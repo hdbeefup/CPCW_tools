@@ -1,0 +1,1151 @@
+#!/usr/bin/env python3
+"""Parser for Codename: Panzers Cold War .map scenario files.
+
+The .map format is a hierarchical chunk-based container using the Gepard engine's
+OBJT/VOBJ/ARRY/SCHM serialization system (same as ProtoDB.bin).
+
+Usage:
+    python cpcw_map.py info       FILE.map          # print map summary
+    python cpcw_map.py structure  FILE.map          # print chunk tree
+    python cpcw_map.py schemas    FILE.map          # print all schemas
+    python cpcw_map.py entities   FILE.map          # list placed entities
+    python cpcw_map.py terrain    FILE.map          # print terrain layer info
+    python cpcw_map.py dump       FILE.map [--json] # dump full object tree
+    python cpcw_map.py blck       FILE.map FILE.png # render block grid as image
+    python cpcw_map.py gui        FILE.map          # graphical viewer
+"""
+
+import argparse
+import json
+import math
+import struct
+import sys
+from collections import OrderedDict
+
+# ---------------------------------------------------------------------------
+# Field type constants
+# ---------------------------------------------------------------------------
+
+FT_INT32    = 0x0001
+FT_FLOAT    = 0x0002
+FT_BOOL     = 0x0003
+FT_STRING   = 0x0004
+FT_FLOAT64  = 0x0005   # 8 bytes, possibly vec2<double> or double
+FT_VEC3     = 0x0006   # 12 bytes, 3x float
+FT_GUID     = 0x0011
+FT_REF      = 0x0012
+FT_IID      = 0x0013   # internal ID, uint32
+FT_ENTREF   = 0x0014   # entity reference, uint32
+FT_VEC2F    = 0x0015   # 8 bytes, 2x float  (guess)
+FT_VEC2I    = 0x0016   # 8 bytes, 2x int32
+FT_UINT8    = 0x0017
+FT_COLOR    = 0x0018   # 4 bytes RGBA
+FT_INT16    = 0x0019
+FT_LOCSTR   = 0x002B   # localised string
+FT_INLINE1  = 0x0088   # inline object
+FT_INLINE2  = 0x0089   # inline object (variant)
+FT_BLOB     = 0x0165
+FT_INT_ARR  = 0x018A   # packed int array
+FT_FLAGS    = 0x039C
+FT_ARRAY    = 0x898A
+
+FIELD_TYPE_NAMES = {
+    FT_INT32:   'int32',    FT_FLOAT:   'float',    FT_BOOL:    'bool',
+    FT_STRING:  'string',   FT_FLOAT64: 'float64',  FT_VEC3:    'vec3',
+    FT_GUID:    'GUID',     FT_REF:     'ref',      FT_IID:     'IID',
+    FT_ENTREF:  'entref',   FT_VEC2F:   'vec2f',    FT_VEC2I:   'vec2i',
+    FT_UINT8:   'uint8',    FT_COLOR:   'color',    FT_INT16:   'int16',
+    FT_LOCSTR:  'locstr',   FT_INLINE1: 'object',   FT_INLINE2: 'object',
+    FT_BLOB:    'blob',     FT_INT_ARR: 'int_arr',  FT_FLAGS:   'flags',
+    FT_ARRAY:   'array',
+}
+
+# Map of all known types that use variable-length (length-prefix + payload)
+# encoding like strings do.  Anything else below 0x88 with size=0xFFFF is
+# assumed to follow the same pattern.
+_STRING_LIKE = {FT_STRING, FT_GUID, FT_REF, FT_FLAGS, FT_LOCSTR}
+
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
+
+def _u8(data, pos):
+    return data[pos], pos + 1
+
+def _u16(data, pos):
+    return struct.unpack_from('<H', data, pos)[0], pos + 2
+
+def _i16(data, pos):
+    return struct.unpack_from('<h', data, pos)[0], pos + 2
+
+def _u32(data, pos):
+    return struct.unpack_from('<I', data, pos)[0], pos + 4
+
+def _i32(data, pos):
+    return struct.unpack_from('<i', data, pos)[0], pos + 4
+
+def _f32(data, pos):
+    return struct.unpack_from('<f', data, pos)[0], pos + 4
+
+def _f64(data, pos):
+    return struct.unpack_from('<d', data, pos)[0], pos + 8
+
+def _tag(data, pos):
+    return data[pos:pos + 4], pos + 4
+
+def _str(data, pos):
+    """Read a uint16-length-prefixed ASCII string."""
+    slen, pos = _u16(data, pos)
+    s = data[pos:pos + slen].decode('ascii', errors='replace')
+    return s, pos + slen
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+class Schema:
+    __slots__ = ('name', 'type_id', 'version', 'fields')
+
+    def __init__(self, name, type_id, version, fields):
+        self.name = name
+        self.type_id = type_id
+        self.version = version
+        self.fields = fields  # [(field_name, field_type, field_size), ...]
+
+
+def parse_schd(data, pos, limit):
+    """Parse a SCHD chunk and return a dict of {type_id: Schema}."""
+    schemas = {}
+    count, pos = _u16(data, pos)
+    _unk, pos = _u16(data, pos)
+
+    for _ in range(count):
+        if pos >= limit or data[pos:pos + 4] != b'SCHM':
+            break
+        content_sz, p = _u32(data, pos + 4)
+        cs = pos + 8
+        ce = cs + content_sz
+
+        name, p = _str(data, cs)
+        type_id, p = _u16(data, p)
+        version, p = _u16(data, p)
+        field_count, p = _u16(data, p)
+
+        fields = []
+        for _ in range(field_count):
+            if p + 2 > ce:
+                break
+            fn, p = _str(data, p)
+            if p + 8 > ce:
+                break
+            ftype, p = _u32(data, p)
+            fsize, p = _u32(data, p)
+            fields.append((fn, ftype, fsize))
+
+        schemas[type_id] = Schema(name, type_id, version, fields)
+        pos = ce
+
+    return schemas
+
+
+# ---------------------------------------------------------------------------
+# OBJT / VOBJ / ARRY parser  (mirrors cpcw_protodb.py logic)
+# ---------------------------------------------------------------------------
+
+class ObjParser:
+    """Stateful parser that reads OBJT/VOBJ/ARRY trees using local schemas."""
+
+    def __init__(self, data, schemas):
+        self.data = data
+        self.schemas = schemas
+
+    # -- public entry -------------------------------------------------------
+
+    def parse_objt(self, pos):
+        return self._parse_objt(pos)
+
+    # -- internals ----------------------------------------------------------
+
+    def _parse_objt(self, pos):
+        if self.data[pos:pos + 4] != b'OBJT':
+            return None, pos
+        content_sz, _ = _u32(self.data, pos + 4)
+        content_end = pos + 8 + content_sz
+        type_id, _ = _u16(self.data, pos + 8)
+
+        obj, vobj_end = self._parse_vobj(pos + 10)
+        if obj is None:
+            s = self.schemas.get(type_id, Schema('?', type_id, 0, []))
+            obj = OrderedDict([('_type_id', type_id), ('_type', s.name)])
+
+        # trailing VOBJs (version extensions)
+        p = vobj_end
+        while p + 10 <= content_end and self.data[p:p + 4] == b'VOBJ':
+            trailing, p = self._parse_vobj(p)
+            if trailing:
+                for k, v in trailing.items():
+                    if not k.startswith('_'):
+                        obj[k] = v
+
+        return obj, content_end
+
+    def _parse_vobj(self, pos):
+        if self.data[pos:pos + 4] != b'VOBJ':
+            return None, pos
+        content_sz, _ = _u32(self.data, pos + 4)
+        content_end = pos + 8 + content_sz
+        type_id, _ = _u16(self.data, pos + 8)
+
+        schema = self.schemas.get(type_id)
+        obj = OrderedDict([
+            ('_type_id', type_id),
+            ('_type', schema.name if schema else f'Unknown_0x{type_id:04x}'),
+        ])
+
+        p = pos + 10
+        if p + 2 > content_end:
+            return obj, content_end
+        _version, p = _u16(self.data, p)
+
+        if schema:
+            for fname, ftype, fsize in schema.fields:
+                if p >= content_end:
+                    break
+                val, p = self._read_field(p, ftype, fsize, content_end)
+                obj[fname] = val
+
+        return obj, content_end
+
+    def _read_field(self, pos, ftype, fsize, limit):
+        if pos >= limit:
+            return None, pos
+
+        if ftype == FT_INT32:
+            if pos + 4 > limit: return None, limit
+            return _i32(self.data, pos)
+
+        if ftype == FT_FLOAT:
+            if pos + 4 > limit: return None, limit
+            v, p = _f32(self.data, pos)
+            return round(v, 6), p
+
+        if ftype == FT_BOOL:
+            if pos + 1 > limit: return None, limit
+            return bool(self.data[pos]), pos + 1
+
+        if ftype in _STRING_LIKE:
+            if pos + 2 > limit: return None, limit
+            return _str(self.data, pos)
+
+        if ftype == FT_UINT8:
+            if pos + 1 > limit: return None, limit
+            return self.data[pos], pos + 1
+
+        if ftype == FT_INT16:
+            if pos + 2 > limit: return None, limit
+            return _i16(self.data, pos)
+
+        if ftype == FT_COLOR:
+            if pos + 4 > limit: return None, limit
+            v, p = _u32(self.data, pos)
+            return f'#{v:08x}', p
+
+        if ftype == FT_IID or ftype == FT_ENTREF:
+            if pos + 4 > limit: return None, limit
+            return _u32(self.data, pos)
+
+        if ftype == FT_FLOAT64:
+            if pos + 8 > limit: return None, limit
+            v, p = _f64(self.data, pos)
+            return round(v, 6), p
+
+        if ftype == FT_VEC3:
+            if pos + 12 > limit: return None, limit
+            x, _ = _f32(self.data, pos)
+            y, _ = _f32(self.data, pos + 4)
+            z, _ = _f32(self.data, pos + 8)
+            return [round(x, 4), round(y, 4), round(z, 4)], pos + 12
+
+        if ftype == FT_VEC2I:
+            if pos + 8 > limit: return None, limit
+            a, _ = _i32(self.data, pos)
+            b, _ = _i32(self.data, pos + 4)
+            return [a, b], pos + 8
+
+        if ftype == FT_VEC2F:
+            if pos + 8 > limit: return None, limit
+            a, _ = _f32(self.data, pos)
+            b, _ = _f32(self.data, pos + 4)
+            return [round(a, 4), round(b, 4)], pos + 8
+
+        if ftype == FT_ARRAY:
+            return self._read_array(pos, limit)
+
+        if ftype in (FT_INLINE1, FT_INLINE2):
+            return self._read_inline(pos, limit)
+
+        if ftype == FT_BLOB:
+            nbytes = fsize if 0 < fsize < 0xFFFF else 0
+            if nbytes > 0 and pos + nbytes <= limit:
+                return self.data[pos:pos + nbytes].hex(), pos + nbytes
+            return None, pos
+
+        # Unknown but has known size in schema
+        if 0 < fsize < 0xFFFF and pos + fsize <= limit:
+            return self.data[pos:pos + fsize].hex(), pos + fsize
+
+        # Variable-length unknown: try length-prefixed string pattern
+        if fsize == 0xFFFF or fsize == 0:
+            # Could be a string-like type or a nested chunk
+            tag = self.data[pos:pos + 4]
+            if tag in (b'ARRY', b'OBJT', b'VOBJ'):
+                return self._read_inline(pos, limit)
+            if pos + 2 <= limit:
+                slen, _ = _u16(self.data, pos)
+                if slen < 4096 and pos + 2 + slen <= limit:
+                    s = self.data[pos + 2:pos + 2 + slen].decode('ascii', errors='replace')
+                    return s, pos + 2 + slen
+
+        return f'<unknown:0x{ftype:04x}>', pos
+
+    def _read_array(self, pos, limit):
+        if pos + 12 > limit or self.data[pos:pos + 4] != b'ARRY':
+            return [], pos
+        arr_size, _ = _u32(self.data, pos + 4)
+        arr_count, _ = _u32(self.data, pos + 8)
+        arr_end = pos + 8 + arr_size
+
+        items = []
+        p = pos + 12
+        for _ in range(arr_count):
+            if p >= arr_end:
+                break
+            if self.data[p:p + 4] == b'OBJT':
+                obj, p = self._parse_objt(p)
+                if obj:
+                    items.append(obj)
+            else:
+                break
+        return items, arr_end
+
+    def _read_inline(self, pos, limit):
+        if pos + 8 > limit:
+            return None, pos
+        tag = self.data[pos:pos + 4]
+        if tag == b'OBJT':
+            return self._parse_objt(pos)
+        if tag == b'VOBJ':
+            return self._parse_vobj(pos)
+        if tag == b'ARRY':
+            return self._read_array(pos, limit)
+        return None, pos
+
+
+# ---------------------------------------------------------------------------
+# Chunk-level map parser
+# ---------------------------------------------------------------------------
+
+class Chunk:
+    """Represents a parsed chunk in the file."""
+    __slots__ = ('tag', 'offset', 'size', 'children', 'data_offset', 'meta')
+
+    def __init__(self, tag, offset, size):
+        self.tag = tag
+        self.offset = offset          # offset of tag byte
+        self.size = size              # content size (after 8-byte header)
+        self.children = []
+        self.data_offset = offset + 8  # start of content
+        self.meta = {}                # parsed metadata
+
+
+class MapFile:
+    """Full parser for a .map scenario file."""
+
+    def __init__(self, filepath):
+        with open(filepath, 'rb') as f:
+            self.data = f.read()
+        self.filepath = filepath
+        self.schemas = {}       # merged across all SCHD sections
+        self.root = None        # root Chunk
+        self._parse()
+
+    # -- high-level parse ---------------------------------------------------
+
+    def _parse(self):
+        d = self.data
+        if d[0:4] != b'SCEN':
+            raise ValueError(f'Not a CPCW map file (expected SCEN, got {d[0:4]})')
+
+        scen_size, _ = _u32(d, 4)
+        scen_ver, _ = _u32(d, 8)
+
+        self.root = Chunk('SCEN', 0, scen_size)
+        self.root.meta['version'] = scen_ver
+
+        pos = 12
+        file_end = min(8 + scen_size, len(d))
+        self._parse_children(self.root, pos, file_end)
+
+    def _parse_children(self, parent, pos, end):
+        """Recursively discover chunks inside a container."""
+        d = self.data
+        while pos + 8 <= end:
+            tag = d[pos:pos + 4]
+            if not all(0x20 <= b < 0x7F for b in tag):
+                break
+            tag_s = tag.decode('ascii')
+            size, _ = _u32(d, pos + 4)
+            chunk_end = pos + 8 + size
+            if chunk_end > end + 4:  # small tolerance
+                break
+
+            chunk = Chunk(tag_s, pos, size)
+            parent.children.append(chunk)
+
+            # Parse version / count header for known containers
+            if tag_s in ('PREC', 'SETS', 'OJTS'):
+                if pos + 12 <= len(d):
+                    chunk.meta['version'], _ = _u32(d, pos + 8)
+                self._parse_children(chunk, pos + 12, chunk_end)
+                pos = chunk_end
+
+            elif tag_s == 'OBJS':
+                if pos + 12 <= len(d):
+                    chunk.meta['schema_offset'], _ = _u32(d, pos + 8)
+                self._parse_children(chunk, pos + 12, chunk_end)
+                # Collect schemas from any SCHD children
+                for child in chunk.children:
+                    if child.tag == 'SCHD':
+                        schemas = parse_schd(d, child.data_offset, child.offset + 8 + child.size)
+                        self.schemas.update(schemas)
+                pos = chunk_end
+
+            elif tag_s == 'WRLD':
+                if pos + 20 <= len(d):
+                    chunk.meta['version'], _ = _u32(d, pos + 8)
+                    chunk.meta['width'], _ = _u32(d, pos + 12)
+                    chunk.meta['height'], _ = _u32(d, pos + 16)
+                self._parse_children(chunk, pos + 20, chunk_end)
+                pos = chunk_end
+
+            elif tag_s == 'GTRN':
+                if pos + 9 <= len(d):
+                    chunk.meta['version'] = d[pos + 8]
+                self._parse_children(chunk, pos + 9, chunk_end)
+                pos = chunk_end
+
+            elif tag_s == 'GROL':
+                self._parse_children(chunk, pos + 8, chunk_end)
+                pos = chunk_end
+
+            elif tag_s == 'UNTS':
+                if pos + 16 <= len(d):
+                    chunk.meta['version'], _ = _u32(d, pos + 8)
+                    chunk.meta['entity_count'], _ = _u32(d, pos + 12)
+                self._parse_children(chunk, pos + 16, chunk_end)
+                pos = chunk_end
+
+            elif tag_s in ('PATH', 'CAMS', 'WTHR'):
+                if pos + 16 <= len(d):
+                    chunk.meta['version'], _ = _u32(d, pos + 8)
+                    chunk.meta['count'], _ = _u32(d, pos + 12)
+                pos = chunk_end
+
+            elif tag_s == 'SCHD':
+                if pos + 12 <= len(d):
+                    chunk.meta['schema_count'], _ = _u16(d, pos + 8)
+                schemas = parse_schd(d, pos + 8, chunk_end)
+                self.schemas.update(schemas)
+                pos = chunk_end
+
+            elif tag_s == 'STOR':
+                if pos + 16 <= len(d):
+                    chunk.meta['count'], _ = _u32(d, pos + 8)
+                    chunk.meta['next_id'], _ = _u32(d, pos + 12)
+                pos = chunk_end
+
+            elif tag_s == 'BLCK':
+                self._parse_blck(chunk)
+                pos = chunk_end
+
+            elif tag_s == 'GTRD':
+                self._parse_gtrd(chunk)
+                pos = chunk_end
+
+            else:
+                pos = chunk_end
+
+    # -- GTRD ---------------------------------------------------------------
+
+    def _parse_gtrd(self, chunk):
+        d = self.data
+        pos = chunk.data_offset
+        end = chunk.offset + 8 + chunk.size
+
+        version, pos = _u8(d, pos)
+        grid_w, pos = _u32(d, pos)
+        grid_h, pos = _u32(d, pos)
+        world_x, pos = _f32(d, pos)
+        world_y, pos = _f32(d, pos)
+        layer_count, pos = _u32(d, pos)
+
+        chunk.meta.update({
+            'version': version,
+            'grid_w': grid_w,
+            'grid_h': grid_h,
+            'world_x': round(world_x, 2),
+            'world_y': round(world_y, 2),
+            'layer_count': layer_count,
+        })
+
+        layers = []
+        for _ in range(layer_count):
+            if pos >= end:
+                break
+            name, pos = _str(d, pos)
+            unk_int, pos = _u32(d, pos)
+            uv_scale, pos = _f32(d, pos)
+            detail, pos = _str(d, pos)
+            flag, pos = _u8(d, pos)
+            layers.append({
+                'name': name,
+                'type': unk_int,
+                'uv_scale': round(uv_scale, 4),
+                'detail': detail,
+                'active': bool(flag),
+            })
+        chunk.meta['layers'] = layers
+        chunk.meta['splatmap_offset'] = pos
+        chunk.meta['splatmap_size'] = end - pos
+
+    # -- BLCK ---------------------------------------------------------------
+
+    def _parse_blck(self, chunk):
+        d = self.data
+        pos = chunk.data_offset
+
+        version, pos = _u32(d, pos)
+        dim1, pos = _u32(d, pos)
+        dim2, pos = _u32(d, pos)
+
+        grid_w = dim1 // 2 if dim1 > 0 else 0
+        grid_h = dim2 // 2 if dim2 > 0 else 0
+
+        chunk.meta.update({
+            'version': version,
+            'vertex_w': dim1,
+            'vertex_h': dim2,
+            'grid_w': grid_w,
+            'grid_h': grid_h,
+            'grid_offset': pos,
+        })
+
+    # -- Object tree access -------------------------------------------------
+
+    def find_chunks(self, tag, root=None):
+        """Find all chunks with the given tag (recursive)."""
+        results = []
+        def walk(c):
+            if c.tag == tag:
+                results.append(c)
+            for child in c.children:
+                walk(child)
+        walk(root or self.root)
+        return results
+
+    def find_chunk(self, tag, root=None):
+        """Find first chunk with the given tag."""
+        results = self.find_chunks(tag, root)
+        return results[0] if results else None
+
+    def parse_objs_tree(self, objs_chunk):
+        """Parse the first OBJT tree inside an OBJS chunk."""
+        parser = ObjParser(self.data, self.schemas)
+        pos = objs_chunk.data_offset + 4  # skip schema_offset
+        end = objs_chunk.offset + 8 + objs_chunk.size
+        # Skip to the SCHD to know where data ends
+        schd_off = struct.unpack_from('<I', self.data, objs_chunk.data_offset)[0]
+        if schd_off > 0 and objs_chunk.data_offset - 8 + schd_off < end:
+            # schema_offset is absolute file offset
+            data_end = schd_off
+        else:
+            data_end = end
+        while pos < data_end - 8:
+            if self.data[pos:pos + 4] == b'OBJT':
+                obj, _ = parser.parse_objt(pos)
+                return obj
+            pos += 1
+        return None
+
+    def parse_objs_all(self, objs_chunk):
+        """Parse ALL top-level OBJTs inside an OBJS chunk (flat list)."""
+        parser = ObjParser(self.data, self.schemas)
+        pos = objs_chunk.data_offset + 4  # skip schema_offset
+        end = objs_chunk.offset + 8 + objs_chunk.size
+        # Use schema_offset as absolute file offset to find data boundary
+        schd_off = struct.unpack_from('<I', self.data, objs_chunk.data_offset)[0]
+        if schd_off > 0 and schd_off < end:
+            data_end = schd_off
+        else:
+            data_end = end
+
+        objects = []
+        while pos < data_end - 8:
+            if self.data[pos:pos + 4] == b'OBJT':
+                obj, pos = parser.parse_objt(pos)
+                if obj:
+                    objects.append(obj)
+            else:
+                break
+        return objects
+
+    def get_scenario_settings(self):
+        """Parse the SP2ScenarioSettings object from PREC/SETS."""
+        prec = self.find_chunk('PREC')
+        if not prec:
+            return None
+        sets = self.find_chunk('SETS', prec)
+        if not sets:
+            return None
+        objs = self.find_chunk('OBJS', sets)
+        if not objs:
+            return None
+        return self.parse_objs_tree(objs)
+
+    def get_entities(self):
+        """Parse entities from the UNTS section."""
+        unts = self.find_chunk('UNTS')
+        if not unts:
+            return []
+        objs = self.find_chunk('OBJS', unts)
+        if not objs:
+            return []
+        return self.parse_objs_all(objs)
+
+    def get_blck_grid(self):
+        """Return the BLCK grid as a list of rows, each row a list of 6-tuples."""
+        chunk = self.find_chunk('BLCK')
+        if not chunk or 'grid_offset' not in chunk.meta:
+            return None, 0, 0
+
+        d = self.data
+        w = chunk.meta['grid_w']
+        h = chunk.meta['grid_h']
+        offset = chunk.meta['grid_offset']
+
+        grid = []
+        pos = offset
+        for y in range(h):
+            row = []
+            for x in range(w):
+                cell = struct.unpack_from('<6H', d, pos)
+                row.append(cell)
+                pos += 12
+            grid.append(row)
+        return grid, w, h
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_info(mf):
+    """Print a summary of the map file."""
+    settings = mf.get_scenario_settings()
+    wrld = mf.find_chunk('WRLD')
+    gtrd = mf.find_chunk('GTRD')
+    blck = mf.find_chunk('BLCK')
+    unts = mf.find_chunk('UNTS')
+
+    print(f'File:    {mf.filepath}')
+    print(f'Size:    {len(mf.data):,} bytes')
+    print(f'Version: {mf.root.meta.get("version", "?")}')
+
+    if settings:
+        print(f'Name:    {settings.get("Name", "?")}')
+        print(f'Desc:    {settings.get("Description", "?")}')
+        print(f'Music:   {settings.get("MusicFileName", "")}')
+        print(f'Skybox:  {settings.get("SkyboxFileName", "")}')
+        print(f'Unit limit:       {settings.get("UnitLimit", "?")}')
+        print(f'Prestige limit:   {settings.get("PrestigeLimit", "?")}')
+        print(f'Starting prestige:{settings.get("StartingPrestige", "?")}')
+
+    if wrld:
+        w = wrld.meta.get('width', '?')
+        h = wrld.meta.get('height', '?')
+        print(f'World:   {w} x {h}')
+
+    if gtrd:
+        m = gtrd.meta
+        print(f'Terrain: {m.get("world_x","?")} x {m.get("world_y","?")} world units')
+        print(f'  Grid:   {m.get("grid_w","?")} x {m.get("grid_h","?")}')
+        print(f'  Layers: {m.get("layer_count","?")}')
+        for i, layer in enumerate(m.get('layers', [])):
+            if layer['name']:
+                print(f'    [{i}] {layer["name"]} (scale={layer["uv_scale"]}, detail={layer["detail"]})')
+
+    if blck:
+        m = blck.meta
+        print(f'Block grid: {m.get("grid_w","?")} x {m.get("grid_h","?")} cells')
+
+    if unts:
+        print(f'Entities: {unts.meta.get("entity_count", "?")}')
+
+    print(f'Schemas: {len(mf.schemas)} types')
+
+
+def cmd_structure(mf, max_depth=None):
+    """Print the chunk tree."""
+    def walk(chunk, depth=0):
+        if max_depth is not None and depth > max_depth:
+            return
+        indent = '  ' * depth
+        meta_str = ''
+        for k, v in chunk.meta.items():
+            if k == 'layers':
+                meta_str += f' layers={len(v)}'
+            elif k in ('grid_offset', 'splatmap_offset', 'splatmap_size'):
+                continue
+            else:
+                meta_str += f' {k}={v}'
+        size_str = _fmt_size(chunk.size)
+        print(f'{indent}{chunk.tag}  @0x{chunk.offset:08X}  size={size_str}{meta_str}')
+        for child in chunk.children:
+            walk(child, depth + 1)
+
+    walk(mf.root)
+
+
+def cmd_schemas(mf):
+    """Print all schema definitions."""
+    for tid in sorted(mf.schemas.keys()):
+        s = mf.schemas[tid]
+        print(f'0x{tid:04X} {s.name} (v{s.version}, {len(s.fields)} fields)')
+        for fname, ftype, fsize in s.fields:
+            tname = FIELD_TYPE_NAMES.get(ftype, f'0x{ftype:04x}')
+            print(f'  {fname}: {tname} (size={fsize})')
+        print()
+
+
+def cmd_entities(mf):
+    """List placed entities with positions."""
+    entities = mf.get_entities()
+    if not entities:
+        print('No entities found.')
+        return
+
+    # Each entity may have nested fields from inheritance (SUnitDesc contains
+    # SEntityDesc fields via VOBJ merging).  Flatten: walk each entity and
+    # collect fields at any depth that look like descriptor data.
+
+    # Group by outermost _type
+    by_type = {}
+    for e in entities:
+        t = e.get('_type', '?')
+        by_type.setdefault(t, []).append(e)
+
+    print(f'Total entities: {len(entities)}\n')
+    for t in sorted(by_type.keys()):
+        ents = by_type[t]
+        print(f'{t}: {len(ents)}')
+        for e in ents[:10]:
+            proto = e.get('Prototype', '')
+            pos = e.get('Pos', '')
+            eid = e.get('ID', '')
+            player = e.get('Player', '')
+            parts = []
+            if proto:
+                parts.append(f'proto={proto}')
+            if isinstance(pos, list) and len(pos) >= 3:
+                parts.append(f'pos=({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})')
+            if player != '':
+                parts.append(f'player={player}')
+            if eid != '':
+                parts.append(f'id={eid}')
+            print(f'  {", ".join(parts)}')
+        if len(ents) > 10:
+            print(f'  ... and {len(ents) - 10} more')
+        print()
+
+
+def cmd_terrain(mf):
+    """Print terrain layer details."""
+    gtrd = mf.find_chunk('GTRD')
+    if not gtrd:
+        print('No GTRD chunk found.')
+        return
+
+    m = gtrd.meta
+    print(f'GTRD version: {m["version"]}')
+    print(f'Grid: {m["grid_w"]} x {m["grid_h"]}')
+    print(f'World size: {m["world_x"]} x {m["world_y"]}')
+    print(f'Layer count: {m["layer_count"]}')
+    print(f'Splatmap data: {m["splatmap_size"]:,} bytes at 0x{m["splatmap_offset"]:X}')
+
+    print(f'\nLayers:')
+    for i, layer in enumerate(m.get('layers', [])):
+        status = 'active' if layer['active'] else 'inactive'
+        name = layer['name'] or '(empty)'
+        print(f'  [{i}] {name}')
+        print(f'      type={layer["type"]} scale={layer["uv_scale"]} detail="{layer["detail"]}" [{status}]')
+
+    # Splatmap statistics
+    d = mf.data
+    start = m['splatmap_offset']
+    end = start + m['splatmap_size']
+    nonzero = sum(1 for i in range(start, end) if d[i] != 0)
+    print(f'\nSplatmap: {nonzero:,} non-zero bytes of {m["splatmap_size"]:,} ({nonzero / m["splatmap_size"] * 100:.1f}% used)')
+
+
+def cmd_dump(mf, as_json=False):
+    """Dump the full object tree from all OBJS sections."""
+    all_trees = OrderedDict()
+
+    # Settings
+    settings = mf.get_scenario_settings()
+    if settings:
+        all_trees['settings'] = settings
+
+    # Objectives
+    prec = mf.find_chunk('PREC')
+    if prec:
+        ojts = mf.find_chunk('OJTS', prec)
+        if ojts:
+            objs = mf.find_chunk('OBJS', ojts)
+            if objs:
+                tree = mf.parse_objs_tree(objs)
+                if tree:
+                    all_trees['objectives'] = tree
+
+    # Game state
+    for objs_chunk in mf.find_chunks('OBJS'):
+        parent_tags = set()
+        # check parent context
+        def find_parent(root, target):
+            for c in root.children:
+                if c is target:
+                    return root
+                r = find_parent(c, target)
+                if r:
+                    return r
+            return None
+        parent = find_parent(mf.root, objs_chunk)
+        if parent and parent.tag == 'SCEN':
+            # This is the main game state OBJS
+            tree = mf.parse_objs_tree(objs_chunk)
+            if tree:
+                all_trees['game_state'] = tree
+
+    # World objects
+    wrld = mf.find_chunk('WRLD')
+    if wrld:
+        for objs_chunk in mf.find_chunks('OBJS', wrld):
+            # skip UNTS sub-OBJS
+            parent = find_parent(wrld, objs_chunk)
+            if parent and parent.tag == 'WRLD':
+                tree = mf.parse_objs_tree(objs_chunk)
+                if tree:
+                    all_trees['world'] = tree
+
+    # Entities
+    entities = mf.get_entities()
+    if entities:
+        all_trees['entities'] = entities
+
+    if as_json:
+        print(json.dumps(_to_serializable(all_trees), indent=2, ensure_ascii=False))
+    else:
+        for section, tree in all_trees.items():
+            print(f'=== {section} ===')
+            if isinstance(tree, list):
+                for item in tree:
+                    _print_obj(item, 1)
+            else:
+                _print_obj(tree, 1)
+            print()
+
+
+def cmd_blck(mf, output_path):
+    """Render the BLCK grid as a PNG image."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print('Error: Pillow is required for image output.  pip install Pillow')
+        return
+
+    grid, w, h = mf.get_blck_grid()
+    if grid is None:
+        print('No BLCK data found.')
+        return
+
+    img = Image.new('RGB', (w, h))
+    pixels = img.load()
+
+    for y in range(h):
+        for x in range(w):
+            cell = grid[y][x]
+            total = sum(cell)
+            if total == 6:
+                # default passable
+                pixels[x, y] = (60, 120, 60)
+            elif total == 0:
+                # blocked
+                pixels[x, y] = (30, 30, 30)
+            else:
+                # encode values as color
+                r = min(255, (cell[0] + cell[1]) & 0xFF)
+                g = min(255, (cell[2] + cell[3]) & 0xFF)
+                b = min(255, (cell[4] + cell[5]) & 0xFF)
+                if r == 0 and g == 0 and b == 0:
+                    # non-zero total but zero RGB → use brightness from total
+                    v = min(255, total // 6)
+                    pixels[x, y] = (v, v // 2, v // 3)
+                else:
+                    pixels[x, y] = (r, g, b)
+
+    img.save(output_path)
+    print(f'Saved {w}x{h} block grid to {output_path}')
+
+
+def cmd_gui(mf):
+    """Launch a graphical chunk/object viewer."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Tk()
+    win.title(f'CPCW Map Viewer — {mf.filepath}')
+    win.geometry('1400x900')
+    win.configure(bg='#1e1e1e')
+
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure('Treeview', background='#1e1e1e', foreground='#d4d4d4',
+                    fieldbackground='#1e1e1e', font=('Consolas', 10), rowheight=22)
+    style.configure('Treeview.Heading', background='#333', foreground='#ccc',
+                    font=('Consolas', 10, 'bold'))
+    style.map('Treeview', background=[('selected', '#264f78')],
+              foreground=[('selected', '#ffffff')])
+    style.configure('TFrame', background='#1e1e1e')
+    style.configure('TLabel', background='#1e1e1e', foreground='#d4d4d4',
+                    font=('Consolas', 10))
+
+    # Paned layout
+    paned = ttk.PanedWindow(win, orient=tk.HORIZONTAL)
+    paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    # Left: chunk tree
+    left = ttk.Frame(paned)
+    tree = ttk.Treeview(left, show='tree', selectmode='browse')
+    vsb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    paned.add(left, weight=1)
+
+    # Right: detail
+    right = ttk.Frame(paned)
+    detail = tk.Text(right, wrap=tk.WORD, bg='#1e1e1e', fg='#d4d4d4',
+                     font=('Consolas', 10), relief='flat', padx=8, pady=8,
+                     insertbackground='#d4d4d4', selectbackground='#264f78')
+    detail_vsb = ttk.Scrollbar(right, orient=tk.VERTICAL, command=detail.yview)
+    detail.configure(yscrollcommand=detail_vsb.set)
+    detail.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    detail_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    paned.add(right, weight=2)
+
+    detail.tag_configure('heading', foreground='#569cd6', font=('Consolas', 11, 'bold'))
+    detail.tag_configure('key', foreground='#9cdcfe')
+    detail.tag_configure('value', foreground='#ce9178')
+    detail.tag_configure('number', foreground='#b5cea8')
+    detail.tag_configure('dim', foreground='#dcdcaa')
+
+    item_data = {}  # tree iid -> chunk or object dict
+
+    def add_chunk(parent_iid, chunk):
+        meta_str = ''
+        for k, v in chunk.meta.items():
+            if k == 'layers':
+                meta_str += f'  [{len(v)} layers]'
+            elif k in ('grid_offset', 'splatmap_offset', 'splatmap_size', 'schema_offset'):
+                continue
+            else:
+                meta_str += f'  {k}={v}'
+        label = f'{chunk.tag}  ({_fmt_size(chunk.size)}){meta_str}'
+        iid = tree.insert(parent_iid, 'end', text=label)
+        item_data[iid] = chunk
+        for child in chunk.children:
+            add_chunk(iid, child)
+        return iid
+
+    def show_chunk(chunk):
+        detail.configure(state=tk.NORMAL)
+        detail.delete('1.0', tk.END)
+        detail.insert(tk.END, f'{chunk.tag}\n', 'heading')
+        detail.insert(tk.END, f'Offset: 0x{chunk.offset:08X}\n', 'dim')
+        detail.insert(tk.END, f'Size:   {chunk.size:,} bytes\n\n', 'dim')
+
+        for k, v in chunk.meta.items():
+            if k == 'layers':
+                detail.insert(tk.END, f'Layers ({len(v)}):\n', 'key')
+                for i, layer in enumerate(v):
+                    detail.insert(tk.END, f'  [{i}] ', 'key')
+                    detail.insert(tk.END, f'{layer["name"] or "(empty)"}\n', 'value')
+                    detail.insert(tk.END, f'      scale={layer["uv_scale"]}  detail={layer["detail"]}  active={layer["active"]}\n', 'dim')
+            else:
+                detail.insert(tk.END, f'{k}: ', 'key')
+                detail.insert(tk.END, f'{v}\n', 'number' if isinstance(v, (int, float)) else 'value')
+
+        # If it's an OBJS, try to parse and show the object tree
+        if chunk.tag == 'OBJS':
+            detail.insert(tk.END, '\n--- Object Tree ---\n\n', 'heading')
+            obj = mf.parse_objs_tree(chunk)
+            if obj:
+                _show_obj_in_text(detail, obj, 0)
+
+        detail.configure(state=tk.DISABLED)
+
+    def _show_obj_in_text(widget, obj, depth):
+        if not isinstance(obj, dict):
+            widget.insert(tk.END, f'{"  " * depth}{obj}\n')
+            return
+        typ = obj.get('_type', '?')
+        name = obj.get('Name', obj.get('Prototype', obj.get('GUID', '')))
+        header = typ
+        if name:
+            header += f': {name}'
+        widget.insert(tk.END, f'{"  " * depth}[{header}]\n', 'heading')
+        for k, v in obj.items():
+            if k.startswith('_'):
+                continue
+            if isinstance(v, list):
+                widget.insert(tk.END, f'{"  " * (depth + 1)}{k}: ({len(v)} items)\n', 'key')
+                for item in v[:20]:
+                    _show_obj_in_text(widget, item, depth + 2)
+                if len(v) > 20:
+                    widget.insert(tk.END, f'{"  " * (depth + 2)}... +{len(v) - 20} more\n', 'dim')
+            elif isinstance(v, dict):
+                widget.insert(tk.END, f'{"  " * (depth + 1)}{k}:\n', 'key')
+                _show_obj_in_text(widget, v, depth + 2)
+            else:
+                widget.insert(tk.END, f'{"  " * (depth + 1)}{k}', 'key')
+                widget.insert(tk.END, f': {v}\n', 'number' if isinstance(v, (int, float)) else 'value')
+
+    def on_select(event):
+        sel = tree.selection()
+        if sel and sel[0] in item_data:
+            show_chunk(item_data[sel[0]])
+
+    tree.bind('<<TreeviewSelect>>', on_select)
+
+    # Build tree
+    root_iid = add_chunk('', mf.root)
+    tree.item(root_iid, open=True)
+    for child_iid in tree.get_children(root_iid):
+        tree.item(child_iid, open=True)
+
+    win.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def _fmt_size(size):
+    if size >= 1048576:
+        return f'{size / 1048576:.1f} MB'
+    if size >= 1024:
+        return f'{size / 1024:.1f} KB'
+    return f'{size} B'
+
+
+def _to_serializable(obj):
+    if isinstance(obj, OrderedDict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, bytes):
+        return obj.hex()
+    if isinstance(obj, float):
+        if obj != obj:  # NaN
+            return None
+        return obj
+    return obj
+
+
+def _print_obj(obj, depth):
+    if not isinstance(obj, dict):
+        print(f'{"  " * depth}{obj}')
+        return
+
+    typ = obj.get('_type', '?')
+    name = obj.get('Name', obj.get('Prototype', obj.get('GUID', '')))
+    header = typ
+    if name:
+        header += f': {name}'
+    print(f'{"  " * depth}[{header}]')
+
+    for k, v in obj.items():
+        if k.startswith('_'):
+            continue
+        indent = '  ' * (depth + 1)
+        if isinstance(v, list):
+            if not v:
+                print(f'{indent}{k}: []')
+            else:
+                print(f'{indent}{k}: ({len(v)} items)')
+                for item in v:
+                    _print_obj(item, depth + 2)
+        elif isinstance(v, dict):
+            print(f'{indent}{k}:')
+            _print_obj(v, depth + 2)
+        else:
+            print(f'{indent}{k}: {v}')
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Codename: Panzers Cold War .map file parser',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument('command',
+                        choices=['info', 'structure', 'schemas', 'entities',
+                                 'terrain', 'dump', 'blck', 'gui'])
+    parser.add_argument('file', help='Path to .map file')
+    parser.add_argument('output', nargs='?', help='Output path (for blck command)')
+    parser.add_argument('--json', action='store_true', help='JSON output (dump)')
+    parser.add_argument('--depth', type=int, default=None, help='Max depth (structure)')
+
+    args = parser.parse_args()
+    mf = MapFile(args.file)
+
+    if args.command == 'info':
+        cmd_info(mf)
+    elif args.command == 'structure':
+        cmd_structure(mf, args.depth)
+    elif args.command == 'schemas':
+        cmd_schemas(mf)
+    elif args.command == 'entities':
+        cmd_entities(mf)
+    elif args.command == 'terrain':
+        cmd_terrain(mf)
+    elif args.command == 'dump':
+        cmd_dump(mf, args.json)
+    elif args.command == 'blck':
+        if not args.output:
+            parser.error('blck command requires an output path')
+        cmd_blck(mf, args.output)
+    elif args.command == 'gui':
+        cmd_gui(mf)
+
+
+if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    main()
