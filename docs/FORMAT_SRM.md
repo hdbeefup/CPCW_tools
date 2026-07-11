@@ -55,25 +55,36 @@ Nodes:        [NodeCount node entries]
 
 ### Node Entry
 
-Each node has a fixed-size header followed by an optional MESH chunk:
+All node headers are stored first, one after another. There is **no** inline
+MESH chunk per node — the mesh data forms a single block *after* the last node
+header (see "Mesh block" below).
 
 ```
 NameLen:    u16 LE
 Name:       ASCII string (e.g. "body0", "gun0h0", "wheel_fl")
 
-Unknown3:   i32 LE (always -1 / 0xFFFFFFFF)
+ParentIdx:  i32 LE (parent node index, -1 = root)   [was mislabelled "Unknown3, always -1"]
 Position:   3x f32 LE (X, Y, Z translation)
-Rotation:   3x f32 LE (X, Y, Z Euler angles in radians)
+Rotation:   3x f32 LE (X, Y, Z Euler angles in radians; compose Rx @ Ry @ Rz)
 Scale:      4x f32 LE (X, Y, Z scale + W, W typically 1.0)
 Unknown4:   u32 LE
-Unknown5:   i32 LE (0 = MESH follows, -1 = no mesh)
+MeshIndex:  i32 LE (index into the mesh block; -1 = transform-only node)  [was "Unknown5"]
 Unknown6:   i32 LE (always -1)
-
-[If Unknown5 != -1:]
-  MESH chunk (inline)
 ```
 
 **Per-node fixed data after name: 56 bytes** (4 + 12 + 12 + 16 + 4 + 4 + 4)
+
+Nodes form a skeleton via `ParentIdx`. A node's world transform is the product
+of local transforms from the root down. Meshes are rigidly skinned to this
+skeleton (see "Vertex Semantics").
+
+### Mesh block
+
+Immediately after the final node header, one MESH chunk per distinct mesh is
+stored back-to-back. A node with `MeshIndex == k` uses the k-th MESH chunk.
+(The original tooling assumed each MESH followed its node inline; because only
+the last node header abuts the block, that captured a single mesh and dropped
+the rest — breaking most multi-mesh models such as buildings.)
 
 ## MESH Chunk
 
@@ -132,6 +143,15 @@ Data:         VertexCount * Stride bytes
 | 8 | BLENDWEIGHT | varies | Skeletal bone weights |
 
 **Packed normal decoding:** `component = (byte / 127.5) - 1.0`
+
+**Rigid skinning / bone index:** the NORMAL stream is stride 4 = `3x u8` packed
+normal + `1x u8` **bone index** in byte 3. That index selects a node from the
+mesh's BONE palette; each vertex is stored in that bone's local space. To
+assemble a model, transform every vertex (and normal) by its bone's world
+matrix. In practice the bone-index stream is identified as the stride-4 stream
+whose byte 3 spans `[0, bone_count-1]` (the tangent/binormal stride-4 streams
+have byte 3 == 0). Articulated models (vehicles, characters) rely on this;
+static models (buildings) are authored already-posed in model space.
 
 ### Submesh / Material Section
 

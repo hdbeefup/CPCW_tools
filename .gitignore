@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Packaged add-on zips (regenerate by zipping the folders under blendertools/)
+blendertools/*.zip
+
+# Converted / exported assets
+*.glb

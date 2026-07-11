@@ -48,6 +48,37 @@ class SrmMesh:
         self.vertex_streams = []
         self.submeshes = []
 
+    def stream(self, semantic):
+        for vs in self.vertex_streams:
+            if vs.semantic == semantic:
+                return vs
+        return None
+
+    def vertex_bone_indices(self):
+        """Per-vertex bone-palette index (byte 3 of the normal stream), or None.
+
+        Models are rigidly skinned: each vertex stores one bone index. The
+        carrier is the stride-4 stream whose byte-3 values span [0, len(bones)-1].
+        """
+        if not self.bones:
+            return None
+        pos = self.stream(SEM_POSITION)
+        if pos is None:
+            return None
+        vcount = pos.vertex_count
+        nb = len(self.bones)
+        best = None
+        best_max = -1
+        for vs in self.vertex_streams:
+            if vs.stride == 4 and vs.vertex_count == vcount:
+                mx = max(vs.data[i * 4 + 3] for i in range(vcount))
+                if mx < nb and mx > best_max:
+                    best_max = mx
+                    best = vs
+        if best is None:
+            return None
+        return [best.data[i * 4 + 3] for i in range(vcount)]
+
 
 class VertexStream:
     __slots__ = ('semantic', 'stride', 'vertex_count', 'data')
@@ -101,7 +132,15 @@ def parse_srm(filepath):
 
 
 def _parse_pmod(data, start, end):
-    """Parse a PMOD chunk."""
+    """Parse a PMOD chunk.
+
+    All node headers come first, followed by a block of MESH chunks. A node's
+    ``unk5`` is the index into that MESH block (-1 = transform-only node), and
+    ``unk3`` is the node's parent index (-1 = root). The meshes are NOT stored
+    inline after each node header -- only the last header abuts the block, so an
+    inline scan would miss every mesh but one (which is why multi-mesh models,
+    e.g. most buildings, used to lose the bulk of their geometry).
+    """
     p = start + 4  # skip version
     node_count = struct.unpack_from('<I', data, p)[0]; p += 4
     _unk1 = struct.unpack_from('<I', data, p)[0]; p += 4
@@ -118,6 +157,7 @@ def _parse_pmod(data, start, end):
 
         # Transform data (56 bytes)
         node.unk3 = struct.unpack_from('<i', data, p)[0]; p += 4
+        node.parent_idx = node.unk3  # unk3 is the parent node index
         node.position = struct.unpack_from('<3f', data, p); p += 12
         node.rotation = struct.unpack_from('<3f', data, p); p += 12
         sx, sy, sz, sw = struct.unpack_from('<4f', data, p); p += 16
@@ -126,14 +166,19 @@ def _parse_pmod(data, start, end):
         node.unk5 = struct.unpack_from('<i', data, p)[0]; p += 4
         node.unk6 = struct.unpack_from('<i', data, p)[0]; p += 4
 
-        # MESH chunk follows if unk5 != -1
-        if p < end and data[p:p + 4] == b'MESH':
-            mesh_size = struct.unpack_from('<I', data, p + 4)[0]
-            mesh_end = p + 8 + mesh_size
-            node.mesh = _parse_mesh(data, p + 8, mesh_end)
-            p = mesh_end
-
         nodes.append(node)
+
+    # MESH block: consecutive MESH chunks after the last node header.
+    meshes = []
+    while p + 8 <= end and data[p:p + 4] == b'MESH':
+        mesh_size = struct.unpack_from('<I', data, p + 4)[0]
+        mesh_end = p + 8 + mesh_size
+        meshes.append(_parse_mesh(data, p + 8, mesh_end))
+        p = mesh_end
+
+    for node in nodes:
+        if 0 <= node.unk5 < len(meshes):
+            node.mesh = meshes[node.unk5]
 
     return nodes
 
@@ -221,6 +266,77 @@ def _parse_mesh(data, start, end):
         mesh.submeshes.append(sm)
 
     return mesh
+
+
+def _mat_mul(a, b):
+    """Multiply two 4x4 matrices (nested lists)."""
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)]
+            for i in range(4)]
+
+
+def _node_local_matrix(node):
+    """Local 4x4 transform: T @ Rx @ Ry @ Rz @ S (rotation order Rx@Ry@Rz)."""
+    rx, ry, rz = node.rotation
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    Rx = [[1, 0, 0, 0], [0, cx, -sx, 0], [0, sx, cx, 0], [0, 0, 0, 1]]
+    Ry = [[cy, 0, sy, 0], [0, 1, 0, 0], [-sy, 0, cy, 0], [0, 0, 0, 1]]
+    Rz = [[cz, -sz, 0, 0], [sz, cz, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    R = _mat_mul(_mat_mul(Rx, Ry), Rz)
+    sx_, sy_, sz_ = node.scale
+    for i in range(3):
+        R[i][0] *= sx_; R[i][1] *= sy_; R[i][2] *= sz_
+    R[0][3], R[1][3], R[2][3] = node.position
+    return R
+
+
+def _build_world_matrices(nodes):
+    """World matrix per node via the parent_idx (unk3) chain."""
+    cache = {}
+
+    def world(i):
+        if i in cache:
+            return cache[i]
+        nd = nodes[i]
+        lm = _node_local_matrix(nd)
+        p = nd.parent_idx
+        wm = _mat_mul(world(p), lm) if (0 <= p < len(nodes) and p != i) else lm
+        cache[i] = wm
+        return wm
+
+    return [world(i) for i in range(len(nodes))]
+
+
+def _transform_point(m, x, y, z):
+    return (m[0][0]*x + m[0][1]*y + m[0][2]*z + m[0][3],
+            m[1][0]*x + m[1][1]*y + m[1][2]*z + m[1][3],
+            m[2][0]*x + m[2][1]*y + m[2][2]*z + m[2][3])
+
+
+def bake_skinning(nodes):
+    """Rigidly skin each mesh in place: rewrite POSITION streams so every vertex
+    is transformed by its bone's world matrix. Assembles articulated models
+    (vehicles, characters). Static models (buildings) are authored in model
+    space and should NOT be skinned -- see the --no-skin flag."""
+    world = _build_world_matrices(nodes)
+    for node in nodes:
+        if node.mesh is None:
+            continue
+        pos = node.mesh.stream(SEM_POSITION)
+        bidx = node.mesh.vertex_bone_indices()
+        if pos is None or bidx is None:
+            continue
+        pal = node.mesh.bones
+        data = bytearray(pos.data)
+        for vi in range(pos.vertex_count):
+            bi = bidx[vi]
+            if 0 <= bi < len(pal) and 0 <= pal[bi] < len(world):
+                off = vi * pos.stride
+                x, y, z = struct.unpack_from('<3f', data, off)
+                nx, ny, nz = _transform_point(world[pal[bi]], x, y, z)
+                struct.pack_into('<3f', data, off, nx, ny, nz)
+        pos.data = bytes(data)
 
 
 def _euler_to_quaternion(rx, ry, rz):
@@ -596,7 +712,7 @@ def _get_texture_dirs(srm_path, data_root=None):
     return dirs
 
 
-def cmd_convert(filepath, output, batch=False, data_root=None):
+def cmd_convert(filepath, output, batch=False, data_root=None, skin=True):
     """Convert SRM to GLB."""
     if batch:
         count = 0
@@ -610,6 +726,8 @@ def cmd_convert(filepath, output, batch=False, data_root=None):
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     try:
                         nodes = parse_srm(srm_path)
+                        if skin:
+                            bake_skinning(nodes)
                         tex_dirs = _get_texture_dirs(srm_path, data_root)
                         nodes_to_glb(nodes, out_path, tex_dirs)
                         count += 1
@@ -620,6 +738,8 @@ def cmd_convert(filepath, output, batch=False, data_root=None):
         print(f"Converted {count} files")
     else:
         nodes = parse_srm(filepath)
+        if skin:
+            bake_skinning(nodes)
         if not output:
             output = os.path.splitext(filepath)[0] + '.glb'
         tex_dirs = _get_texture_dirs(filepath, data_root)
@@ -648,13 +768,17 @@ def main():
     p_conv.add_argument('-o', '--output', help='Output GLB file or directory')
     p_conv.add_argument('--batch', action='store_true', help='Batch convert directory')
     p_conv.add_argument('--no-tex', action='store_true', help='Skip texture embedding')
+    p_conv.add_argument('--no-skin', action='store_true',
+                        help='Do not assemble via skinning (use for static '
+                             'models such as buildings, which are already posed)')
 
     args = parser.parse_args()
     if args.command == 'info':
         cmd_info(args.file)
     elif args.command == 'convert':
         cmd_convert(args.file, args.output, getattr(args, 'batch', False),
-                    data_root=None if getattr(args, 'no_tex', False) else None)
+                    data_root=None if getattr(args, 'no_tex', False) else None,
+                    skin=not getattr(args, 'no_skin', False))
 
 
 if __name__ == '__main__':
