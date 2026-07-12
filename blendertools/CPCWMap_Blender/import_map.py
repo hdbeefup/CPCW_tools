@@ -19,6 +19,7 @@ from bpy.props import StringProperty, BoolProperty, FloatProperty, IntProperty
 from bpy_extras.io_utils import ImportHelper
 
 from . import map_format
+from . import protodb
 
 
 # Entity descriptor type -> (collection name, empty display, display size)
@@ -109,8 +110,129 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability):
     return obj
 
 
+# ---------------------------------------------------------------------------
+# Real model placement (Prototype -> ProtoDB -> .srm -> collection instance)
+# ---------------------------------------------------------------------------
+
+def _resolve_data_root(filepath, data_root):
+    """Find the extracted-data root that holds ProtoDB.bin + model folders.
+
+    Uses the user-supplied dir if valid, else walks up from the .map looking for
+    a directory that contains ProtoDB.bin (the extraction root).
+    """
+    if data_root:
+        data_root = bpy.path.abspath(data_root)
+        if os.path.isdir(data_root):
+            return data_root
+    d = os.path.dirname(os.path.abspath(filepath))
+    for _ in range(6):
+        if os.path.isfile(os.path.join(d, 'ProtoDB.bin')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _import_model_collection(context, srm_path, data_root, import_textures):
+    """Import one .srm via the SRM add-on's operator; return its collection.
+
+    Returns None if the SRM importer is unavailable or the import fails.
+    """
+    if not hasattr(bpy.ops.import_scene, 'cpcw_srm'):
+        return None
+    before = set(bpy.data.collections)
+    try:
+        bpy.ops.import_scene.cpcw_srm(
+            filepath=srm_path, import_textures=import_textures,
+            texture_dir=data_root or "", apply_skin='NONE')
+    except Exception as e:
+        print("  model import failed for %s: %s" % (srm_path, e))
+        return None
+    new_cols = [c for c in bpy.data.collections if c not in before]
+    return new_cols[0] if new_cols else None
+
+
+def _place_models(context, mf, root, entities, data_root, import_textures,
+                  models_max):
+    """Resolve each entity's Prototype to a model and place a collection instance.
+
+    Returns the number of instances created. Falls back silently (0) if ProtoDB
+    or the SRM importer is missing; the caller still placed entity Empties.
+    """
+    data_root = _resolve_data_root(mf.filepath, data_root)
+    if not data_root:
+        print("  no ProtoDB.bin found (set 'Data Root'); skipping model placement")
+        return 0
+    proto_path = os.path.join(data_root, 'ProtoDB.bin')
+    if not os.path.isfile(proto_path):
+        print("  ProtoDB.bin not in data root; skipping model placement")
+        return 0
+    try:
+        model_index = protodb.build_model_index(proto_path)
+    except Exception as e:
+        print("  ProtoDB parse failed: %s" % e)
+        return 0
+
+    # Template collections live under a hidden holder so only instances show.
+    templates = bpy.data.collections.new("_MapModelTemplates")
+    root.children.link(templates)
+    context.view_layer.layer_collection.children[root.name].children[
+        templates.name].exclude = True
+
+    inst_col = bpy.data.collections.new("Models")
+    root.children.link(inst_col)
+
+    cache = {}          # model_path -> collection (or None if failed)
+    placed = 0
+    for e in entities:
+        if models_max and placed >= models_max:
+            break
+        guid = (e.get('Prototype') or '').lower()
+        model = model_index.get(guid)
+        pos = e.get('Pos')
+        if not model or not isinstance(pos, (list, tuple)) or len(pos) < 3:
+            continue
+        if model not in cache:
+            srm_path = os.path.normpath(os.path.join(data_root, model))
+            col = (_import_model_collection(context, srm_path, data_root,
+                                            import_textures)
+                   if os.path.isfile(srm_path) else None)
+            if col is not None:
+                # move template out of the scene view; keep as instance source
+                try:
+                    context.scene.collection.children.unlink(col)
+                except Exception:
+                    pass
+                templates.children.link(col)
+            cache[model] = col
+        col = cache[model]
+        if col is None:
+            continue
+        inst = bpy.data.objects.new("%s.%s" % (
+            os.path.splitext(os.path.basename(model))[0], e.get('ID', '')), None)
+        inst.instance_type = 'COLLECTION'
+        inst.instance_collection = col
+        inst.location = (float(pos[0]), float(pos[1]), float(pos[2]))
+        d = e.get('Dir')
+        if isinstance(d, (list, tuple)) and d:
+            inst.rotation_euler = (0.0, 0.0, math.radians(float(d[0])))
+        sc = e.get('Scale')
+        if isinstance(sc, (int, float)) and sc:
+            inst.scale = (float(sc), float(sc), float(sc))
+        inst["cpcw_prototype"] = e.get('Prototype', '')
+        inst["cpcw_model"] = model
+        inst_col.objects.link(inst)
+        placed += 1
+    print("  placed %d model instances (%d unique models)" %
+          (placed, sum(1 for v in cache.values() if v)))
+    return placed
+
+
 def load_map(context, filepath, place_entities=True, build_terrain=True,
-             tint_passability=True, max_entities=0):
+             tint_passability=True, max_entities=0, place_models=False,
+             data_root="", import_textures=True, models_max=0):
     """Import a .map file: terrain + entity Empties. Returns the root collection."""
     mf = map_format.MapFile(filepath)
     world_w, world_h = _get_world_size(mf)
@@ -171,8 +293,16 @@ def load_map(context, filepath, place_entities=True, build_terrain=True,
             col_for(col_name).objects.link(obj)
             n_placed += 1
 
+    n_models = 0
+    if place_models:
+        entities = mf.get_entities()
+        if max_entities and max_entities > 0:
+            entities = entities[:max_entities]
+        n_models = _place_models(context, mf, root, entities, data_root,
+                                 import_textures, models_max)
+
     print(f"Imported map {filepath}: world {world_w:.0f}x{world_h:.0f}, "
-          f"{n_placed} entities placed")
+          f"{n_placed} entities placed, {n_models} models")
     return root, n_placed
 
 
@@ -193,11 +323,26 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
         description="Colour the terrain grid by the BLCK passability data "
                     "(green = passable, red = blocked)")
     place_entities: BoolProperty(
-        name="Place Entities", default=True,
+        name="Place Entity Markers", default=True,
         description="Add an Empty for each placed entity (unit/building/doodad)")
     max_entities: IntProperty(
         name="Max Entities", default=0, min=0,
         description="Limit number of entities placed (0 = all)")
+    place_models: BoolProperty(
+        name="Place Real Models", default=False,
+        description="Resolve each entity's Prototype via ProtoDB and instance "
+                    "its actual .srm model (needs the SRM add-on enabled and the "
+                    "extracted data root). Slower, but matches the in-game look")
+    data_root: StringProperty(
+        name="Data Root", default="", subtype='DIR_PATH',
+        description="Extracted game-data folder containing ProtoDB.bin and the "
+                    "model folders (auto-detected from the .map path if blank)")
+    import_textures: BoolProperty(
+        name="Model Textures", default=True,
+        description="Load DDS textures on the placed models")
+    models_max: IntProperty(
+        name="Max Models", default=0, min=0,
+        description="Limit number of model instances placed (0 = all)")
 
     def execute(self, context):
         try:
@@ -205,7 +350,11 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
                                place_entities=self.place_entities,
                                build_terrain=self.build_terrain,
                                tint_passability=self.tint_passability,
-                               max_entities=self.max_entities)
+                               max_entities=self.max_entities,
+                               place_models=self.place_models,
+                               data_root=self.data_root,
+                               import_textures=self.import_textures,
+                               models_max=self.models_max)
         except Exception as e:
             self.report({'ERROR'}, f"Map import failed: {e}")
             return {'CANCELLED'}
@@ -220,6 +369,11 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
         layout.prop(self, "place_entities")
         if self.place_entities:
             layout.prop(self, "max_entities")
+        layout.prop(self, "place_models")
+        if self.place_models:
+            layout.prop(self, "data_root")
+            layout.prop(self, "import_textures")
+            layout.prop(self, "models_max")
 
 
 def menu_func_import(self, context):
