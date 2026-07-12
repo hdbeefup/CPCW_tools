@@ -74,7 +74,37 @@ suspension0r) belongs on the ROOF but no bone points there — model-specific qu
 - Decompiled loader: `N:\gamePAKdata\re\srm_funcs.txt`. Finder script: `find4.py`
   (find tag immediates + DiffuseTexture refs, decompile). Full analyze+find: `find_all.py`.
 
+## DELIVERED (round-trip session, commit 3911f33)
+- **Byte-faithful writer** `cpcw_srm_writer.py` == `SRM_Blender/srm_writer.py`:
+  `parse()->SrmFile->pack()` reproduces original bytes for **2087/2087** files
+  (container+PMOD nodes+MESH/BONE/INDS/VERS+material trailers; untouched chunks
+  kept raw). This is the user's #1 goal ("import then export shouldn't break").
+- **Blender exporter** `SRM_Blender/export_srm.py` (File > Export > CPCW Model):
+  re-writes from the pristine source stashed on import (`root["cpcw_srm_source"]`);
+  no-edit export is byte-identical; root-level node transform edits are written
+  back. Verified headless in Blender 5.0.1 (no-edit identical + moved body0 → +2.0
+  written back, other nodes untouched).
+- **Usage-based stream classification**: VERS 4th word = D3DDECLUSAGE is the real
+  type (semantic can't tell normal/tangent/binormal apart). Fixed normals never
+  resolving. Rigid bone idx = NORMAL(usage 3) byte3 (corpus-verified
+  max<=nb-1); smooth-skin uses usage 2/1. Applied to srm_format.py + cpcw_srm.py.
+- **Standalone** `cpcw_srm.py roundtrip <file|dir> [--batch]`.
+- Docs updated (FORMAT_SRM VERS/usage table + round-trip note; README export).
+
+## SKINNING: resolved as far as the static file allows
+Concluded (data + Ghidra loader): the file carries **no per-bone inverse-bind**
+(PBND is a bbox). A mesh mixes model-space body + origin-stored bone-local parts;
+the exact rest pose is animation/bind-time driven and not statically recoverable.
+The loader (FUN_004af8a0 -> node reader 004aed60 -> mesh reader 0051a550) only
+deserializes; it does NOT bake transforms. So the Assemble toggle (Full/Parts/Off)
+stays, documented. render_funcs.txt has the loader family; the D3D9 render/skin
+transform was NOT pursued further (unsymbolized, low marginal value). If revisited:
+trace the scene-graph world-matrix update + matrix-palette setup from the model
+class draw method (callers of 004af8a0).
+
 ## NEXT STEPS (resume plan)
+0. (optional) Blender-mesh -> VERS/INDS/BONE encoder for authoring NEW geometry
+   (writer/format ready; only the Blender->stream packer is missing).
 1. Ghidra: find the RENDER/skinning path. Anchors: who consumes mesh+0x24 (bone
    palette) at draw; node scene-graph WORLD-matrix update (parent_world@local);
    whether an inverse-bind is computed at bind time and where wheel vs body differ.
