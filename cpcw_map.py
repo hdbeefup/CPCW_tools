@@ -623,6 +623,121 @@ class MapFile:
             return []
         return self.parse_objs_all(objs)
 
+    def get_heightmap(self):
+        """Return (heights, W, H) for the terrain, or None.
+
+        The terrain elevation is a contiguous **f32 grid of (world_w+1) x
+        (world_h+1)** vertices, row-major, in world units, stored inside the GTRD
+        chunk (after the layer table) at a byte offset that is not necessarily
+        4-aligned. It is located as the longest run of "height-like" f32 values
+        (finite, |v| < 500) across all four byte phases; when that run is longer
+        than the grid (a small preamble precedes it on some maps) the exact start
+        is pinned by correlating against the map's own entity elevations
+        (entities sit on the terrain). Verified against entity Z at R^2 ~ 0.9.
+        """
+        import array as _array
+        d = self.data
+        wrld = self.find_chunk('WRLD')
+        gtrd = self.find_chunk('GTRD')
+        if not wrld or not gtrd:
+            return None
+        WW = wrld.meta.get('width'); WH = wrld.meta.get('height')
+        if not WW or not WH:
+            return None
+        W, H = WW + 1, WH + 1
+        need = W * H
+        gs = gtrd.meta.get('splatmap_offset', gtrd.data_offset)
+        ge = gtrd.offset + 8 + gtrd.size
+
+        # Collect every "height-like" run >= need/2 across all four byte phases.
+        runs = []
+        for phase in range(4):
+            start = gs + phase
+            n = (ge - start) // 4
+            if n <= 0:
+                continue
+            a = _array.array('f')
+            a.frombytes(d[start:start + n * 4])
+            run = 0; rstart = 0
+            for i in range(n):
+                v = a[i]
+                if v == v and -500.0 < v < 500.0:
+                    if run == 0:
+                        rstart = i
+                    run += 1
+                else:
+                    if run >= need // 2:
+                        runs.append((run, start + rstart * 4))
+                    run = 0
+            if run >= need // 2:
+                runs.append((run, start + rstart * 4))
+        if not runs:
+            return None
+
+        # Entity elevations are ground truth (units sit on the terrain): pick the
+        # candidate offset whose grid best predicts them. Falls back to the
+        # longest run's start if there are too few entities to calibrate.
+        E = self._entity_grid_samples(W, H, WW, WH)
+        if len(E) < 20:
+            runs.sort(reverse=True)
+            off = runs[0][1]
+        else:
+            best = (-9.0, runs[0][1])
+            row = 4 * W
+            runs.sort(reverse=True)   # try the longest (usually the grid) first
+            for runlen, r0 in runs:
+                if best[0] > 0.9:     # already a confident fit
+                    break
+                # The grid may start a few rows into the run (a small preamble of
+                # height-like values precedes it on some maps), or the run may be
+                # the whole grid (start == grid). Search a margin of rows past the
+                # start plus any slack, capped to keep import fast.
+                hi = r0 + max((runlen - need) * 4, 0) + row * 16
+                hi = min(hi, r0 + row * 40)
+                for off in range(r0, hi + 1, 4):
+                    r2 = self._height_fit(off, W, E)
+                    if r2 > best[0]:
+                        best = (r2, off)
+            if best[0] < 0.4:
+                return None
+            off = best[1]
+        heights = list(struct.unpack_from('<%df' % need, d, off))
+        return heights, W, H
+
+    def _entity_grid_samples(self, W, H, WW, WH, limit=200):
+        E = []
+        for e in self.get_entities():
+            p = e.get('Pos')
+            if isinstance(p, (list, tuple)) and len(p) >= 3:
+                fx = p[0] / WW * (W - 1); fy = p[1] / WH * (H - 1)
+                if 0 <= fx < W - 1 and 0 <= fy < H - 1:
+                    E.append((fx, fy, p[2]))
+        return E[:limit]
+
+    def _height_fit(self, off, W, E):
+        """R^2 of the grid at ``off`` predicting entity Z (bilinear). Early-out."""
+        d = self.data
+        xs = []; ys = []
+        for fx, fy, ez in E:
+            x0 = int(fx); y0 = int(fy); b = off + (y0 * W + x0) * 4
+            if b + W * 4 + 4 > len(d):
+                return -9.0
+            h00, h10 = struct.unpack_from('<2f', d, b)
+            if h00 != h00 or abs(h00) > 500:
+                return -9.0
+            h01, h11 = struct.unpack_from('<2f', d, b + W * 4)
+            tx = fx - x0; ty = fy - y0
+            xs.append(h00 * (1 - tx) * (1 - ty) + h10 * tx * (1 - ty) +
+                      h01 * (1 - tx) * ty + h11 * tx * ty)
+            ys.append(ez)
+        n = len(xs)
+        if n < 20:
+            return -9.0
+        mx = sum(xs) / n; my = sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs) or 1e-9
+        syy = sum((y - my) ** 2 for y in ys) or 1e-9
+        return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) ** 2 / (sxx * syy)
+
     def get_blck_grid(self):
         """Return the BLCK grid as a list of rows, each row a list of 6-tuples."""
         chunk = self.find_chunk('BLCK')

@@ -44,11 +44,66 @@ def _get_world_size(mf):
     return 512.0, 512.0
 
 
-def _build_terrain(mf, collection, world_w, world_h, tint_passability):
-    """Create a flat ground plane over the world extent (Z=0)."""
+def _build_terrain(mf, collection, world_w, world_h, tint_passability,
+                   use_heightmap=True, height_res=256):
+    """Create a ground plane over the world extent.
+
+    With ``use_heightmap`` the plane is a subdivided grid displaced by the real
+    terrain heightmap (decoded from GTRD); otherwise it is flat at Z=0.
+    """
     verts = [(0.0, 0.0, 0.0), (world_w, 0.0, 0.0),
              (world_w, world_h, 0.0), (0.0, world_h, 0.0)]
     faces = [(0, 1, 2, 3)]
+
+    heightmap = None
+    if use_heightmap:
+        try:
+            heightmap = mf.get_heightmap()
+        except Exception as e:
+            print("  heightmap decode failed: %s" % e)
+            heightmap = None
+
+    if heightmap:
+        heights, HW, HH = heightmap
+
+        def sample(u, v):  # bilinear sample at normalized (u,v) in [0,1]
+            fx = u * (HW - 1); fy = v * (HH - 1)
+            x0 = int(fx); y0 = int(fy)
+            x1 = min(x0 + 1, HW - 1); y1 = min(y0 + 1, HH - 1)
+            tx = fx - x0; ty = fy - y0
+            h00 = heights[y0 * HW + x0]; h10 = heights[y0 * HW + x1]
+            h01 = heights[y1 * HW + x0]; h11 = heights[y1 * HW + x1]
+            return (h00 * (1 - tx) * (1 - ty) + h10 * tx * (1 - ty) +
+                    h01 * (1 - tx) * ty + h11 * tx * ty)
+
+        # Subdivide to at most height_res per axis (full grid can be >500k verts).
+        nx = min(height_res, HW - 1)
+        ny = min(height_res, HH - 1)
+        verts = []
+        for j in range(ny + 1):
+            v = j / ny
+            for i in range(nx + 1):
+                u = i / nx
+                verts.append((u * world_w, v * world_h, sample(u, v)))
+        faces = []
+        for j in range(ny):
+            for i in range(nx):
+                a = j * (nx + 1) + i
+                faces.append((a, a + 1, a + (nx + 1) + 1, a + (nx + 1)))
+
+        mesh = bpy.data.meshes.new("Terrain")
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new("Terrain", mesh)
+        mat = bpy.data.materials.new("TerrainMat")
+        mat.use_nodes = True
+        pr = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if pr:
+            pr.inputs['Roughness'].default_value = 1.0
+            pr.inputs['Base Color'].default_value = (0.32, 0.36, 0.28, 1.0)
+        obj.data.materials.append(mat)
+        collection.objects.link(obj)
+        return obj
 
     grid = None
     gw = gh = 0
@@ -232,7 +287,8 @@ def _place_models(context, mf, root, entities, data_root, import_textures,
 
 def load_map(context, filepath, place_entities=True, build_terrain=True,
              tint_passability=True, max_entities=0, place_models=False,
-             data_root="", import_textures=True, models_max=0):
+             data_root="", import_textures=True, models_max=0,
+             use_heightmap=True, height_res=256):
     """Import a .map file: terrain + entity Empties. Returns the root collection."""
     mf = map_format.MapFile(filepath)
     world_w, world_h = _get_world_size(mf)
@@ -244,7 +300,8 @@ def load_map(context, filepath, place_entities=True, build_terrain=True,
     if build_terrain:
         terr_col = bpy.data.collections.new("Terrain")
         root.children.link(terr_col)
-        _build_terrain(mf, terr_col, world_w, world_h, tint_passability)
+        _build_terrain(mf, terr_col, world_w, world_h, tint_passability,
+                       use_heightmap=use_heightmap, height_res=height_res)
 
     n_placed = 0
     if place_entities:
@@ -316,12 +373,20 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(default="*.map", options={'HIDDEN'})
 
     build_terrain: BoolProperty(
-        name="Build Terrain Plane", default=True,
-        description="Create a flat ground plane over the world extent")
+        name="Build Terrain", default=True,
+        description="Create a ground mesh over the world extent")
+    use_heightmap: BoolProperty(
+        name="Real Heightmap", default=True,
+        description="Displace the terrain by the decoded GTRD elevation grid "
+                    "(matches the in-game hills). If off, a flat plane is built")
+    height_res: IntProperty(
+        name="Terrain Resolution", default=256, min=16, max=1024,
+        description="Max terrain subdivisions per axis when using the heightmap")
     tint_passability: BoolProperty(
-        name="Tint Passability", default=True,
-        description="Colour the terrain grid by the BLCK passability data "
-                    "(green = passable, red = blocked)")
+        name="Tint Passability", default=False,
+        description="Colour a flat terrain grid by the BLCK passability data "
+                    "(green = passable, red = blocked). Ignored when the real "
+                    "heightmap is used")
     place_entities: BoolProperty(
         name="Place Entity Markers", default=True,
         description="Add an Empty for each placed entity (unit/building/doodad)")
@@ -354,7 +419,9 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
                                place_models=self.place_models,
                                data_root=self.data_root,
                                import_textures=self.import_textures,
-                               models_max=self.models_max)
+                               models_max=self.models_max,
+                               use_heightmap=self.use_heightmap,
+                               height_res=self.height_res)
         except Exception as e:
             self.report({'ERROR'}, f"Map import failed: {e}")
             return {'CANCELLED'}
@@ -365,7 +432,11 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
         layout = self.layout
         layout.prop(self, "build_terrain")
         if self.build_terrain:
-            layout.prop(self, "tint_passability")
+            layout.prop(self, "use_heightmap")
+            if self.use_heightmap:
+                layout.prop(self, "height_res")
+            else:
+                layout.prop(self, "tint_passability")
         layout.prop(self, "place_entities")
         if self.place_entities:
             layout.prop(self, "max_entities")
