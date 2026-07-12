@@ -35,17 +35,18 @@ ProtoDB.bin                                       # prototype DB (for future mod
 - **Model:** *File > Import > CPCW Model (.srm)*. Options: uniform *Scale*,
   *Assemble*, *Show Skeleton*, *Import Textures*, and an *Extra Texture Dir*
   (point at the extracted data root so cross-referenced `.dds` files resolve).
-  The model is parented under one Empty that converts SRM's Y-up space to
-  Blender's Z-up.
-  - **Assemble** has three modes:
-    - **Full (articulated)** — *default*. Skins every part by its bone. Correct
-      for fully-articulated models: tanks and tracked vehicles (Patton,
-      bulldozer) where the whole model is bone-local.
-    - **Parts only (static body)** — skins only the small parts (wheels…) and
-      leaves the one large body group in place. Use for cars/models whose body
-      shifts or whose wheels float in Full mode (e.g. the Moskvitch).
-    - **Off (raw bind pose)** — no skinning. Correct for static models
-      (**buildings**), which are authored already-posed in model space.
+  The left-handed→right-handed conversion is baked into geometry (models import
+  upright and un-mirrored); the root Empty carries only the uniform scale.
+  - **Assemble** modes:
+    - **Auto** — *default*. Skins bone-local parts (wheels, turret, tracks,
+      rotors, panels, hulls) into place and leaves already-posed model-space
+      bodies (a civilian car body/speaker) where they are — one setting for
+      tanks, cars, aircraft and buildings. (An inferred proxy for the engine's
+      unstored inverse-bind, not a decoded flag; if a model looks wrong, try the
+      overrides below.)
+    - **Full (debug)** — skins *every* group by its bone. Same as Auto for
+      fully-articulated models; shifts a civilian car body off-centre.
+    - **Off (raw bind pose)** — no skinning; each mesh placed by its node matrix.
 - **Export:** *File > Export > CPCW Model (.srm)*. Select an imported model and
   export. The exporter re-writes from the pristine source file (byte-faithful —
   round-trip verified over all 2087 game models), so importing a game asset and
@@ -83,12 +84,22 @@ converter got wrong:
   `Usage` (0=pos 1=blendweight 2=blendindices 3=normal 4=uv 5=tangent
   6=binormal). This fixed normals never resolving (the old code looked for
   `Semantic == 3`, which no stream has).
-- **Rigid skinning.** Each vertex stores a **bone-palette index in byte 3 of the
-  NORMAL stream** (`Usage == 3`). Corpus-verified: `max(byte3) <= bone_count-1`
-  for every skinned mesh. Vertices are in bone-local space; transforming each by
-  its bone's world matrix assembles the model. Rotations compose `Rx @ Ry @ Rz`.
-  Smooth-skinned meshes (266 of them) instead carry explicit BLENDINDICES
-  (`Usage == 2`) + BLENDWEIGHT (`Usage == 1`) streams.
+- **Left-handed → right-handed (un-mirror).** SRM is DirectX **left-handed**
+  Y-up. The old importer converted to Blender Z-up with `Rx(90°)` — a pure
+  rotation (determinant +1) that leaves every model **mirrored** (train
+  lettering read reversed; the ka_15's one-sided canopy floated off). The fix
+  bakes a **reflection** into geometry: swap `(x,y,z)→(x,z,y)` on positions and
+  normals (det −1) and **reverse triangle winding**; node/bone matrices are
+  conjugated `P·M·P` so the skeleton still assembles.
+- **Rigid skinning + AUTO assembly.** Each vertex stores a **bone-palette index
+  in byte 3 of the NORMAL stream** (`Usage == 3`; corpus-verified
+  `max(byte3) <= bone_count-1`). The game renders `BoneWorld[b] @ InvBind[b] @ v`
+  but stores no InvBind, so **Auto** mode uses a geometric proxy: skin bone-local
+  parts (wheels/turret/tracks/rotors/panels/hulls) by their bone matrix, leave
+  already-posed model-space bodies in place. It matches every tested model but is
+  an inferred heuristic, not a decoded flag — `Full`/`Off` remain as overrides.
+  Rotations compose `Rx @ Ry @ Rz`. Smooth-skinned meshes (266) instead carry
+  explicit BLENDINDICES (`Usage == 2`) + BLENDWEIGHT (`Usage == 1`) streams.
 - **Round-trip writer.** `srm_writer.py` parses to an editable model and
   re-serializes byte-for-byte (all 2087 files). This backs the SRM exporter and
   guarantees import→export fidelity.

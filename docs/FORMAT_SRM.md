@@ -254,6 +254,35 @@ Common DDS formats used: DXT1, DXT3, DXT5.
 
 ## Coordinate System
 
-- Y-up coordinate system
-- Euler rotations in radians, applied as XYZ order
-- Scale includes a 4th component (W), typically 1.0
+- **Left-handed, Y-up** (DirectX convention). This matters: converting to a
+  right-handed target (Blender Z-up, or glTF's right-handed Y-up) requires a
+  **reflection (determinant −1)**, not merely a rotation. Using a pure rotation
+  (e.g. `Rx(90°)` for Y-up→Z-up) leaves the model **mirrored** — reversed text,
+  one-sided parts landing on the wrong side. The Blender importer bakes the
+  reflection into geometry: swap each position/normal `(x,y,z)→(x,z,y)` **and
+  reverse triangle winding** so faces stay outward; node/bone matrices are
+  conjugated `P·M·P`. See `blendertools/SRM_Blender/import_srm.py`.
+- Euler rotations in radians; the node matrix composes **`Rx @ Ry @ Rz`** (NOT
+  the same as a `Euler('XYZ')` which multiplies `Rz @ Ry @ Rx`).
+- Scale includes a 4th component (W), typically 1.0.
+
+## Rigid skinning / assembly
+
+Each vertex names one bone (palette index = byte 3 of the NORMAL stream). The
+engine renders `world_v = BoneWorld[bone] @ InvBind[bone] @ v`, but the SRM
+stores **no InvBind** (BONE is only a u16 node palette; PBND is a bounding box).
+Empirically the geometry is authored in a mix:
+
+- **bone-local** parts (wheels, gun barrels, turret, tracks, rotor blades,
+  building window panels, whole tank hulls) are stored at their bone's origin →
+  `InvBind = I` → transform by `BoneWorld[bone]`.
+- **model-space** parts (a civilian car body/speaker authored already-posed and
+  merely anchored to a side node) are stored at their final position →
+  `InvBind = BoneWorld[bone]⁻¹` → leave in place.
+
+The render path was not recovered from the binary, so the importer's **AUTO**
+mode uses a geometric proxy to pick skin-vs-leave per group (a group is left only
+when it spans most of the mesh AND skinning it would shove it off the x=0 centre
+line). This matches every tested model (car, tank, helicopter, buildings) but is
+a heuristic, not a decoded flag; `FULL` (skin all) and `NONE` (skin none) remain
+as overrides.
