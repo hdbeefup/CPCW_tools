@@ -5,13 +5,16 @@ materials with DDS textures (decoded by dds.py).
 
 CPCW models are rigidly skinned: each mesh vertex is stored in the local space
 of one skeleton bone (the bone-palette index is byte 3 of the normal stream) and
-the skeleton is a node hierarchy (each node's parent is its `unk3`). To assemble
-a model we compose each bone's world matrix up the parent chain and transform
-every vertex by its bone's world matrix. The assembled model is then parented
-under one root Empty that converts SRM's Y-up space to Blender's Z-up.
+the skeleton is a node hierarchy (each node's parent is its `unk3`). Assembly is
+two steps: (1) transform each vertex by its bone's composed world matrix -- but
+only for bone-local parts, leaving already-posed model-space bodies in place
+(see `_skin_decisions`, an inferred proxy for the engine's inverse-bind); then
+(2) convert SRM's DirectX LEFT-handed Y-up frame to Blender's right-handed Z-up
+by BAKING a reflection into the geometry -- swap (x,y,z)->(x,z,y) and reverse
+triangle winding (see `_HAND`). The old importer used a pure rotation Rx(90) for
+step 2, which is determinant +1 and therefore left every model MIRRORED.
 """
 
-import math
 import os
 
 import bpy
@@ -158,6 +161,35 @@ def _make_material(submesh, search_dirs, import_textures, img_cache, mat_cache):
 
 
 # ---------------------------------------------------------------------------
+# Handedness
+# ---------------------------------------------------------------------------
+#
+# SRM uses DirectX's LEFT-handed, Y-up frame; Blender is RIGHT-handed, Z-up.
+# Converting between them needs a REFLECTION (determinant -1), not merely a
+# rotation.  The old importer used Matrix.Rotation(90,'X') (determinant +1) as
+# the root transform: that maps Y-up->Z-up but PRESERVES the left-handedness,
+# so every model came in MIRRORED (the train's "DEUTSCHE" read "EHCSTUED" from
+# outside, symmetric hulls hid it, and the ka_15's one-sided canopy exposed it).
+#
+# The correct map is the axis swap (x, y, z) -> (x, z, y): it carries Y-up->Z-up
+# AND flips handedness (it is a single transposition, determinant -1).  We BAKE
+# it into geometry (swap every vertex/normal component and REVERSE triangle
+# winding so faces stay outward) rather than hang a negative-determinant matrix
+# on the root Empty -- baked geometry keeps each object at positive scale so
+# Blender shades it right-side-out.  Node/bone matrices are conjugated
+# (P @ M @ P) so the skeleton still assembles and stays a proper rotation.
+_HAND = Matrix(((1, 0, 0, 0),
+                (0, 0, 1, 0),
+                (0, 1, 0, 0),
+                (0, 0, 0, 1)))  # swap Y/Z, determinant -1
+
+
+def _swap_pt(p):
+    """Bake the LH->RH axis swap into a point: (x, y, z) -> (x, z, y)."""
+    return (p[0], p[2], p[1])
+
+
+# ---------------------------------------------------------------------------
 # Mesh building
 # ---------------------------------------------------------------------------
 
@@ -193,40 +225,80 @@ def _build_world_matrices(nodes):
     return [world(i) for i in range(len(nodes))]
 
 
-def _compact_bone_groups(verts, bone_idx, ratio=0.85):
-    """Decide which bone groups are compact enough to be skinned.
+def _skin_decisions(verts, bone_idx, palette, world_mats,
+                    dom_ratio=0.6, offcenter_frac=0.15):
+    """Decide, per bone-palette group, whether to SKIN it (apply the bone's
+    world matrix) or LEAVE it in place (model space).
 
-    Returns {bone_index: bool}. A group is skinned unless it spans almost the
-    whole mesh: the *static body* of a model (a car body, a building shell) is
-    one bone group that covers the entire mesh and is authored already-posed in
-    model space, so skinning it would shift/explode it. Articulated parts
-    (wheels, turret, running gear) each cover only part of the mesh and are
-    stored bone-local, so they are skinned into place.
+    NOTE: this is an INFERRED PROXY, not the game's exact rule. The game renders
+    ``world_v = BoneWorld[b] @ InvBind[b] @ v``; the SRM stores no InvBind and
+    the render path was not recovered from the binary, so we reconstruct the
+    skin/leave decision geometrically. It reproduces every ground-truth model we
+    checked (moskvitch car, Patton tank, ka_15 helicopter, buildings) but is a
+    heuristic with hand-tuned thresholds, not a decoded format field — if a model
+    looks wrong, fall back to the FULL or NONE override. The distinction the game
+    encodes: bone-local parts have ``InvBind = I`` while already-posed model-space
+    parts have ``InvBind = BoneWorld[b]**-1``:
+
+    * **bone-local** parts (wheels, gun barrels, turret, tracks, rotor blades,
+      building panels, and even whole hulls like the Patton's) are authored at
+      their bone's origin, so ``InvBind = I`` and ``world_v = BoneWorld[b] @ v``
+      -> **SKIN**.
+    * **model-space** parts (a civilian car body/speaker authored already-posed
+      and merely *anchored* to a side node such as ``suspension0l``) have
+      ``InvBind = BoneWorld[b]**-1``, so ``world_v = v`` -> **LEAVE**.
+
+    The two are told apart by a robust, vehicle-agnostic proxy for that InvBind:
+    a group is model-space (LEAVE) only when it BOTH (a) spans most of the mesh
+    (a whole body, ``gdiag >= dom_ratio * mesh_diag``) AND (b) skinning it would
+    shove that body OFF the x=0 longitudinal centre-line that every vehicle body
+    is authored symmetric about (``|skin_cx| - |stored_cx| > offcenter_frac *
+    x_extent``).  A bone-local body sits on a central bone (Patton ``body0``,
+    world Tx~0) so skinning keeps it centred -> SKIN; a model-space body is
+    anchored to a lateral bone (``suspension0l``, world Tx~-0.6) so skinning
+    shoves it sideways -> LEAVE.  Small parts never meet (a) and always SKIN.
+
+    Returns ``{palette_index: skin_bool}``.
     """
     groups = {}
     for vi, bi in enumerate(bone_idx):
         groups.setdefault(bi, []).append(verts[vi])
-    # whole-mesh diagonal
     xs = [p[0] for p in verts]; ys = [p[1] for p in verts]; zs = [p[2] for p in verts]
     mesh_diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 +
                  (max(zs) - min(zs)) ** 2) ** 0.5 or 1.0
+    x_extent = (max(xs) - min(xs)) or 1.0
     out = {}
     for bi, pts in groups.items():
         gx = [p[0] for p in pts]; gy = [p[1] for p in pts]; gz = [p[2] for p in pts]
         gdiag = ((max(gx) - min(gx)) ** 2 + (max(gy) - min(gy)) ** 2 +
                  (max(gz) - min(gz)) ** 2) ** 0.5
-        out[bi] = (gdiag / mesh_diag) < ratio
+        cx = sum(gx) / len(pts); cy = sum(gy) / len(pts); cz = sum(gz) / len(pts)
+        skin = True
+        bn = palette[bi] if 0 <= bi < len(palette) else -1
+        if 0 <= bn < len(world_mats):
+            sc = world_mats[bn] @ Vector((cx, cy, cz))
+            dominant = gdiag >= dom_ratio * mesh_diag
+            off_center = abs(sc.x) - abs(cx) > offcenter_frac * x_extent
+            if dominant and off_center:
+                skin = False
+        out[bi] = skin
     return out
 
 
-def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
+def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO'):
     """Build a Blender mesh datablock from an SrmNode's mesh.
 
     CPCW meshes are rigidly skinned: each vertex carries a bone-palette index
-    (byte 3 of the normal stream) and is stored in that bone's local space. To
-    assemble the model we transform each vertex by its bone's world matrix
-    (composed via the node parent hierarchy). Without this, parts collapse to
-    the skeleton origin (wheels stacked at centre, etc.).
+    (byte 3 of the normal stream).  We (1) assemble in SRM space by transforming
+    each vertex by its bone's world matrix -- per :func:`_skin_decisions`, which
+    skins articulated/bone-local parts and leaves already-posed model-space
+    bodies -- then (2) BAKE the LH->RH handedness swap into the result: swap each
+    position/normal component (x,y,z)->(x,z,y) and REVERSE triangle winding so
+    faces stay outward (see :data:`_HAND`).
+
+    ``apply_skin``:  'AUTO' = the true per-group rule (default);  'FULL' = skin
+    every group (debug/fully-articulated);  'NONE' = raw bind pose, no skinning
+    (mesh is placed by its node's world matrix in :func:`load_srm`).
     """
     mesh = node.mesh
     pos_stream = mesh.stream_by_usage(srm_format.USAGE_POSITION)
@@ -235,38 +307,48 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
 
     verts = list(pos_stream.positions())
     idx = mesh.indices
-    faces = [(idx[i], idx[i + 1], idx[i + 2]) for i in range(0, len(idx) - 2, 3)]
+    # Winding REVERSED (v0, v2, v1): the handedness swap is a reflection, which
+    # flips triangle orientation; reversing restores outward-facing normals.
+    faces = [(idx[i], idx[i + 2], idx[i + 1]) for i in range(0, len(idx) - 2, 3)]
 
-    # Per-vertex bone (palette index) for rigid skinning.
+    norm_stream = mesh.stream_by_usage(srm_format.USAGE_NORMAL)
+    normals = list(norm_stream.normals()) if norm_stream is not None else None
+
+    # (1) Assemble in SRM space (skip in NONE; the object matrix places it).
     bone_idx = None
-    rot3 = None  # per-node 3x3 rotation for skinning normals
-    skin_group = None
     if apply_skin != 'NONE' and nodes is not None and world_mats is not None:
         bone_idx = mesh.vertex_bone_indices()
     if bone_idx is not None:
         palette = mesh.bones
-        rot3 = [wm.to_3x3() for wm in world_mats]
-        # A CPCW mesh may MIX model-space geometry (a static car body, already
-        # posed) with bone-local parts (wheels stored at the origin, positioned
-        # by their bone). In 'PARTS' mode we skin only the compact parts and
-        # leave the one whole-mesh-spanning body group in place; in 'FULL' mode
-        # every group is skinned (correct for fully-articulated models where
-        # even the body is bone-local). The two cases are geometrically
-        # indistinguishable, hence the user-selectable mode.
-        if apply_skin == 'PARTS':
-            skin_group = _compact_bone_groups(verts, bone_idx)
-        else:
+        if apply_skin == 'FULL':
             skin_group = {bi: True for bi in set(bone_idx)}
-        skinned = []
+        else:  # 'AUTO'
+            skin_group = _skin_decisions(verts, bone_idx, palette, world_mats)
+        rot3 = [wm.to_3x3() for wm in world_mats]
+        out_v = []
+        out_n = [] if normals is not None else None
         for vi, p in enumerate(verts):
             bi = bone_idx[vi]
-            if (skin_group.get(bi) and 0 <= bi < len(palette)
-                    and 0 <= palette[bi] < len(world_mats)):
-                v = world_mats[palette[bi]] @ Vector(p)
-                skinned.append((v.x, v.y, v.z))
+            bn = palette[bi] if 0 <= bi < len(palette) else -1
+            if skin_group.get(bi) and 0 <= bn < len(world_mats):
+                v = world_mats[bn] @ Vector(p)
+                out_v.append((v.x, v.y, v.z))
+                if out_n is not None and vi < len(normals):
+                    nn = rot3[bn] @ Vector(normals[vi])
+                    out_n.append((nn.x, nn.y, nn.z))
+                elif out_n is not None:
+                    out_n.append((0.0, 0.0, 1.0))
             else:
-                skinned.append(p)
-        verts = skinned
+                out_v.append(p)
+                if out_n is not None:
+                    out_n.append(normals[vi] if vi < len(normals) else (0.0, 0.0, 1.0))
+        verts = out_v
+        normals = out_n if out_n is not None else normals
+
+    # (2) Bake the LH->RH handedness swap into positions and normals.
+    verts = [_swap_pt(p) for p in verts]
+    if normals is not None:
+        normals = [_swap_pt(n) for n in normals]
 
     bl_mesh = bpy.data.meshes.new(name)
     bl_mesh.from_pydata(verts, [], faces)
@@ -283,36 +365,29 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
                 u, v = uvs[vi]
                 uv_layer.data[loop.index].uv = (u, 1.0 - v)
 
-    # Custom split normals (rotated by the bone if skinned)
-    norm_stream = mesh.stream_by_usage(srm_format.USAGE_NORMAL)
-    if norm_stream is not None and bl_mesh.polygons:
-        normals = list(norm_stream.normals())
-        if bone_idx is not None and rot3 is not None:
-            palette = mesh.bones
-            for vi in range(min(len(normals), len(bone_idx))):
-                bi = bone_idx[vi]
-                if (skin_group and skin_group.get(bi)
-                        and 0 <= bi < len(palette) and 0 <= palette[bi] < len(rot3)):
-                    nrm = rot3[palette[bi]] @ Vector(normals[vi])
-                    normals[vi] = (nrm.x, nrm.y, nrm.z)
-        if len(normals) >= len(verts):
-            loop_normals = []
-            for loop in bl_mesh.loops:
-                vi = loop.vertex_index
-                loop_normals.append(normals[vi] if vi < len(normals) else (0.0, 0.0, 1.0))
-            try:
-                bl_mesh.normals_split_custom_set(loop_normals)
-            except (AttributeError, RuntimeError):
-                pass  # Blender 4.1+ removed this; auto normals are fine for preview
+    # Custom split normals (already assembled + swapped above)
+    if normals is not None and bl_mesh.polygons and len(normals) >= len(verts):
+        loop_normals = []
+        for loop in bl_mesh.loops:
+            vi = loop.vertex_index
+            loop_normals.append(normals[vi] if vi < len(normals) else (0.0, 0.0, 1.0))
+        try:
+            bl_mesh.normals_split_custom_set(loop_normals)
+        except (AttributeError, RuntimeError):
+            pass  # Blender 4.1+ removed this; auto normals are fine for preview
 
     return bl_mesh
 
 
 def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
-             apply_skin='FULL', show_skeleton=False):
-    """Import an SRM file. apply_skin is 'FULL', 'PARTS' or 'NONE'."""
+             apply_skin='AUTO', show_skeleton=False):
+    """Import an SRM file. apply_skin is 'AUTO', 'FULL' or 'NONE'."""
     nodes = srm_format.parse_srm(filepath)
     world_mats = _build_world_matrices(nodes)
+    # Node/bone world matrices expressed in Blender space: conjugate by the
+    # handedness swap (P @ M @ P, P == P**-1) so Empties and NONE-mode meshes
+    # sit consistently with the baked geometry and stay proper rotations.
+    world_mats_bl = [_HAND @ wm @ _HAND for wm in world_mats]
 
     model_dir = os.path.dirname(os.path.abspath(filepath))
     search_dirs = [model_dir]
@@ -323,11 +398,13 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
     collection = bpy.data.collections.new(model_name)
     context.scene.collection.children.link(collection)
 
-    # Root Empty: SRM (Y-up) -> Blender (Z-up) + uniform scale.
+    # Root Empty: handedness (Y-up LH -> Z-up RH) is baked into the geometry, so
+    # the root only carries the user's uniform scale -- no rotation, no negative
+    # determinant (which would flip child normals inside-out).
     root = bpy.data.objects.new(model_name, None)
     root.empty_display_type = 'PLAIN_AXES'
     root.empty_display_size = 0.5
-    root.matrix_basis = Matrix.Rotation(math.radians(90.0), 4, 'X') @ Matrix.Scale(scale, 4)
+    root.matrix_basis = Matrix.Scale(scale, 4)
     # Stash the source path so the exporter can round-trip from the pristine
     # file (see export_srm.py) and record the assemble mode used.
     root["cpcw_srm_source"] = os.path.abspath(filepath)
@@ -348,18 +425,18 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
                 obj.data.materials.append(
                     _make_material(sm, search_dirs, import_textures,
                                    img_cache, mat_cache))
-            # With no skinning, place the mesh at its node's world transform;
-            # skinned vertices are already baked into model space (identity).
+            # With no skinning, place the mesh at its node's (Blender-space)
+            # world transform; assembled meshes already bake world+swap in.
             if apply_skin == 'NONE':
-                obj.matrix_basis = world_mats[i]
+                obj.matrix_basis = world_mats_bl[i]
         else:
             if not show_skeleton:
                 continue
             obj = bpy.data.objects.new(obj_name, None)
             obj.empty_display_type = 'ARROWS'
             obj.empty_display_size = 0.1
-            # place skeleton bone at its world transform (for reference)
-            obj.matrix_basis = world_mats[i]
+            # place skeleton bone at its (Blender-space) world transform
+            obj.matrix_basis = world_mats_bl[i]
 
         obj["cpcw_node_index"] = i
         obj["cpcw_parent"] = node.parent_idx
@@ -406,18 +483,20 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         name="Assemble",
         description="How to assemble the model from its skeleton",
         items=[
-            ('FULL', "Full (articulated)",
-             "Skin every part by its bone. Correct for fully-articulated models "
-             "(tanks, tracked vehicles) where the whole model is bone-local"),
-            ('PARTS', "Parts only (static body)",
-             "Skin only the small parts (wheels, etc.) and leave the one large "
-             "body group in place. Use for cars/models whose body shifts or "
-             "whose wheels float in Full mode"),
+            ('AUTO', "Auto (recommended)",
+             "Inferred assembly (a geometric proxy for the engine's inverse-bind, "
+             "not a decoded flag): skin articulated/bone-local parts (wheels, "
+             "turret, tracks, rotors, building panels, hulls) into place, and "
+             "leave already-posed model-space bodies (e.g. a civilian car "
+             "body/speaker) where they are. Matches tested tanks, cars, aircraft "
+             "and buildings; if a model looks wrong, try Full or Off"),
+            ('FULL', "Full (debug)",
+             "Skin every group by its bone. Same as Auto for fully-articulated "
+             "models; shifts a civilian car body off-centre (kept for debugging)"),
             ('NONE', "Off (raw bind pose)",
-             "No skinning. Correct for static models (buildings) which are "
-             "authored already-posed"),
+             "No skinning; each mesh placed by its node's world matrix only"),
         ],
-        default='FULL',
+        default='AUTO',
     )
     show_skeleton: BoolProperty(
         name="Show Skeleton",
