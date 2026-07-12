@@ -8,3 +8,6 @@ blendertools/*.zip
 
 # Converted / exported assets
 *.glb
+
+# Render outputs (regenerable)
+renders/

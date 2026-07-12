@@ -1,5 +1,46 @@
 # CPCW Blender tools — work state (resume notes)
 
+## LATEST SESSION (handedness + skinning + map preview) — all committed
+Big deliverables since the round-trip writer:
+- **Handedness fix (commit 37cd613):** .srm is DirectX LEFT-handed; old Rx(90)
+  root left every model MIRRORED (train text reversed, ka_15 windows "floated").
+  Now baked reflection swap (x,y,z)->(x,z,y) + reversed winding + node matrices
+  conjugated P·M·P. Root Empty = scale only. See [[srm-handedness]] memory.
+- **AUTO skinning (37cd613):** replaced FULL/PARTS/NONE default with per-group
+  rule `_skin_decisions` (skin bone-local parts, leave posed model-space bodies).
+  INFERRED heuristic (render path NOT recovered), FULL/NONE kept as overrides.
+- **Named-prop attach (387e498):** props named after an unk4=8 attach node
+  (moskvitch roof `speaker`, Studebaker `awning`, `helipad`) get pinned there
+  (`_attach_override`, texture-basename == node-name). Fires on 3/2087 models.
+  Speaker now on the roof (verified Z[1.34,1.82] above body 1.21).
+- **Export handedness (5f5758d):** node writeback conjugates P·matrix_local·P;
+  no-edit round-trip still byte-identical.
+- **Map real models (b5ba6db):** Prototype GUID -> ProtoDB ModelName -> .srm,
+  instanced at Pos/yaw/Scale (849/859 on a Domination map). protodb.py vendored.
+- **Map real terrain (2c4c04c):** GTRD f32 (w+1)x(h+1) heightmap, entity-Z
+  calibrated locate (R2 0.72-1.0). get_heightmap() in cpcw_map + addon.
+- Docs updated (FORMAT_SRM handedness/assembly + MAP_FORMAT §7.4). Renders in
+  N:\ProjectsCODE\CPCW_tools\renders\ (gitignored). Verified via headless Blender.
+
+### STILL TODO (user: "still work to be had, will continue next day")
+- **moskvitch body ~0.1-0.2 too low** (wheels clip the body/arches). Its body
+  binds to `suspension0l` (base moskvitch401 binds body->`body0`); AUTO leaves it
+  model-space (correct) but the exact ground-clearance offset isn't in the file;
+  skinning by body0 DISTORTS it (180deg yaw). Needs the real inverse-bind rule.
+- **AUTO skinning is a heuristic, not the game's true rule.** The Ghidra
+  render/skinning path was NOT recovered (the workflow's ghidra agent failed on a
+  structured-output cap; my find_attach.py showed the only name-based node assoc
+  is GAMEPLAY mounts, not mesh render-attach). To make skinning exact, still need
+  to reverse the D3D draw path / the load-time inverse-bind computation. Ghidra
+  project ready at N:\gamePAKdata\re\gp; dumps: srm_funcs.txt, render_funcs.txt,
+  map_funcs.txt, attach_funcs.txt.
+- **Patton etc. show all upgrade variants** (camo-net/gun std+upgraded parts all
+  present, some "floating" at attach points). Expected (all variants in one file);
+  a variant filter could be added later.
+- **Standalone cpcw_srm.py glTF export still has the latent mirror** (writes LH
+  coords into RH glTF). Deferred; documented in [[srm-handedness]].
+- **Map terrain has no splat textures** (grey). Terrain is geometrically correct.
+
 ## Goal
 Blender import (and eventually export) of Codename: Panzers Cold War `.srm` models
 + `.map` scenarios. User wants: (1) import faithful to how the GAME reads the file
