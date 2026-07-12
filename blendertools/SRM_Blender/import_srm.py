@@ -285,7 +285,32 @@ def _skin_decisions(verts, bone_idx, palette, world_mats,
     return out
 
 
-def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO'):
+def _attach_override(mesh, nodes, attach_nodes):
+    """Return a node index a whole mesh should be pinned to, or None.
+
+    A few add-on props (the moskvitch's roof *speaker*, a Studebaker *awning*, a
+    *helipad*) are separate meshes named after a dedicated attach node (unk4=8,
+    no mesh of its own). The mesh-merge that produced the shipped .srm rebound
+    them to an unrelated physics/suspension bone, so their bone palette places
+    them wrong. When a mesh's texture basename exactly matches such an attach
+    node — and that node is NOT already in its palette — pin the whole mesh to
+    it. Corpus-verified: this fires on exactly 3 of 2087 models, all genuine
+    prop attachments, so it cannot mis-skin ordinary meshes.
+    """
+    if not attach_nodes:
+        return None
+    palette = set(mesh.bones)
+    for sm in mesh.submeshes:
+        for tex in sm.textures.values():
+            base = os.path.splitext(os.path.basename(tex.replace('\\', '/')))[0].lower()
+            ni = attach_nodes.get(base)
+            if ni is not None and ni not in palette:
+                return ni
+    return None
+
+
+def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
+                attach_nodes=None):
     """Build a Blender mesh datablock from an SrmNode's mesh.
 
     CPCW meshes are rigidly skinned: each vertex carries a bone-palette index
@@ -318,9 +343,13 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO'):
     bone_idx = None
     if apply_skin != 'NONE' and nodes is not None and world_mats is not None:
         bone_idx = mesh.vertex_bone_indices()
+    # A named-prop mesh (speaker/awning/…) is pinned wholesale to its attach node.
+    attach_ni = _attach_override(mesh, nodes, attach_nodes) if apply_skin != 'NONE' else None
     if bone_idx is not None:
         palette = mesh.bones
-        if apply_skin == 'FULL':
+        if attach_ni is not None:
+            skin_group = {bi: True for bi in set(bone_idx)}
+        elif apply_skin == 'FULL':
             skin_group = {bi: True for bi in set(bone_idx)}
         else:  # 'AUTO'
             skin_group = _skin_decisions(verts, bone_idx, palette, world_mats)
@@ -329,7 +358,7 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO'):
         out_n = [] if normals is not None else None
         for vi, p in enumerate(verts):
             bi = bone_idx[vi]
-            bn = palette[bi] if 0 <= bi < len(palette) else -1
+            bn = attach_ni if attach_ni is not None else (palette[bi] if 0 <= bi < len(palette) else -1)
             if skin_group.get(bi) and 0 <= bn < len(world_mats):
                 v = world_mats[bn] @ Vector(p)
                 out_v.append((v.x, v.y, v.z))
@@ -384,6 +413,9 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
     """Import an SRM file. apply_skin is 'AUTO', 'FULL' or 'NONE'."""
     nodes = srm_format.parse_srm(filepath)
     world_mats = _build_world_matrices(nodes)
+    # Named attach nodes (unk4=8, no mesh) for prop meshes (see _attach_override).
+    attach_nodes = {n.name.lower(): i for i, n in enumerate(nodes)
+                    if n.mesh is None and n.unk4 == 8 and n.name}
     # Node/bone world matrices expressed in Blender space: conjugate by the
     # handedness swap (P @ M @ P, P == P**-1) so Empties and NONE-mode meshes
     # sit consistently with the baked geometry and stay proper rotations.
@@ -419,7 +451,8 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
         obj_name = node.name or f"node_{i}"
 
         if node.mesh:
-            bl_mesh = _build_mesh(node, obj_name, nodes, world_mats, apply_skin)
+            bl_mesh = _build_mesh(node, obj_name, nodes, world_mats, apply_skin,
+                                  attach_nodes)
             obj = bpy.data.objects.new(obj_name, bl_mesh)
             for sm in node.mesh.submeshes:
                 obj.data.materials.append(
