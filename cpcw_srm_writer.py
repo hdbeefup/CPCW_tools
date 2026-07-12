@@ -117,6 +117,71 @@ class WMesh:
                 return v
         return None
 
+    def indices(self):
+        """Return the index buffer as a list of ints."""
+        if not self.inds_raw:
+            return []
+        count = _u32(self.inds_raw, 8)
+        stride = _u32(self.inds_raw, 12)
+        fmt = '<%d%s' % (count, 'H' if stride == 2 else 'I')
+        return list(struct.unpack_from(fmt, self.inds_raw, 16))
+
+    def positions(self):
+        """Decode the POSITION stream to a list of (x, y, z), or []."""
+        v = self.stream_by_usage(USAGE_POSITION)
+        if v is None:
+            return []
+        return [struct.unpack_from('<3f', v.data, i * v.stride)
+                for i in range(v.vcount)]
+
+    def replace_geometry(self, positions, indices, uvs=None, normals=None,
+                         bone_indices=None):
+        """Rewrite this mesh's geometry from plain Python data, in place.
+
+        Keeps the existing stream *set*, usages, strides and material trailer —
+        only the vertex data, counts and index buffer change — so the result
+        stays a structurally valid, game-shaped MESH. ``positions`` is a list of
+        (x,y,z); ``indices`` a flat triangle-index list; ``uvs`` a list of (u,v);
+        ``normals`` a list of (nx,ny,nz); ``bone_indices`` a per-vertex palette
+        index (0..len(bones)-1) written into NORMAL byte 3 for rigid skinning.
+
+        All streams are resized to ``len(positions)``. Only usages POSITION(12),
+        TEXCOORD(8), NORMAL/TANGENT/BINORMAL(4) are re-encoded; any other stream
+        is truncated/zero-extended to the new count (raise if you need those).
+        """
+        n = len(positions)
+        for v in self.streams:
+            if v.usage == USAGE_POSITION and v.stride == 12:
+                v.data = b''.join(struct.pack('<3f', *positions[i]) for i in range(n))
+            elif v.usage == USAGE_TEXCOORD and v.stride == 8:
+                src = uvs or [(0.0, 0.0)] * n
+                v.data = b''.join(struct.pack('<2f', src[i][0], src[i][1]) for i in range(n))
+            elif v.usage in (USAGE_NORMAL, USAGE_TANGENT, USAGE_BINORMAL) and v.stride == 4:
+                nsrc = normals if (normals and v.usage == USAGE_NORMAL) else None
+                out = bytearray(4 * n)
+                for i in range(n):
+                    if nsrc is not None:
+                        nx, ny, nz = nsrc[i]
+                        out[i * 4] = _pack_snorm8(nx)
+                        out[i * 4 + 1] = _pack_snorm8(ny)
+                        out[i * 4 + 2] = _pack_snorm8(nz)
+                    if v.usage == USAGE_NORMAL and bone_indices is not None:
+                        out[i * 4 + 3] = bone_indices[i] & 0xFF
+                v.data = bytes(out)
+            else:
+                # unknown stream: keep byte pattern length consistent
+                cur = v.stride * v.vcount
+                want = v.stride * n
+                v.data = (v.data[:want] if want <= cur
+                          else v.data + b'\x00' * (want - cur))
+            v.vcount = n
+            v.tail = b''  # normalized; original tail was padding we can drop
+
+        stride = 2 if (max(indices) if indices else 0) < 65536 else 4
+        fmt = '<%d%s' % (len(indices), 'H' if stride == 2 else 'I')
+        ibody = struct.pack('<II', len(indices), stride) + struct.pack(fmt, *indices)
+        self.inds_raw = b'INDS' + struct.pack('<I', len(ibody)) + ibody
+
     def pack(self):
         body = struct.pack('<II', self.stream_count, self.submesh_count)
         if self.bone_raw is not None:
@@ -126,6 +191,12 @@ class WMesh:
             body += v.pack()
         body += self.trailing
         return b'MESH' + struct.pack('<I', len(body)) + body
+
+
+def _pack_snorm8(f):
+    """Encode a [-1,1] float to the game's packed-normal byte: (f+1)*127.5."""
+    b = int(round((f + 1.0) * 127.5))
+    return 0 if b < 0 else 255 if b > 255 else b
 
 
 class WPmod:
