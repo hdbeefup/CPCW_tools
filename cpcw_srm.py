@@ -8,13 +8,23 @@ import os
 import struct
 import sys
 
-# Vertex semantic IDs
+# Vertex semantic IDs (raw ``semantic`` word; normal/tangent/binormal all = 4).
 SEM_TEXCOORD = 1
 SEM_POSITION = 2
 SEM_NORMAL = 3
 SEM_TANGENT = 4
 SEM_BINORMAL = 5
 SEM_COLOR = 6
+
+# D3DDECLUSAGE (the VERS ``usage`` word) — the real per-stream type. Prefer
+# these over the semantic aliases above. See cpcw_srm_writer.py / FORMAT_SRM.md.
+USAGE_POSITION = 0
+USAGE_BLENDWEIGHT = 1
+USAGE_BLENDINDICES = 2
+USAGE_NORMAL = 3
+USAGE_TEXCOORD = 4
+USAGE_TANGENT = 5
+USAGE_BINORMAL = 6
 
 
 class SrmNode:
@@ -54,37 +64,35 @@ class SrmMesh:
                 return vs
         return None
 
-    def vertex_bone_indices(self):
-        """Per-vertex bone-palette index (byte 3 of the normal stream), or None.
+    def stream_by_usage(self, usage):
+        """Return the first vertex stream with the given D3DDECLUSAGE, or None."""
+        for vs in self.vertex_streams:
+            if vs.usage == usage:
+                return vs
+        return None
 
-        Models are rigidly skinned: each vertex stores one bone index. The
-        carrier is the stride-4 stream whose byte-3 values span [0, len(bones)-1].
+    def vertex_bone_indices(self):
+        """Per-vertex bone-palette index (byte 3 of the NORMAL stream), or None.
+
+        Rigid skinning stores one bone-palette index per vertex in byte 3 of the
+        NORMAL stream (D3DDECLUSAGE 3). Verified corpus-wide: for every skinned
+        mesh ``max(byte3) <= len(bones)-1``. (``semantic`` cannot select the
+        normal stream: normal/tangent/binormal all share semantic 4 — use usage.)
         """
         if not self.bones:
             return None
-        pos = self.stream(SEM_POSITION)
-        if pos is None:
+        nrm = self.stream_by_usage(USAGE_NORMAL)
+        if nrm is None or nrm.stride != 4:
             return None
-        vcount = pos.vertex_count
-        nb = len(self.bones)
-        best = None
-        best_max = -1
-        for vs in self.vertex_streams:
-            if vs.stride == 4 and vs.vertex_count == vcount:
-                mx = max(vs.data[i * 4 + 3] for i in range(vcount))
-                if mx < nb and mx > best_max:
-                    best_max = mx
-                    best = vs
-        if best is None:
-            return None
-        return [best.data[i * 4 + 3] for i in range(vcount)]
+        return [nrm.data[i * 4 + 3] for i in range(nrm.vertex_count)]
 
 
 class VertexStream:
-    __slots__ = ('semantic', 'stride', 'vertex_count', 'data')
+    __slots__ = ('semantic', 'usage', 'stride', 'vertex_count', 'data')
 
-    def __init__(self, semantic, stride, vertex_count, data):
+    def __init__(self, semantic, stride, vertex_count, data, usage=None):
         self.semantic = semantic
+        self.usage = usage if usage is not None else semantic
         self.stride = stride
         self.vertex_count = vertex_count
         self.data = data  # raw bytes
@@ -215,10 +223,11 @@ def _parse_mesh(data, start, end):
         assert data[p:p + 4] == b'VERS', f"Expected VERS at 0x{p:x}"
         vs_size = struct.unpack_from('<I', data, p + 4)[0]; p += 8
         vs_end = p + vs_size
-        _f1, vert_count, stride, _f4, semantic = struct.unpack_from('<IIIII', data, p)
+        _f1, vert_count, stride, usage, semantic = struct.unpack_from('<IIIII', data, p)
         p += 20
         vdata = data[p:p + vert_count * stride]
-        mesh.vertex_streams.append(VertexStream(semantic, stride, vert_count, vdata))
+        mesh.vertex_streams.append(
+            VertexStream(semantic, stride, vert_count, vdata, usage=usage))
         p = vs_end
 
     # Parse submesh/material data
@@ -782,6 +791,43 @@ def cmd_convert(filepath, output, batch=False, data_root=None, skin_mode='full')
         print(f"Wrote {output} ({total_verts} verts, {total_tris} tris)")
 
 
+def cmd_roundtrip(filepath, output=None, batch=False):
+    """Parse and re-serialize .srm byte-faithfully (the modding round-trip).
+
+    Verified over the whole game corpus: parse -> write reproduces the original
+    bytes exactly, so importing a game asset and exporting it never corrupts it.
+    """
+    import cpcw_srm_writer as W
+
+    if batch or os.path.isdir(filepath):
+        files = []
+        for dp, _, fn in os.walk(filepath):
+            files.extend(os.path.join(dp, f) for f in fn if f.lower().endswith('.srm'))
+        ok = bad = err = 0
+        for f in files:
+            try:
+                data = open(f, 'rb').read()
+                if W.parse(data).pack() == data:
+                    ok += 1
+                else:
+                    bad += 1
+                    print("  MISMATCH", f)
+            except Exception as e:
+                err += 1
+                print("  ERROR", os.path.basename(f), repr(e))
+        print(f"roundtrip: {len(files)} files, exact={ok} mismatch={bad} error={err}")
+        return
+
+    data = open(filepath, 'rb').read()
+    model = W.parse(data)
+    out = model.pack()
+    print(f"{filepath}: {len(data)} bytes, re-write "
+          f"{'IDENTICAL' if out == data else 'DIFFERS (%d bytes)' % len(out)}")
+    if output:
+        model.write(output)
+        print(f"wrote {output}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='CPCW .srm model viewer/converter')
     sub = parser.add_subparsers(dest='command', required=True)
@@ -802,6 +848,13 @@ def main():
     p_conv.add_argument('--no-skin', action='store_true',
                         help="Alias for --skin none")
 
+    p_rt = sub.add_parser('roundtrip',
+                          help='Byte-faithful re-write (verifies the writer)')
+    p_rt.add_argument('file', help='SRM file or directory (with --batch)')
+    p_rt.add_argument('-o', '--output', help='Output .srm (default: verify only)')
+    p_rt.add_argument('--batch', action='store_true',
+                      help='Verify every .srm under a directory re-writes identically')
+
     args = parser.parse_args()
     if args.command == 'info':
         cmd_info(args.file)
@@ -810,6 +863,8 @@ def main():
         cmd_convert(args.file, args.output, getattr(args, 'batch', False),
                     data_root=None if getattr(args, 'no_tex', False) else None,
                     skin_mode=mode)
+    elif args.command == 'roundtrip':
+        cmd_roundtrip(args.file, args.output, getattr(args, 'batch', False))
 
 
 if __name__ == '__main__':

@@ -2,6 +2,13 @@
 
 3D model format for Codename: Panzers Cold War (Gepard engine). Contains geometry, materials, textures references, bounding data, and optional collision meshes.
 
+> **Round-trip / writing.** `cpcw_srm_writer.py` (and the identical
+> `blendertools/SRM_Blender/srm_writer.py`) parse a `.srm` into a fully editable
+> model and re-serialize it **byte-for-byte** — verified over all 2087 game
+> files (`cpcw_srm.py roundtrip <dir> --batch`). Chunks a mod doesn't touch keep
+> their raw bytes, so importing a game asset and exporting it never corrupts it.
+> The Blender add-on exposes this as **File > Export > CPCW Model (.srm)**.
+
 ## File Layout
 
 ```
@@ -122,36 +129,48 @@ Triangle winding order: counter-clockwise.
 Unknown1:     u32 LE (stream index or flags, typically 1)
 VertexCount:  u32 LE
 Stride:       u32 LE (bytes per vertex)
-Unknown4:     u32 LE
-Semantic:     u32 LE (see table below)
+Usage:        u32 LE (D3DDECLUSAGE — the real stream type; see table)
+Semantic:     u32 LE (coarse category: 1=uv 2=pos 4=vector; NOT unique)
 Data:         VertexCount * Stride bytes
 ```
 
 **Header: 20 bytes**, then vertex data.
 
-### Vertex Semantics
+### Vertex stream type = `Usage` (D3DDECLUSAGE)
 
-| ID | Semantic | Typical Stride | Data Format |
-|----|----------|---------------|-------------|
-| 1 | TEXCOORD | 8 | 2x f32 (U, V) |
-| 2 | POSITION | 12 | 3x f32 (X, Y, Z) |
-| 3 | NORMAL | 4 or 12 | Packed: 4x u8 (XYZ mapped 0-255 to -1..+1, W=0). Or 3x f32. |
-| 4 | TANGENT | 4 | 4x u8 (packed same as normal) |
-| 5 | BINORMAL | 4 | 4x u8 (packed same as normal) |
-| 6 | COLOR | 4 | 4x u8 (RGBA) |
-| 7 | BLENDINDICES | varies | Skeletal bone indices |
-| 8 | BLENDWEIGHT | varies | Skeletal bone weights |
+The 4th header word (`Usage`) is the authoritative discriminator. The 5th word
+(`Semantic`) is only a coarse category — normal/tangent/binormal **all** share
+`Semantic == 4`, so you must key off `Usage`. Verified across all 2087 files.
+
+| Usage | Meaning | Typical Stride | Data Format |
+|-------|---------|---------------|-------------|
+| 0 | POSITION | 12 (rarely 44) | 3x f32 (X, Y, Z) |
+| 1 | BLENDWEIGHT | 4 | 4x u8 / 255 (smooth skin) |
+| 2 | BLENDINDICES | 4 | 4x u8 bone-palette indices (smooth skin) |
+| 3 | NORMAL | 4 | 3x u8 packed + **1x u8 bone index** (byte 3) |
+| 4 | TEXCOORD | 8 | 2x f32 (U, V); a mesh may have 2-3 UV sets |
+| 5 | TANGENT | 4 | 4x u8 (packed same as normal) |
+| 6 | BINORMAL | 4 | 4x u8 (packed same as normal) |
+| 7 | (extra set) | 4 | 4x u8 |
 
 **Packed normal decoding:** `component = (byte / 127.5) - 1.0`
 
-**Rigid skinning / bone index:** the NORMAL stream is stride 4 = `3x u8` packed
-normal + `1x u8` **bone index** in byte 3. That index selects a node from the
-mesh's BONE palette; each vertex is stored in that bone's local space. To
-assemble a model, transform every vertex (and normal) by its bone's world
-matrix. In practice the bone-index stream is identified as the stride-4 stream
-whose byte 3 spans `[0, bone_count-1]` (the tangent/binormal stride-4 streams
-have byte 3 == 0). Articulated models (vehicles, characters) rely on this;
-static models (buildings) are authored already-posed in model space.
+**Rigid skinning / bone index (2603 meshes):** byte 3 of the **NORMAL** stream
+(`Usage == 3`) is the per-vertex **bone-palette index**. Corpus-verified: for
+every skinned mesh `max(byte3) <= bone_count - 1`. That index selects a node
+from the mesh's BONE palette. Do *not* identify the stream by "byte 3 spans
+`[0, bone_count-1]`" — on multi-bone meshes several stride-4 streams have a
+non-trivial byte 3; key off `Usage == 3` instead.
+
+**Smooth skinning (266 meshes):** use the explicit `Usage == 2` (BLENDINDICES)
+and `Usage == 1` (BLENDWEIGHT) streams (up to 4 influences per vertex).
+
+**Assembly note:** meshes mix conventions — a static body may be stored already
+in model space while wheels/parts are stored bone-local at the origin. The
+static file does not carry per-bone inverse-bind matrices (PBND is only a
+bounding box), so the exact rest pose the engine shows is animation-driven and
+not fully recoverable from geometry alone. The importer therefore offers an
+Assemble mode (Full / Parts / Off); see FORMAT notes and import_srm.py.
 
 ### Submesh / Material Section
 

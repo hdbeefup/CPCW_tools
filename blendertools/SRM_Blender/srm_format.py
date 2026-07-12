@@ -10,15 +10,31 @@ See docs/FORMAT_SRM.md for the binary layout.
 import os
 import struct
 
-# Vertex semantic IDs
+# Vertex stream classification.
+#
+# A VERS header is 5 u32s: f1, vertex_count, stride, USAGE, semantic. The real
+# per-stream type is USAGE (the 4th word) = D3DDECLUSAGE; ``semantic`` is 4 for
+# all of normal/tangent/binormal and so cannot tell them apart. Verified over
+# the whole game corpus. See srm_writer.py / docs/FORMAT_SRM.md.
+USAGE_POSITION = 0
+USAGE_BLENDWEIGHT = 1
+USAGE_BLENDINDICES = 2
+USAGE_NORMAL = 3
+USAGE_TEXCOORD = 4
+USAGE_TANGENT = 5
+USAGE_BINORMAL = 6
+
+USAGE_NAMES = {0: 'pos', 1: 'blendweight', 2: 'blendindices', 3: 'normal',
+               4: 'uv', 5: 'tangent', 6: 'binormal'}
+
+# Back-compat semantic aliases (the raw ``semantic`` word, kept so old callers
+# still resolve position/uv). Prefer the USAGE_* constants above.
 SEM_TEXCOORD = 1
 SEM_POSITION = 2
 SEM_NORMAL = 3
 SEM_TANGENT = 4
 SEM_BINORMAL = 5
 SEM_COLOR = 6
-
-SEM_NAMES = {1: 'uv', 2: 'pos', 3: 'normal', 4: 'tangent', 5: 'binormal', 6: 'color'}
 
 
 class SrmNode:
@@ -53,49 +69,62 @@ class SrmMesh:
         self.submeshes = []
 
     def stream(self, semantic):
-        """Return the first vertex stream matching a semantic, or None."""
+        """Return the first vertex stream matching a raw ``semantic``, or None.
+
+        Kept for back-compat; note normal/tangent/binormal all share semantic 4.
+        Prefer :meth:`stream_by_usage` with the USAGE_* constants.
+        """
         for vs in self.vertex_streams:
             if vs.semantic == semantic:
+                return vs
+        return None
+
+    def stream_by_usage(self, usage):
+        """Return the first vertex stream with the given D3DDECLUSAGE, or None."""
+        for vs in self.vertex_streams:
+            if vs.usage == usage:
                 return vs
         return None
 
     def vertex_bone_indices(self):
         """Return a per-vertex bone-palette index list, or None if unskinned.
 
-        Rigid skinning stores one bone index per vertex in byte 3 of the normal
-        stream (a stride-4 stream). The correct stream is the stride-4 stream
-        whose byte-3 values span [0, len(bones)-1]; other stride-4 streams
-        (tangent/binormal) have byte 3 == 0 throughout.
+        Rigid skinning stores one bone-palette index per vertex in **byte 3 of
+        the NORMAL stream** (usage 3). Verified over the whole corpus: for every
+        skinned mesh ``max(byte3) <= len(bones)-1``.
         """
         if not self.bones:
             return None
-        pos = self.stream(SEM_POSITION)
-        if pos is None:
+        nrm = self.stream_by_usage(USAGE_NORMAL)
+        if nrm is None or nrm.stride != 4:
             return None
-        vcount = pos.vertex_count
-        nb = len(self.bones)
-        best = None
-        best_max = -1
-        for vs in self.vertex_streams:
-            if vs.stride == 4 and vs.vertex_count == vcount:
-                mx = 0
-                for i in range(vcount):
-                    b = vs.data[i * 4 + 3]
-                    if b > mx:
-                        mx = b
-                if mx < nb and mx > best_max:
-                    best_max = mx
-                    best = vs
-        if best is None:
+        return [nrm.data[i * 4 + 3] for i in range(nrm.vertex_count)]
+
+    def blend_indices(self):
+        """Per-vertex (index, weight) lists for smooth skinning, or None.
+
+        Smooth-skinned meshes carry explicit BLENDINDICES (usage 2) and
+        BLENDWEIGHT (usage 1) streams (4 bytes each: up to 4 influences).
+        """
+        bi = self.stream_by_usage(USAGE_BLENDINDICES)
+        bw = self.stream_by_usage(USAGE_BLENDWEIGHT)
+        if bi is None:
             return None
-        return [best.data[i * 4 + 3] for i in range(vcount)]
+        n = bi.vertex_count
+        idx = [tuple(bi.data[i * 4 + k] for k in range(4)) for i in range(n)]
+        if bw is not None and bw.stride == 4:
+            wt = [tuple(bw.data[i * 4 + k] / 255.0 for k in range(4)) for i in range(n)]
+        else:
+            wt = [(1.0, 0.0, 0.0, 0.0)] * n
+        return idx, wt
 
 
 class VertexStream:
-    __slots__ = ('semantic', 'stride', 'vertex_count', 'data')
+    __slots__ = ('semantic', 'usage', 'stride', 'vertex_count', 'data')
 
-    def __init__(self, semantic, stride, vertex_count, data):
+    def __init__(self, semantic, stride, vertex_count, data, usage=None):
         self.semantic = semantic
+        self.usage = usage if usage is not None else semantic
         self.stride = stride
         self.vertex_count = vertex_count
         self.data = data  # raw bytes
@@ -252,10 +281,11 @@ def _parse_mesh(data, start, end):
         assert data[p:p + 4] == b'VERS', f"Expected VERS at 0x{p:x}"
         vs_size = struct.unpack_from('<I', data, p + 4)[0]; p += 8
         vs_end = p + vs_size
-        _f1, vert_count, stride, _f4, semantic = struct.unpack_from('<IIIII', data, p)
+        _f1, vert_count, stride, usage, semantic = struct.unpack_from('<IIIII', data, p)
         p += 20
         vdata = data[p:p + vert_count * stride]
-        mesh.vertex_streams.append(VertexStream(semantic, stride, vert_count, vdata))
+        mesh.vertex_streams.append(
+            VertexStream(semantic, stride, vert_count, vdata, usage=usage))
         p = vs_end
 
     # Submesh / material data (single submesh spanning the whole mesh; matches

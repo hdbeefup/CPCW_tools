@@ -229,7 +229,7 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
     the skeleton origin (wheels stacked at centre, etc.).
     """
     mesh = node.mesh
-    pos_stream = mesh.stream(srm_format.SEM_POSITION)
+    pos_stream = mesh.stream_by_usage(srm_format.USAGE_POSITION)
     if pos_stream is None:
         return None
 
@@ -273,7 +273,7 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
     bl_mesh.update()
 
     # UVs (per-loop, V flipped)
-    uv_stream = mesh.stream(srm_format.SEM_TEXCOORD)
+    uv_stream = mesh.stream_by_usage(srm_format.USAGE_TEXCOORD)
     if uv_stream is not None and bl_mesh.polygons:
         uvs = list(uv_stream.uvs())
         uv_layer = bl_mesh.uv_layers.new(name="UVMap")
@@ -284,7 +284,7 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
                 uv_layer.data[loop.index].uv = (u, 1.0 - v)
 
     # Custom split normals (rotated by the bone if skinned)
-    norm_stream = mesh.stream(srm_format.SEM_NORMAL)
+    norm_stream = mesh.stream_by_usage(srm_format.USAGE_NORMAL)
     if norm_stream is not None and bl_mesh.polygons:
         normals = list(norm_stream.normals())
         if bone_idx is not None and rot3 is not None:
@@ -328,6 +328,10 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
     root.empty_display_type = 'PLAIN_AXES'
     root.empty_display_size = 0.5
     root.matrix_basis = Matrix.Rotation(math.radians(90.0), 4, 'X') @ Matrix.Scale(scale, 4)
+    # Stash the source path so the exporter can round-trip from the pristine
+    # file (see export_srm.py) and record the assemble mode used.
+    root["cpcw_srm_source"] = os.path.abspath(filepath)
+    root["cpcw_assemble"] = apply_skin
     collection.objects.link(root)
 
     img_cache = {}
