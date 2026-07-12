@@ -314,11 +314,35 @@ def _transform_point(m, x, y, z):
             m[2][0]*x + m[2][1]*y + m[2][2]*z + m[2][3])
 
 
-def bake_skinning(nodes):
-    """Rigidly skin each mesh in place: rewrite POSITION streams so every vertex
-    is transformed by its bone's world matrix. Assembles articulated models
-    (vehicles, characters). Static models (buildings) are authored in model
-    space and should NOT be skinned -- see the --no-skin flag."""
+def _compact_bone_groups(pos, bidx, ratio=0.85):
+    """{bone_index: skin?} -- a group is skinned unless it spans nearly the whole
+    mesh (the static model-space body); see the 'parts' skin mode."""
+    groups = {}
+    xs = []; ys = []; zs = []
+    for vi in range(pos.vertex_count):
+        x, y, z = struct.unpack_from('<3f', pos.data, vi * pos.stride)
+        xs.append(x); ys.append(y); zs.append(z)
+        groups.setdefault(bidx[vi], []).append((x, y, z))
+    mesh_diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 +
+                 (max(zs) - min(zs)) ** 2) ** 0.5 or 1.0
+    out = {}
+    for bi, pts in groups.items():
+        gx = [p[0] for p in pts]; gy = [p[1] for p in pts]; gz = [p[2] for p in pts]
+        gdiag = ((max(gx) - min(gx)) ** 2 + (max(gy) - min(gy)) ** 2 +
+                 (max(gz) - min(gz)) ** 2) ** 0.5
+        out[bi] = (gdiag / mesh_diag) < ratio
+    return out
+
+
+def bake_skinning(nodes, mode='full'):
+    """Rigidly skin each mesh in place: rewrite POSITION streams so vertices are
+    transformed by their bone's world matrix, assembling articulated models.
+
+    mode 'full'  : skin every part (tanks/tracked vehicles; whole model bone-local)
+    mode 'parts' : skin only compact parts, leave the large static body in place
+                   (cars whose body shifts / wheels float in 'full')
+    Static models (buildings) should not be skinned at all -- use --no-skin.
+    """
     world = _build_world_matrices(nodes)
     for node in nodes:
         if node.mesh is None:
@@ -328,10 +352,12 @@ def bake_skinning(nodes):
         if pos is None or bidx is None:
             continue
         pal = node.mesh.bones
+        skin_group = (_compact_bone_groups(pos, bidx) if mode == 'parts'
+                      else {bi: True for bi in set(bidx)})
         data = bytearray(pos.data)
         for vi in range(pos.vertex_count):
             bi = bidx[vi]
-            if 0 <= bi < len(pal) and 0 <= pal[bi] < len(world):
+            if skin_group.get(bi) and 0 <= bi < len(pal) and 0 <= pal[bi] < len(world):
                 off = vi * pos.stride
                 x, y, z = struct.unpack_from('<3f', data, off)
                 nx, ny, nz = _transform_point(world[pal[bi]], x, y, z)
@@ -712,8 +738,8 @@ def _get_texture_dirs(srm_path, data_root=None):
     return dirs
 
 
-def cmd_convert(filepath, output, batch=False, data_root=None, skin=True):
-    """Convert SRM to GLB."""
+def cmd_convert(filepath, output, batch=False, data_root=None, skin_mode='full'):
+    """Convert SRM to GLB. skin_mode: 'full', 'parts' or 'none'."""
     if batch:
         count = 0
         tex_found = 0
@@ -726,8 +752,8 @@ def cmd_convert(filepath, output, batch=False, data_root=None, skin=True):
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     try:
                         nodes = parse_srm(srm_path)
-                        if skin:
-                            bake_skinning(nodes)
+                        if skin_mode != 'none':
+                            bake_skinning(nodes, skin_mode)
                         tex_dirs = _get_texture_dirs(srm_path, data_root)
                         nodes_to_glb(nodes, out_path, tex_dirs)
                         count += 1
@@ -738,8 +764,8 @@ def cmd_convert(filepath, output, batch=False, data_root=None, skin=True):
         print(f"Converted {count} files")
     else:
         nodes = parse_srm(filepath)
-        if skin:
-            bake_skinning(nodes)
+        if skin_mode != 'none':
+            bake_skinning(nodes, skin_mode)
         if not output:
             output = os.path.splitext(filepath)[0] + '.glb'
         tex_dirs = _get_texture_dirs(filepath, data_root)
@@ -768,17 +794,22 @@ def main():
     p_conv.add_argument('-o', '--output', help='Output GLB file or directory')
     p_conv.add_argument('--batch', action='store_true', help='Batch convert directory')
     p_conv.add_argument('--no-tex', action='store_true', help='Skip texture embedding')
+    p_conv.add_argument('--skin', choices=['full', 'parts', 'none'], default='full',
+                        help="Assembly mode: 'full' skins every part (tanks etc.); "
+                             "'parts' skins only small parts and leaves the static "
+                             "body (cars whose body shifts/wheels float in full); "
+                             "'none' for static models such as buildings")
     p_conv.add_argument('--no-skin', action='store_true',
-                        help='Do not assemble via skinning (use for static '
-                             'models such as buildings, which are already posed)')
+                        help="Alias for --skin none")
 
     args = parser.parse_args()
     if args.command == 'info':
         cmd_info(args.file)
     elif args.command == 'convert':
+        mode = 'none' if getattr(args, 'no_skin', False) else args.skin
         cmd_convert(args.file, args.output, getattr(args, 'batch', False),
                     data_root=None if getattr(args, 'no_tex', False) else None,
-                    skin=not getattr(args, 'no_skin', False))
+                    skin_mode=mode)
 
 
 if __name__ == '__main__':

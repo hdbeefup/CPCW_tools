@@ -15,7 +15,7 @@ import math
 import os
 
 import bpy
-from bpy.props import StringProperty, FloatProperty, BoolProperty
+from bpy.props import StringProperty, FloatProperty, BoolProperty, EnumProperty
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Euler, Vector
 
@@ -193,6 +193,32 @@ def _build_world_matrices(nodes):
     return [world(i) for i in range(len(nodes))]
 
 
+def _compact_bone_groups(verts, bone_idx, ratio=0.85):
+    """Decide which bone groups are compact enough to be skinned.
+
+    Returns {bone_index: bool}. A group is skinned unless it spans almost the
+    whole mesh: the *static body* of a model (a car body, a building shell) is
+    one bone group that covers the entire mesh and is authored already-posed in
+    model space, so skinning it would shift/explode it. Articulated parts
+    (wheels, turret, running gear) each cover only part of the mesh and are
+    stored bone-local, so they are skinned into place.
+    """
+    groups = {}
+    for vi, bi in enumerate(bone_idx):
+        groups.setdefault(bi, []).append(verts[vi])
+    # whole-mesh diagonal
+    xs = [p[0] for p in verts]; ys = [p[1] for p in verts]; zs = [p[2] for p in verts]
+    mesh_diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 +
+                 (max(zs) - min(zs)) ** 2) ** 0.5 or 1.0
+    out = {}
+    for bi, pts in groups.items():
+        gx = [p[0] for p in pts]; gy = [p[1] for p in pts]; gz = [p[2] for p in pts]
+        gdiag = ((max(gx) - min(gx)) ** 2 + (max(gy) - min(gy)) ** 2 +
+                 (max(gz) - min(gz)) ** 2) ** 0.5
+        out[bi] = (gdiag / mesh_diag) < ratio
+    return out
+
+
 def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
     """Build a Blender mesh datablock from an SrmNode's mesh.
 
@@ -214,15 +240,28 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
     # Per-vertex bone (palette index) for rigid skinning.
     bone_idx = None
     rot3 = None  # per-node 3x3 rotation for skinning normals
-    if apply_skin and nodes is not None and world_mats is not None:
+    skin_group = None
+    if apply_skin != 'NONE' and nodes is not None and world_mats is not None:
         bone_idx = mesh.vertex_bone_indices()
     if bone_idx is not None:
         palette = mesh.bones
         rot3 = [wm.to_3x3() for wm in world_mats]
+        # A CPCW mesh may MIX model-space geometry (a static car body, already
+        # posed) with bone-local parts (wheels stored at the origin, positioned
+        # by their bone). In 'PARTS' mode we skin only the compact parts and
+        # leave the one whole-mesh-spanning body group in place; in 'FULL' mode
+        # every group is skinned (correct for fully-articulated models where
+        # even the body is bone-local). The two cases are geometrically
+        # indistinguishable, hence the user-selectable mode.
+        if apply_skin == 'PARTS':
+            skin_group = _compact_bone_groups(verts, bone_idx)
+        else:
+            skin_group = {bi: True for bi in set(bone_idx)}
         skinned = []
         for vi, p in enumerate(verts):
             bi = bone_idx[vi]
-            if 0 <= bi < len(palette) and 0 <= palette[bi] < len(world_mats):
+            if (skin_group.get(bi) and 0 <= bi < len(palette)
+                    and 0 <= palette[bi] < len(world_mats)):
                 v = world_mats[palette[bi]] @ Vector(p)
                 skinned.append((v.x, v.y, v.z))
             else:
@@ -252,7 +291,8 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
             palette = mesh.bones
             for vi in range(min(len(normals), len(bone_idx))):
                 bi = bone_idx[vi]
-                if 0 <= bi < len(palette) and 0 <= palette[bi] < len(rot3):
+                if (skin_group and skin_group.get(bi)
+                        and 0 <= bi < len(palette) and 0 <= palette[bi] < len(rot3)):
                     nrm = rot3[palette[bi]] @ Vector(normals[vi])
                     normals[vi] = (nrm.x, nrm.y, nrm.z)
         if len(normals) >= len(verts):
@@ -269,8 +309,8 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin=True):
 
 
 def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
-             apply_skin=True, show_skeleton=False):
-    """Import an SRM file. Returns the created root object."""
+             apply_skin='FULL', show_skeleton=False):
+    """Import an SRM file. apply_skin is 'FULL', 'PARTS' or 'NONE'."""
     nodes = srm_format.parse_srm(filepath)
     world_mats = _build_world_matrices(nodes)
 
@@ -304,8 +344,9 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
                 obj.data.materials.append(
                     _make_material(sm, search_dirs, import_textures,
                                    img_cache, mat_cache))
-            # Skinned vertices are already in model space -> identity transform.
-            if not apply_skin:
+            # With no skinning, place the mesh at its node's world transform;
+            # skinned vertices are already baked into model space (identity).
+            if apply_skin == 'NONE':
                 obj.matrix_basis = world_mats[i]
         else:
             if not show_skeleton:
@@ -357,12 +398,22 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
                     "(e.g. the extracted game data root)",
         default="", subtype='DIR_PATH',
     )
-    apply_skin: BoolProperty(
-        name="Assemble (Skinning)",
-        description="Transform each vertex by its bone so the model is assembled "
-                    "(wheels/turret/parts in place). Disable to see the raw "
-                    "bind-pose meshes with per-node transforms",
-        default=True,
+    apply_skin: EnumProperty(
+        name="Assemble",
+        description="How to assemble the model from its skeleton",
+        items=[
+            ('FULL', "Full (articulated)",
+             "Skin every part by its bone. Correct for fully-articulated models "
+             "(tanks, tracked vehicles) where the whole model is bone-local"),
+            ('PARTS', "Parts only (static body)",
+             "Skin only the small parts (wheels, etc.) and leave the one large "
+             "body group in place. Use for cars/models whose body shifts or "
+             "whose wheels float in Full mode"),
+            ('NONE', "Off (raw bind pose)",
+             "No skinning. Correct for static models (buildings) which are "
+             "authored already-posed"),
+        ],
+        default='FULL',
     )
     show_skeleton: BoolProperty(
         name="Show Skeleton",

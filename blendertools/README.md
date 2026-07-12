@@ -33,14 +33,19 @@ ProtoDB.bin                                       # prototype DB (for future mod
 ## Usage
 
 - **Model:** *File > Import > CPCW Model (.srm)*. Options: uniform *Scale*,
-  *Assemble (Skinning)*, *Show Skeleton*, *Import Textures*, and an *Extra
-  Texture Dir* (point at the extracted data root so cross-referenced `.dds`
-  files resolve). The model is parented under one Empty that converts SRM's
-  Y-up space to Blender's Z-up.
-  - **Assemble (Skinning)** (default on) transforms each vertex by its bone so
-    articulated models come together — wheels/tracks/turret/limbs in place.
-    Turn it **off** for static models (most **buildings** and some props), which
-    are authored already-posed in model space and will look scattered if skinned.
+  *Assemble*, *Show Skeleton*, *Import Textures*, and an *Extra Texture Dir*
+  (point at the extracted data root so cross-referenced `.dds` files resolve).
+  The model is parented under one Empty that converts SRM's Y-up space to
+  Blender's Z-up.
+  - **Assemble** has three modes:
+    - **Full (articulated)** — *default*. Skins every part by its bone. Correct
+      for fully-articulated models: tanks and tracked vehicles (Patton,
+      bulldozer) where the whole model is bone-local.
+    - **Parts only (static body)** — skins only the small parts (wheels…) and
+      leaves the one large body group in place. Use for cars/models whose body
+      shifts or whose wheels float in Full mode (e.g. the Moskvitch).
+    - **Off (raw bind pose)** — no skinning. Correct for static models
+      (**buildings**), which are authored already-posed in model space.
 - **Map:** *File > Import > CPCW Map (.map)*. Options: *Build Terrain Plane*,
   *Tint Passability* (green = passable, red = blocked, from the BLCK grid),
   *Place Entities*, *Max Entities*. Entities become Empties grouped into
@@ -72,10 +77,12 @@ converter got wrong:
 
 ## Known limitations / future work
 
-- **Static vs skinned is not auto-detected.** Skinning assembles articulated
-  models (vehicles, characters) but scatters static ones (buildings), which are
-  authored already-posed. No reliable in-file flag distinguishing the two was
-  found, so skinning is a user toggle (default on). Untick it for buildings.
+- **Assembly mode is not auto-detected.** A model may be fully bone-local (skin
+  everything — "Full"), have a static model-space body mixed with bone-local
+  parts (skin parts only — "Parts only"), or be entirely model-space (skin
+  nothing — "Off", buildings). These cases are geometrically indistinguishable
+  per-group and no in-file flag separating them was found, so the mode is a
+  user choice (default "Full"). If a model looks wrong, try the other modes.
 - **Map terrain is flat.** No per-vertex height array has been reverse-engineered
   (`GTRD` is splat paint, `BLCK` is passability); the plane sits at Z=0.
 - **No real models in maps yet.** A map entity's `Prototype` (a GUID) is not yet
