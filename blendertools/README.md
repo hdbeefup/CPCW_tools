@@ -53,11 +53,18 @@ ProtoDB.bin                                       # prototype DB (for future mod
   moves/rotations/scales of root-level nodes back into the file. (Authoring new
   geometry from scratch is future work — the writer/format supports it; the
   Blender-mesh → VERS/INDS/BONE encoder is not built yet.)
-- **Map:** *File > Import > CPCW Map (.map)*. Options: *Build Terrain Plane*,
-  *Tint Passability* (green = passable, red = blocked, from the BLCK grid),
-  *Place Entities*, *Max Entities*. Entities become Empties grouped into
-  collections by type (Units / Buildings / Doodads / …), each carrying
-  `cpcw_prototype`, `cpcw_id`, `cpcw_player` custom properties.
+- **Map:** *File > Import > CPCW Map (.map)*.
+  - **Real Heightmap** (*default on*) — builds a subdivided terrain mesh
+    displaced by the decoded GTRD elevation grid (the actual in-game hills;
+    *Terrain Resolution* caps subdivisions per axis). Turn off for a flat plane
+    with optional *Tint Passability* (green = passable, red = blocked, BLCK).
+  - **Place Real Models** — resolves each entity's `Prototype` through
+    `ProtoDB.bin` to its `.srm` and instances the actual model at the entity's
+    position / yaw / scale, so the scene matches the game (needs the SRM add-on
+    enabled and the extracted *Data Root*; auto-detected from the .map path).
+  - **Place Entity Markers** — an Empty per entity, grouped into collections by
+    type (Units / Buildings / Doodads / …), each carrying `cpcw_prototype`,
+    `cpcw_id`, `cpcw_player` custom properties.
 
 ## SRM format notes (reverse-engineered here)
 

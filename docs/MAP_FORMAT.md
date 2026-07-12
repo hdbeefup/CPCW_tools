@@ -349,6 +349,33 @@ each terrain layer.
   vertex mapping requires further reverse engineering.
 - For T_01.map: ~1 MB non-zero data within 2.6 MB total splatmap region
 
+### 7.4 Terrain Heightmap (elevation) — SOLVED
+
+Embedded within the GTRD post-layer region is the **terrain elevation grid**:
+
+- A contiguous block of **IEEE-754 float32 values**, row-major, sized
+  **`(world_w + 1) × (world_h + 1)` vertices** (one vertex per engine unit, plus
+  the closing edge), giving heights directly in **world units**.
+- Loaded by the engine class `STerrainTiled` (`STerrainTiled::Load` /
+  `::LoadData`, which dispatches the GTRD/GROL/GDCL/GRVL sub-chunks). The terrain
+  is conceptually tiled (32-unit tiles), but the elevation itself is stored as
+  the single row-major grid above.
+- **Byte alignment is not guaranteed to be 4** — the grid can start at any byte
+  offset inside GTRD (a small per-map preamble precedes it), so a reader must
+  scan all four byte phases.
+- **Locating it** (implemented in `cpcw_map.py` `MapFile.get_heightmap()`): find
+  the longest run of "height-like" float32 values (finite, `|v| < 500`) across
+  all four byte phases; the grid start is then pinned by correlating candidate
+  offsets against the map's own **entity elevations** (units/doodads sit on the
+  terrain, so `entity.Pos.z ≈ height(entity.x, entity.y)`). Verified at
+  **R² ≈ 0.72–1.00** vs entity Z over maps from 545×513 to 769×769.
+- Heights observed roughly in `[-25, +55]` world units; map borders are flat
+  (0.0), matching the in-game look. Reconstructing the terrain mesh from this
+  grid reproduces the game's hills/valleys exactly.
+
+`GROL`, `GDCL`, `GRVL` (siblings under GTRN) are much smaller — ground roles /
+decals / (reveal?) — and do not carry the elevation.
+
 ---
 
 ## 8. BLCK — Block Grid
@@ -478,11 +505,24 @@ Root game state object in the main OBJS section.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| Prototype | string | Reference to ProtoDB object |
-| Pos | vec3 | World position (x, y, z) |
-| Dir | vec3 | Facing direction |
+| Prototype | string | **GUID** reference to a ProtoDB object |
+| Pos | vec3 | World position (x, y, z) — z is the placed elevation |
+| Dir | vec3 | Facing; `Dir[0]` is a **yaw angle in degrees** about the up (z) axis |
 | Elevation | float | Ground elevation |
+| Scale | float | Uniform scale (doodads) |
 | ID | int32 | Unique entity ID |
+
+**Resolving an entity to its 3D model — SOLVED.** `Prototype` is a GUID that
+indexes `ProtoDB.bin`. The matching ProtoDB object carries a **`ModelName`**
+string field naming the `.srm` model (backslash paths, e.g.
+`Vehicles\Civilian\moskvitch401.srm`; also `WreckModelName`, `MarketModelName`).
+So the full chain is: `entity.Prototype (GUID)` → ProtoDB object → `ModelName`
+→ `.srm`. Build a `{guid → ModelName}` index by walking every object in ProtoDB
+(see `protodb.build_model_index`). On a Domination map this resolved **859/859**
+entities (849 with a model: trees, bushes, buildings). Placing each entity's
+actual model at its `Pos` with yaw `Dir[0]` and `Scale` reproduces the in-game
+scene layout. `Pos.z` already holds the correct elevation, so models sit on the
+decoded terrain heightmap (§7.4).
 
 ### SUnitDesc (extends SEntityDesc)
 
