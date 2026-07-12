@@ -29,6 +29,14 @@ from mathutils import Matrix
 
 from . import srm_writer
 
+# Same LH<->RH swap the importer bakes (see import_srm._HAND): (x,y,z)<->(x,z,y).
+# It is its own inverse, so conjugating an object's Blender-space matrix by it
+# (P @ M @ P) recovers the SRM-space matrix the node header stores.
+_HAND = Matrix(((1, 0, 0, 0),
+                (0, 0, 1, 0),
+                (0, 1, 0, 0),
+                (0, 0, 0, 1)))
+
 
 def _srm_local_matrix(pos, rot, scale):
     """Build a node's local matrix the same way the importer does (Rx@Ry@Rz)."""
@@ -55,17 +63,19 @@ def _node_edit(obj, root, model, node_index, tol=1e-5):
     """Return (pos, rot_xyz, scale3) if this object's transform differs from the
     node's source transform, else None.
 
-    A root-child object's ``matrix_local`` is already in SRM space (the root
-    carries the Y-up->Z-up conversion for the *world*, so children's locals are
-    native SRM). We only write back hierarchy-root nodes (parent < 0), whose
-    world == local, and only when the object actually moved versus the source
-    file — so a no-edit export stays byte-identical.
+    The importer bakes the LH->RH swap into geometry and expresses node/bone
+    matrices in Blender space (``P @ world_srm @ P``). To compare against the
+    stored SRM node header we conjugate the object's Blender-space local matrix
+    back by the same swap (``P @ matrix_local @ P``). We only write back
+    hierarchy-root nodes (parent < 0), whose world == local, and only when the
+    object actually moved versus the source — so a no-edit export stays
+    byte-identical.
     """
     node = model.nodes[node_index]
     if node.parent >= 0 or obj.parent is not root:
         return None
     orig = _srm_local_matrix(node.pos, node.rot, node.scale)
-    cur = obj.matrix_local
+    cur = _HAND @ obj.matrix_local @ _HAND
     if all(abs(a - b) <= tol for ra, rb in zip(orig, cur) for a, b in zip(ra, rb)):
         return None  # unchanged
     loc, quat, scl = cur.decompose()
