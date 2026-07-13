@@ -22,24 +22,31 @@ Big deliverables since the round-trip writer:
 - Docs updated (FORMAT_SRM handedness/assembly + MAP_FORMAT §7.4). Renders in
   N:\ProjectsCODE\CPCW_tools\renders\ (gitignored). Verified via headless Blender.
 
-### STILL TODO (user: "still work to be had, will continue next day")
+### SESSION 2 (continued) — DONE
+- **Map splatmap terrain paint (commit 1547bdd):** decoded the GTRD splatmap —
+  one W×H uint8 opacity grid per layer right after the heightmap, then ~4 dense
+  trailing grids (baked normals/AO). `region == (W*H)*(4+num_layers+4)` on every
+  map. `get_splatmap()`; import_map paints per-vertex (real .dds layer averages,
+  sRGB→linear) into a FLOAT_COLOR attr. M_02 shows roads/river/fields. dds.py
+  vendored into map add-on. MAP_FORMAT §7.3 rewritten (SOLVED).
+- **SRM upgrade-variant filter (commit 0acd636):** vehicles pack all loadouts;
+  variant read from the bone name (_std/_upg/camo). Import **Variant** option:
+  STANDARD (default) / UPGRADED / ALL, per-vertex-by-bone. Single-variant models
+  unaffected. Patton verified. FORMAT_SRM "Upgrade variants" section added.
+
+### STILL TODO
 - **moskvitch body ~0.1-0.2 too low** (wheels clip the body/arches). Its body
   binds to `suspension0l` (base moskvitch401 binds body->`body0`); AUTO leaves it
   model-space (correct) but the exact ground-clearance offset isn't in the file;
   skinning by body0 DISTORTS it (180deg yaw). Needs the real inverse-bind rule.
-- **AUTO skinning is a heuristic, not the game's true rule.** The Ghidra
-  render/skinning path was NOT recovered (the workflow's ghidra agent failed on a
-  structured-output cap; my find_attach.py showed the only name-based node assoc
-  is GAMEPLAY mounts, not mesh render-attach). To make skinning exact, still need
-  to reverse the D3D draw path / the load-time inverse-bind computation. Ghidra
-  project ready at N:\gamePAKdata\re\gp; dumps: srm_funcs.txt, render_funcs.txt,
-  map_funcs.txt, attach_funcs.txt.
-- **Patton etc. show all upgrade variants** (camo-net/gun std+upgraded parts all
-  present, some "floating" at attach points). Expected (all variants in one file);
-  a variant filter could be added later.
+- **AUTO skinning is a heuristic, not the game's true rule.** Reversing the D3D
+  render/skinning path is IN PROGRESS this session (background Ghidra agent
+  writing N:\gamePAKdata\re\SKINNING_RESULT.md; scans in skin_scan*.txt). To make
+  skinning exact + fix the moskvitch height, need the load-time inverse-bind /
+  matrix-palette setup. Ghidra project N:\gamePAKdata\re\gp; loader dumps in
+  srm_funcs.txt, render_funcs.txt.
 - **Standalone cpcw_srm.py glTF export still has the latent mirror** (writes LH
   coords into RH glTF). Deferred; documented in [[srm-handedness]].
-- **Map terrain has no splat textures** (grey). Terrain is geometrically correct.
 
 ## Goal
 Blender import (and eventually export) of Codename: Panzers Cold War `.srm` models

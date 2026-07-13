@@ -286,3 +286,23 @@ when it spans most of the mesh AND skinning it would shove it off the x=0 centre
 line). This matches every tested model (car, tank, helicopter, buildings) but is
 a heuristic, not a decoded flag; `FULL` (skin all) and `NONE` (skin none) remain
 as overrides.
+
+## Upgrade variants (node-name convention)
+
+Vehicles pack **every upgrade loadout into one .srm** (the shipped file has a few
+pre-merged meshes named `Merged mesh N`, each skinned to a mixed bone palette).
+A part's variant is read from the **name of the bone it is skinned to**:
+
+| Bone-name token | Variant part |
+|-----------------|--------------|
+| `…_std`         | standard loadout (e.g. `gun0m0_std`, `door0_std`) |
+| `…_upg`         | upgraded loadout (`gun2h0_upg`, `camo_body0_upg`) |
+| `camo…`         | the upgrade's camouflage net (these also carry `_upg`) |
+| (untagged)      | always-present base hull / tracks |
+
+The engine shows the loadout matching the unit's in-game upgrade state; the file
+carries all of them, overlapping at their attach points. The Blender importer
+reproduces this with a **Variant** option that keeps faces per the selected set —
+`STANDARD` = {base, `_std`}, `UPGRADED` = {base, `_upg`, camo}, `ALL` = every
+part — read per-vertex from each vertex's bone tag. Single-variant models are
+entirely untagged (base) so the filter is a no-op for them.

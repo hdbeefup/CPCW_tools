@@ -47,6 +47,11 @@ ProtoDB.bin                                       # prototype DB (for future mod
     - **Full (debug)** — skins *every* group by its bone. Same as Auto for
       fully-articulated models; shifts a civilian car body off-centre.
     - **Off (raw bind pose)** — no skinning; each mesh placed by its node matrix.
+  - **Variant** — vehicles pack every upgrade loadout into one file; the part's
+    variant is read from the bone it is skinned to (`_std` / `_upg` / `camo`).
+    *Standard* (default) shows base + standard parts; *Upgraded* shows base +
+    upgraded parts + camo net; *All* shows everything (they overlap at attach
+    points). Non-variant models are unaffected.
 - **Export:** *File > Export > CPCW Model (.srm)*. Select an imported model and
   export. The exporter re-writes from the pristine source file (byte-faithful —
   round-trip verified over all 2087 game models), so importing a game asset and
@@ -59,6 +64,10 @@ ProtoDB.bin                                       # prototype DB (for future mod
     displaced by the decoded GTRD elevation grid (the actual in-game hills;
     *Terrain Resolution* caps subdivisions per axis). Turn off for a flat plane
     with optional *Tint Passability* (green = passable, red = blocked, BLCK).
+  - **Paint Terrain** (*default on*) — tints the terrain per-vertex from the
+    GTRD paint layers (decoded splatmap), so roads / fields / river beds / grass
+    read like the game. Uses the real layer `.dds` ground-texture averages when
+    the *Data Root* is found, else a colour-by-ground-type fallback.
   - **Place Real Models** — resolves each entity's `Prototype` through
     `ProtoDB.bin` to its `.srm` and instances the actual model at the entity's
     position / yaw / scale, so the scene matches the game (needs the SRM add-on
@@ -112,15 +121,14 @@ converter got wrong:
 
 ## Known limitations / future work
 
-- **Assembly mode is not auto-detected.** A model may be fully bone-local (skin
-  everything — "Full"), have a static model-space body mixed with bone-local
-  parts (skin parts only — "Parts only"), or be entirely model-space (skin
-  nothing — "Off", buildings). These cases are geometrically indistinguishable
-  per-group and no in-file flag separating them was found, so the mode is a
-  user choice (default "Full"). If a model looks wrong, try the other modes.
-- **Map terrain is flat.** No per-vertex height array has been reverse-engineered
-  (`GTRD` is splat paint, `BLCK` is passability); the plane sits at Z=0.
-- **No real models in maps yet.** A map entity's `Prototype` (a GUID) is not yet
-  resolved to its `.srm` via `ProtoDB.bin`. The entity loop in `import_map.py` is
-  structured so a resolver can later replace an Empty with a model instance.
+- **Assembly is an inferred heuristic, not the engine's rule.** *Auto* skins
+  bone-local parts and leaves model-space bodies via a geometric proxy for the
+  unstored inverse-bind (see above). It matches every tested model, but the true
+  per-bone rule lives in the D3D render path and hasn't been reversed yet; a few
+  edge cases (e.g. the moskvitch `_speaker` body sits ~0.1 low) need it. `Full`/
+  `Off` remain as overrides.
+- **Map terrain has no tiled texture detail.** The splatmap paint is reproduced
+  as a per-vertex tint (roads/fields/grass read correctly), but the layer `.dds`
+  textures are not tiled/baked onto the surface — the terrain is coloured, not
+  texture-mapped.
 - **Single material per mesh.** Sub-mesh/multi-material splitting is not applied.
