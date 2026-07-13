@@ -336,18 +336,39 @@ M+12    1     uint8   Active flag (1 = enabled, 0 = disabled)
 Layer paths reference material definitions in the game's data files (typically
 under `Tiles/` in the extracted pak archives).
 
-### 7.3 Splatmap Data
+### 7.3 Splatmap Data — SOLVED
 
-After layer definitions, the remainder of GTRD contains **sparse terrain paint
-weights** as IEEE 754 floats. The data represents per-vertex blend weights for
-each terrain layer.
+The GTRD post-layer region is a stack of contiguous **per-vertex grids**, all
+row-major at the same `(world_w+1) × (world_h+1)` resolution as the heightmap
+(§7.4). The exact layout, verified across every map (world 384² to 769²):
 
-- Large zero regions indicate areas covered by the default layer (layer 0)
-- Non-zero floats are very small (typically 0.000004 – 0.01+) representing
-  paint brush opacity/weight
-- Data is organized sequentially but sparsely — not a fixed grid. The exact
-  vertex mapping requires further reverse engineering.
-- For T_01.map: ~1 MB non-zero data within 2.6 MB total splatmap region
+```
+GTRD post-layer region:
+  [ small preamble, 7..2700 bytes ]
+  [ heightmap:  (W×H) × float32 ]            (§7.4, world-unit elevation)
+  [ layer 0 splat:  (W×H) × uint8 ]          per-vertex paint opacity, layer 0
+  [ layer 1 splat:  (W×H) × uint8 ]                    "                layer 1
+    ...                                        one grid per layer in §7.2 order,
+  [ layer N-1 splat: (W×H) × uint8 ]           INCLUDING inactive slots
+  [ +4 trailing grids: (W×H) × uint8 ]        dense, ~255 (baked normals/AO)
+```
+
+So `region_bytes ≈ (W×H) × (4  +  num_layers  +  4)`. This holds exactly on
+every checked map (e.g. `region/need == 18` for a 10-layer map, `== 24` for a
+16-layer map).
+
+- **Per-layer opacity:** each splat grid is one uint8 per vertex, `0` = layer
+  absent, `255` = full. Layer 0 is the base (≈255 everywhere); higher layers are
+  painted overlays (mostly 0, non-zero where that texture shows).
+- **Compositing:** alpha-composite the layers in file order ("over"), starting
+  from layer 0: `c = c·(1−w_i) + layer_color_i·w_i`, `w_i = opacity_i/255`.
+- The 4 trailing grids are dense (mostly 255) and are almost certainly a baked
+  terrain normal (3 ch) + AO/brightness; not needed to reproduce the paint.
+- Implemented in `map_format.py MapFile.get_splatmap()` → `(layers, weights,
+  W, H)` and used by the Blender map add-on to tint the terrain per-vertex
+  (real layer `.dds` averages resolved under the data root, else a by-type
+  colour). Layer names may carry a map prefix (`M2_`, `M6_`, `Tutor_1_`) that
+  must be stripped to resolve the shared tile texture.
 
 ### 7.4 Terrain Heightmap (elevation) — SOLVED
 

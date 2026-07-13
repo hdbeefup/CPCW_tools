@@ -619,16 +619,16 @@ class MapFile:
             return []
         return self.parse_objs_all(objs)
 
-    def get_heightmap(self):
-        """Return (heights, W, H) for the terrain, or None.
+    def _find_heightmap_offset(self):
+        """Locate the terrain elevation grid inside GTRD.
 
-        The terrain elevation is a contiguous f32 grid of (world_w+1) x
-        (world_h+1) vertices, row-major, in world units, stored inside the GTRD
-        chunk (after the layer table) at a byte offset that is not necessarily
-        4-aligned. Located as the longest run of "height-like" f32 values (finite,
-        |v| < 500) across all four byte phases; the exact start is pinned by
-        correlating against the map's own entity elevations (units sit on the
-        terrain). Verified against entity Z at R^2 ~ 0.9 across many maps.
+        Returns ``(off, W, H)`` — the absolute byte offset of the f32 heightmap
+        and the grid dimensions — or ``None``. The grid is (world_w+1) x
+        (world_h+1) row-major f32 world-unit heights, stored after the layer
+        table at a byte offset that is not necessarily 4-aligned. Located as the
+        longest run of "height-like" f32 values (finite, |v| < 500) across all
+        four byte phases; the exact start is pinned by correlating against the
+        map's own entity elevations (units sit on the terrain).
         """
         import array as _array
         d = self.data
@@ -688,8 +688,53 @@ class MapFile:
             if best[0] < 0.4:
                 return None
             off = best[1]
-        heights = list(struct.unpack_from('<%df' % need, d, off))
+        return off, W, H
+
+    def get_heightmap(self):
+        """Return (heights, W, H) for the terrain, or None."""
+        loc = self._find_heightmap_offset()
+        if not loc:
+            return None
+        off, W, H = loc
+        need = W * H
+        heights = list(struct.unpack_from('<%df' % need, self.data, off))
         return heights, W, H
+
+    def get_splatmap(self):
+        """Return the terrain paint layers, or None.
+
+        Immediately after the f32 heightmap, GTRD stores the splatmap: one
+        row-major ``W x H`` grid of uint8 per-vertex opacity for EACH terrain
+        layer (``len(layers)`` grids, including inactive slots), followed by ~4
+        trailing dense grids (baked normals/AO, ignored here). Layout verified
+        across maps: total GTRD post-layer bytes == 4 (heightmap f32) +
+        (num_layers + 4) per vertex.
+
+        Returns ``(layers, weights, W, H)`` where ``layers`` is the GTRD layer
+        metadata list and ``weights`` is a list (one per layer) of ``bytes`` of
+        length ``W*H`` (row-major). Only the active layers should be composited.
+        """
+        loc = self._find_heightmap_offset()
+        if not loc:
+            return None
+        off, W, H = loc
+        need = W * H
+        gtrd = self.find_chunk('GTRD')
+        layers = gtrd.meta.get('layers', []) if gtrd else []
+        if not layers:
+            return None
+        ge = gtrd.offset + 8 + gtrd.size
+        splat_start = off + need * 4
+        weights = []
+        for i in range(len(layers)):
+            a = splat_start + i * need
+            b = a + need
+            if b > ge:
+                break
+            weights.append(self.data[a:b])
+        if not weights:
+            return None
+        return layers, weights, W, H
 
     def _entity_grid_samples(self, W, H, WW, WH, limit=200):
         E = []

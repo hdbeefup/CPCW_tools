@@ -13,6 +13,7 @@ directly at their Pos; Dir[0] is a yaw angle in degrees about Z.
 
 import math
 import os
+import re
 
 import bpy
 from bpy.props import StringProperty, BoolProperty, FloatProperty, IntProperty
@@ -44,12 +45,165 @@ def _get_world_size(mf):
     return 512.0, 512.0
 
 
+# ---------------------------------------------------------------------------
+# Terrain splatmap colouring (GTRD paint layers -> per-vertex colour)
+# ---------------------------------------------------------------------------
+
+# Keyword -> representative sRGB colour, used when a layer's .dds can't be found.
+_LAYER_PALETTE = (
+    (('grass', 'foliage', 'long_grass', 'meadow'), (0.27, 0.39, 0.17)),
+    (('tillage', 'ploughland', 'soil', 'muddy', 'mud', 'dirt', 'field'),
+     (0.34, 0.25, 0.16)),
+    (('gritty', 'ground', 'straw', 'sand', 'dry', 'default'), (0.52, 0.44, 0.30)),
+    (('cobble', 'road', 'pavement', 'stone', 'rock', 'ruin', 'gravel', 'mine'),
+     (0.44, 0.43, 0.42)),
+    (('water', 'puddle', 'river', 'sea'), (0.20, 0.29, 0.33)),
+    (('snow', 'winter', 'ice'), (0.80, 0.82, 0.85)),
+    (('bump', 'normal', 'wind'), (0.40, 0.38, 0.33)),
+)
+
+_dds_index_cache = {}
+_dds_avg_cache = {}
+
+
+def _dds_index(data_root):
+    """Map every extracted .dds basename (lower, no ext) -> full path (cached)."""
+    if data_root in _dds_index_cache:
+        return _dds_index_cache[data_root]
+    idx = {}
+    try:
+        for dp, _dirs, fns in os.walk(data_root):
+            for fn in fns:
+                if fn.lower().endswith('.dds'):
+                    idx.setdefault(fn[:-4].lower(), os.path.join(dp, fn))
+    except OSError:
+        pass
+    _dds_index_cache[data_root] = idx
+    return idx
+
+
+def _resolve_layer_dds(name, idx):
+    """Resolve a GTRD layer name to a .dds path, tolerating map prefixes."""
+    base = name.replace('\\', '/').split('/')[-1]
+    cands = [base, base.replace(' ', '_')]
+    # strip leading map tag: "M2_", "M06_", "Tutor_1_", "Tutor 1 ", "T_01_"
+    m = re.match(r'(?i)^(m\d+|tutor[_ ]?\d+|t_?\d+)[_ ]?(.+)$', base)
+    if m:
+        cands.append(m.group(2))
+        cands.append(m.group(2).replace(' ', '_'))
+    for c in cands:
+        p = idx.get(c.lower())
+        if p:
+            return p
+    return None
+
+
+def _dds_avg_color(path):
+    """Average sRGB colour of a .dds top mip (sampled, cached). None on failure."""
+    if path in _dds_avg_cache:
+        return _dds_avg_cache[path]
+    col = None
+    try:
+        from . import dds
+        img = dds.DDS.read(path)
+        rgba = img.rgba
+        n = len(rgba) // 4
+        if n:
+            step = max(1, n // 4096)
+            r = g = b = cnt = 0
+            for i in range(0, n, step):
+                o = i * 4
+                r += rgba[o]; g += rgba[o + 1]; b += rgba[o + 2]
+                cnt += 1
+            col = (r / cnt / 255.0, g / cnt / 255.0, b / cnt / 255.0)
+    except Exception as e:
+        print("  dds avg failed for %s: %s" % (os.path.basename(path), e))
+    _dds_avg_cache[path] = col
+    return col
+
+
+def _keyword_color(name):
+    s = name.lower()
+    for keys, col in _LAYER_PALETTE:
+        if any(k in s for k in keys):
+            return col
+    return (0.35, 0.33, 0.28)
+
+
+def _srgb_to_linear(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _layer_colors(layers, data_root):
+    """Per-layer representative colour (LINEAR): real .dds average else palette.
+
+    Colours are converted sRGB->linear because a FLOAT_COLOR vertex attribute is
+    fed to Base Color as linear (no colour management), so storing the sRGB value
+    directly would render ~2x too bright.
+    """
+    idx = _dds_index(data_root) if data_root else {}
+    cols = []
+    for lay in layers:
+        col = None
+        if idx:
+            p = _resolve_layer_dds(lay['name'], idx)
+            if p:
+                col = _dds_avg_color(p)
+        if col is None:
+            col = _keyword_color(lay['name'])
+        cols.append(tuple(_srgb_to_linear(x) for x in col))
+    return cols
+
+
+def _splat_vertex_colors(mf, data_root, uvs):
+    """Composite the GTRD paint layers into a per-vertex RGB list.
+
+    ``uvs`` is a list of (u, v) in [0,1] per terrain vertex (row-major order the
+    mesh was built in). Returns a list of (r, g, b) the same length, or None if
+    no splatmap is available. Layers are alpha-composited in file order ("over"),
+    starting from the base layer (layer 0), matching how the paint stacks.
+    """
+    try:
+        sp = mf.get_splatmap()
+    except Exception as e:
+        print("  splatmap decode failed: %s" % e)
+        sp = None
+    if not sp:
+        return None
+    layers, weights, W, H = sp
+    active = [i for i, l in enumerate(layers) if l.get('active')]
+    if not active:
+        return None
+    colors = _layer_colors(layers, data_root)
+    base_i = active[0]
+    overlays = active[1:]
+    out = []
+    for u, v in uvs:
+        gx = int(round(u * (W - 1)))
+        gy = int(round(v * (H - 1)))
+        gi = gy * W + gx
+        r, g, b = colors[base_i]
+        for li in overlays:
+            w = weights[li][gi] / 255.0
+            if w <= 0.0:
+                continue
+            lr, lg, lb = colors[li]
+            r = r * (1.0 - w) + lr * w
+            g = g * (1.0 - w) + lg * w
+            b = b * (1.0 - w) + lb * w
+        out.append((r, g, b))
+    return out
+
+
 def _build_terrain(mf, collection, world_w, world_h, tint_passability,
-                   use_heightmap=True, height_res=256):
+                   use_heightmap=True, height_res=256, data_root=None,
+                   paint_splatmap=True):
     """Create a ground plane over the world extent.
 
     With ``use_heightmap`` the plane is a subdivided grid displaced by the real
-    terrain heightmap (decoded from GTRD); otherwise it is flat at Z=0.
+    terrain heightmap (decoded from GTRD); otherwise it is flat at Z=0. With
+    ``paint_splatmap`` the heightmap mesh is tinted per-vertex from the GTRD
+    terrain paint layers (real .dds averages when found under ``data_root``).
     """
     verts = [(0.0, 0.0, 0.0), (world_w, 0.0, 0.0),
              (world_w, world_h, 0.0), (0.0, world_h, 0.0)]
@@ -80,11 +234,13 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability,
         nx = min(height_res, HW - 1)
         ny = min(height_res, HH - 1)
         verts = []
+        uvs = []
         for j in range(ny + 1):
             v = j / ny
             for i in range(nx + 1):
                 u = i / nx
                 verts.append((u * world_w, v * world_h, sample(u, v)))
+                uvs.append((u, v))
         faces = []
         for j in range(ny):
             for i in range(nx):
@@ -94,13 +250,34 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability,
         mesh = bpy.data.meshes.new("Terrain")
         mesh.from_pydata(verts, [], faces)
         mesh.update()
+
+        vcolors = None
+        if paint_splatmap:
+            vcolors = _splat_vertex_colors(mf, data_root, uvs)
+        if vcolors:
+            try:
+                attr = mesh.color_attributes.new(name="Terrain",
+                                                 type='FLOAT_COLOR', domain='POINT')
+                for vi, (r, g, b) in enumerate(vcolors):
+                    attr.data[vi].color = (r, g, b, 1.0)
+            except (AttributeError, RuntimeError, IndexError) as e:
+                print("  terrain vertex colours failed: %s" % e)
+                vcolors = None
+
         obj = bpy.data.objects.new("Terrain", mesh)
         mat = bpy.data.materials.new("TerrainMat")
         mat.use_nodes = True
         pr = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
         if pr:
             pr.inputs['Roughness'].default_value = 1.0
-            pr.inputs['Base Color'].default_value = (0.32, 0.36, 0.28, 1.0)
+            if vcolors and mesh.color_attributes:
+                vc = mat.node_tree.nodes.new('ShaderNodeVertexColor')
+                vc.layer_name = "Terrain"
+                vc.location = (-300, 0)
+                mat.node_tree.links.new(vc.outputs['Color'],
+                                        pr.inputs['Base Color'])
+            else:
+                pr.inputs['Base Color'].default_value = (0.32, 0.36, 0.28, 1.0)
         obj.data.materials.append(mat)
         collection.objects.link(obj)
         return obj
@@ -288,10 +465,11 @@ def _place_models(context, mf, root, entities, data_root, import_textures,
 def load_map(context, filepath, place_entities=True, build_terrain=True,
              tint_passability=True, max_entities=0, place_models=False,
              data_root="", import_textures=True, models_max=0,
-             use_heightmap=True, height_res=256):
+             use_heightmap=True, height_res=256, paint_splatmap=True):
     """Import a .map file: terrain + entity Empties. Returns the root collection."""
     mf = map_format.MapFile(filepath)
     world_w, world_h = _get_world_size(mf)
+    resolved_root = _resolve_data_root(filepath, data_root)
 
     map_name = os.path.splitext(os.path.basename(filepath))[0]
     root = bpy.data.collections.new(f"Map_{map_name}")
@@ -301,7 +479,8 @@ def load_map(context, filepath, place_entities=True, build_terrain=True,
         terr_col = bpy.data.collections.new("Terrain")
         root.children.link(terr_col)
         _build_terrain(mf, terr_col, world_w, world_h, tint_passability,
-                       use_heightmap=use_heightmap, height_res=height_res)
+                       use_heightmap=use_heightmap, height_res=height_res,
+                       data_root=resolved_root, paint_splatmap=paint_splatmap)
 
     n_placed = 0
     if place_entities:
@@ -382,6 +561,11 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
     height_res: IntProperty(
         name="Terrain Resolution", default=256, min=16, max=1024,
         description="Max terrain subdivisions per axis when using the heightmap")
+    paint_splatmap: BoolProperty(
+        name="Paint Terrain", default=True,
+        description="Tint the terrain per-vertex from the GTRD paint layers "
+                    "(real .dds ground colours when the data root is found, "
+                    "else a colour by ground type). Needs the real heightmap")
     tint_passability: BoolProperty(
         name="Tint Passability", default=False,
         description="Colour a flat terrain grid by the BLCK passability data "
@@ -421,7 +605,8 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
                                import_textures=self.import_textures,
                                models_max=self.models_max,
                                use_heightmap=self.use_heightmap,
-                               height_res=self.height_res)
+                               height_res=self.height_res,
+                               paint_splatmap=self.paint_splatmap)
         except Exception as e:
             self.report({'ERROR'}, f"Map import failed: {e}")
             return {'CANCELLED'}
@@ -435,6 +620,7 @@ class IMPORT_OT_cpcw_map(bpy.types.Operator, ImportHelper):
             layout.prop(self, "use_heightmap")
             if self.use_heightmap:
                 layout.prop(self, "height_res")
+                layout.prop(self, "paint_splatmap")
             else:
                 layout.prop(self, "tint_passability")
         layout.prop(self, "place_entities")
