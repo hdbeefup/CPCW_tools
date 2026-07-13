@@ -38,6 +38,14 @@ Big deliverables since the round-trip writer:
   pos/normal/translation, quat (x,y,z,w)->(-x,-y,z,w), reverse winding). Verified:
   GLB round-trip vs native SRM import of v200 have identical signed volume
   (125.146, ratio 1.0) -> chirally identical, un-mirrored. [[srm-handedness]].
+- **Variant safety fix (commit 4b01049):** bare-"camo" match hid whole models
+  named "camo*" (camo_tent). Now classify by `_std`/`_upg` suffix only (camo-net
+  always carries `_upg`). Corpus: 0 models hide-everything (was 1), 18 tagged.
+- **Geometry write-back / reshape (commit 75abc9b):** exporter option rewrites
+  each mesh's POSITION stream from the edited Blender mesh (surgical: positions
+  only; indices/UVs/normals/bone kept). Gated on Assemble='NONE' + unchanged vert
+  count. Verified: no-edit byte-identical (v200); vtx move -> exact stored delta.
+  Modders can now RESHAPE existing geometry, not just re-serialize.
 
 ### Skinning RE — DONE this session (partial, honest)
 Ghidra traced the D3D9 render path (N:\gamePAKdata\re\SKINNING_RESULT.md):
