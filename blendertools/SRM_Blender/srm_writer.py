@@ -111,6 +111,18 @@ class WMesh:
         n = _u32(self.bone_raw, 8)
         return list(struct.unpack_from('<%dH' % n, self.bone_raw, 12))
 
+    def set_bones(self, node_indices):
+        """Rebuild the BONE palette from a list of node indices (u16 each).
+
+        The BONE chunk is exactly ``count(u32) + u16[count]`` (verified over the
+        corpus), so rebuilding it is byte-faithful: setting the same palette
+        reproduces the original bytes. Used to extend the palette when authored
+        geometry references a bone not already present.
+        """
+        n = len(node_indices)
+        body = struct.pack('<I', n) + struct.pack('<%dH' % n, *node_indices)
+        self.bone_raw = b'BONE' + struct.pack('<I', len(body)) + body
+
     def stream_by_usage(self, usage):
         for v in self.streams:
             if v.usage == usage:

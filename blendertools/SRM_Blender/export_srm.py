@@ -44,7 +44,7 @@ def _unswap(co):
     return (co[0], co[2], co[1])
 
 
-def _geometry_writeback(root, pmod):
+def _geometry_writeback(root, pmod, allow_topology=False):
     """Rewrite each mesh node's POSITION stream from the (edited) Blender mesh.
 
     Only valid for a model imported with Assemble='NONE' (mesh local coords are
@@ -77,18 +77,115 @@ def _geometry_writeback(root, pmod):
             skipped.append((o.name, "no float3 POSITION stream"))
             continue
         me = o.data
-        if len(me.vertices) != ps.vcount:
-            skipped.append((o.name, "vertex count %d != source %d (topology "
-                            "changed; reshape only, don't add/remove verts)"
+        if len(me.vertices) == ps.vcount:
+            # Same topology: surgical position-only rewrite (byte-identical when
+            # unedited; captures vertex moves).
+            buf = bytearray(ps.vcount * 12)
+            for i, v in enumerate(me.vertices):
+                sx, sy, sz = _unswap(v.co)
+                struct.pack_into('<3f', buf, i * 12, sx, sy, sz)
+            ps.data = bytes(buf)
+            written += 1
+        elif allow_topology:
+            # Topology changed (verts added/removed): full rebuild of the mesh
+            # streams + index buffer, with per-vertex bone from the vertex groups.
+            try:
+                _full_geometry_rebuild(o, pmod.meshes[mi], pmod.nodes)
+                written += 1
+            except Exception as e:
+                skipped.append((o.name, "topology rebuild failed: %s" % e))
+        else:
+            skipped.append((o.name, "vertex count %d != source %d; enable "
+                            "'Allow Topology Changes' to add/remove verts"
                             % (len(me.vertices), ps.vcount)))
-            continue
-        buf = bytearray(ps.vcount * 12)
-        for i, v in enumerate(me.vertices):
-            sx, sy, sz = _unswap(v.co)
-            struct.pack_into('<3f', buf, i * 12, sx, sy, sz)
-        ps.data = bytes(buf)
-        written += 1
     return written, skipped
+
+
+def _dominant_group_name(v, obj):
+    """Name of the vertex group with the highest weight on vertex v, or None."""
+    best = None; bw = -1.0
+    for g in v.groups:
+        if g.weight > bw:
+            bw = g.weight
+            gi = g.group
+            if 0 <= gi < len(obj.vertex_groups):
+                best = obj.vertex_groups[gi].name
+    return best
+
+
+def _full_geometry_rebuild(obj, mesh_w, pmod_nodes):
+    """Rebuild a WMesh's streams + index buffer from an edited Blender mesh whose
+    topology changed (verts added/removed). Per-vertex bone comes from the vertex
+    groups created on import (``cpcw_bone_map`` maps group name -> node index);
+    the BONE palette is extended if a referenced bone isn't already present.
+
+    Positions are un-swapped (Blender local == swap(stored) for a NONE-mode
+    import); triangles are re-wound to the SRM order; UVs are taken per vertex
+    (the first loop -- a UV seam that splits one vertex is not representable in
+    the per-vertex stream). Requires the model imported with Assemble='NONE'.
+    """
+    me = obj.data
+    me.calc_loop_triangles()
+    n = len(me.vertices)
+
+    positions = [_unswap(v.co) for v in me.vertices]
+    normals = [_unswap(v.normal) for v in me.vertices]
+
+    # UV per vertex from the active layer (first loop touching each vertex)
+    uvs = [(0.0, 0.0)] * n
+    uvl = me.uv_layers.active
+    if uvl:
+        seen = [False] * n
+        for loop in me.loops:
+            vi = loop.vertex_index
+            if not seen[vi]:
+                u, v = uvl.data[loop.index].uv
+                uvs[vi] = (u, 1.0 - v)  # undo the import's V flip
+                seen[vi] = True
+
+    # Triangles, re-wound to SRM order (import used v0,v2,v1; mirror it back)
+    indices = []
+    for lt in me.loop_triangles:
+        a, b, c = lt.vertices
+        indices.extend((a, c, b))
+
+    # Per-vertex bone -> palette index, extending the palette as needed.
+    node_name_to_idx = {}
+    for ni, nd in enumerate(pmod_nodes):
+        node_name_to_idx.setdefault(nd.name, ni)
+    bone_map = {}
+    raw = obj.get('cpcw_bone_map', '')
+    for pair in raw.split(';'):
+        if '=' in pair:
+            k, val = pair.rsplit('=', 1)
+            try:
+                bone_map[k] = int(val)
+            except ValueError:
+                pass
+
+    palette = list(mesh_w.bones())        # node indices
+    pal_index = {ni: pi for pi, ni in enumerate(palette)}
+
+    def palette_index_for_node(nidx):
+        if nidx in pal_index:
+            return pal_index[nidx]
+        pi = len(palette)
+        palette.append(nidx)
+        pal_index[nidx] = pi
+        return pi
+
+    default_pi = 0 if palette else palette_index_for_node(0)
+    bone_indices = []
+    for v in me.vertices:
+        gname = _dominant_group_name(v, obj)
+        nidx = None
+        if gname is not None:
+            nidx = bone_map.get(gname, node_name_to_idx.get(gname))
+        bone_indices.append(default_pi if nidx is None
+                            else palette_index_for_node(nidx))
+
+    mesh_w.set_bones(palette)
+    mesh_w.replace_geometry(positions, indices, uvs, normals, bone_indices)
 
 
 def _srm_local_matrix(pos, rot, scale):
@@ -136,7 +233,8 @@ def _node_edit(obj, root, model, node_index, tol=1e-5):
     return (loc.x, loc.y, loc.z), (eul.x, eul.y, eul.z), (scl.x, scl.y, scl.z)
 
 
-def export_srm(context, filepath, apply_transforms=True, write_geometry=False):
+def export_srm(context, filepath, apply_transforms=True, write_geometry=False,
+               allow_topology=False):
     sel = context.selected_objects or context.scene.objects
     root = None
     for o in sel:
@@ -164,7 +262,7 @@ def export_srm(context, filepath, apply_transforms=True, write_geometry=False):
                 "'Off (raw bind pose)'; this one used %r, whose vertices are "
                 "bone-transformed and can't be inverted. Re-import with Assemble="
                 "Off to edit and export geometry." % assemble)
-        geo_written, skipped = _geometry_writeback(root, pmod)
+        geo_written, skipped = _geometry_writeback(root, pmod, allow_topology)
         for name, why in skipped:
             print("  geometry write-back skipped %s: %s" % (name, why))
 
@@ -212,19 +310,28 @@ class EXPORT_OT_cpcw_srm(bpy.types.Operator, ExportHelper):
         default=True,
     )
     write_geometry: BoolProperty(
-        name="Write Back Geometry (reshape)",
+        name="Write Back Geometry",
         description="Rewrite each mesh's vertex POSITIONS from the edited Blender "
-                    "mesh (reshape existing geometry). Requires the model to have "
-                    "been imported with Assemble='Off (raw bind pose)' and the "
-                    "vertex count unchanged. Indices/UVs/normals/skinning are "
-                    "preserved; a no-edit export stays byte-identical",
+                    "mesh (reshape existing geometry). Requires the model imported "
+                    "with Assemble='Off (raw bind pose)'. With the vertex count "
+                    "unchanged, indices/UVs/normals/skinning are preserved and a "
+                    "no-edit export stays byte-identical",
+        default=False,
+    )
+    allow_topology: BoolProperty(
+        name="Allow Topology Changes (author)",
+        description="Also accept meshes with a changed vertex count (added/removed "
+                    "verts): rebuild the whole mesh -- positions, triangles, UVs, "
+                    "normals -- and take each vertex's bone from its 'Bone Vertex "
+                    "Groups' (the palette is extended for new bones). For authoring "
+                    "new geometry; model in the Off/bind-pose space",
         default=False,
     )
 
     def execute(self, context):
         try:
             export_srm(context, self.filepath, self.apply_transforms,
-                       self.write_geometry)
+                       self.write_geometry, self.allow_topology)
         except Exception as e:
             self.report({'ERROR'}, "SRM export failed: %s" % e)
             return {'CANCELLED'}
@@ -234,6 +341,8 @@ class EXPORT_OT_cpcw_srm(bpy.types.Operator, ExportHelper):
         layout = self.layout
         layout.prop(self, "apply_transforms")
         layout.prop(self, "write_geometry")
+        if self.write_geometry:
+            layout.prop(self, "allow_topology")
 
 
 def menu_func_export(self, context):

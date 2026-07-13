@@ -497,8 +497,48 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
     return bl_mesh
 
 
+def _assign_bone_groups(obj, srm_mesh, nodes):
+    """Expose the mesh's rigid skinning as Blender vertex groups.
+
+    Each vertex is rigidly bound to one bone (palette index = NORMAL byte 3);
+    create one vertex group per palette entry, named after its node, and assign
+    each vertex (weight 1.0). The Blender vertex order matches the SRM order
+    (``from_pydata`` preserves it), so group membership round-trips. A
+    ``cpcw_bone_map`` custom prop records group-name -> node-index so the exporter
+    can turn edited/new groups back into a bone palette. Enables authoring: a
+    modder assigns new geometry to a bone's group and exports it.
+    """
+    bidx = srm_mesh.vertex_bone_indices()
+    if not bidx:
+        return
+    palette = srm_mesh.bones
+    if len(bidx) != len(obj.data.vertices):
+        return  # vertex counts must line up to map groups safely
+    group_of_pi = {}
+    name_map = {}
+    used = set()
+    for pi, nidx in enumerate(palette):
+        base = (nodes[nidx].name if 0 <= nidx < len(nodes) and nodes[nidx].name
+                else "bone_%d" % pi)
+        nm = base
+        k = 1
+        while nm in used:
+            nm = "%s.%03d" % (base, k); k += 1
+        used.add(nm)
+        group_of_pi[pi] = obj.vertex_groups.new(name=nm)
+        name_map[nm] = nidx
+    buckets = {}
+    for vi, bi in enumerate(bidx):
+        if 0 <= bi < len(palette):
+            buckets.setdefault(bi, []).append(vi)
+    for pi, verts in buckets.items():
+        group_of_pi[pi].add(verts, 1.0, 'REPLACE')
+    obj["cpcw_bone_map"] = ";".join("%s=%d" % (k, v) for k, v in name_map.items())
+
+
 def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
-             apply_skin='AUTO', show_skeleton=False, variant='STANDARD'):
+             apply_skin='AUTO', show_skeleton=False, variant='STANDARD',
+             make_vertex_groups=True):
     """Import an SRM file. apply_skin is 'AUTO', 'FULL' or 'NONE'.
 
     ``variant`` selects the upgrade loadout for vehicles that pack several into
@@ -563,6 +603,8 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
             # world transform; assembled meshes already bake world+swap in.
             if apply_skin == 'NONE':
                 obj.matrix_basis = world_mats_bl[i]
+            if make_vertex_groups:
+                _assign_bone_groups(obj, node.mesh, nodes)
         else:
             if not show_skeleton:
                 continue
@@ -658,12 +700,21 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         description="Also create an Empty at each skeleton bone (attach points)",
         default=False,
     )
+    make_vertex_groups: BoolProperty(
+        name="Bone Vertex Groups",
+        description="Add a vertex group per bone (named after its node) holding "
+                    "each vertex's rigid binding. Lets you re-bind or author new "
+                    "geometry and export it back (see the exporter's geometry "
+                    "write-back)",
+        default=True,
+    )
 
     def execute(self, context):
         try:
             root = load_srm(context, self.filepath, self.scale,
                             self.import_textures, self.texture_dir,
-                            self.apply_skin, self.show_skeleton, self.variant)
+                            self.apply_skin, self.show_skeleton, self.variant,
+                            self.make_vertex_groups)
         except Exception as e:
             self.report({'ERROR'}, f"SRM import failed: {e}")
             return {'CANCELLED'}
@@ -679,6 +730,7 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         layout.prop(self, "apply_skin")
         layout.prop(self, "variant")
         layout.prop(self, "show_skeleton")
+        layout.prop(self, "make_vertex_groups")
         layout.prop(self, "import_textures")
         if self.import_textures:
             layout.prop(self, "texture_dir")
