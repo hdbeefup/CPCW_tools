@@ -195,6 +195,133 @@ def _splat_vertex_colors(mf, data_root, uvs):
     return out
 
 
+def _dds_to_bpy_image(path, name):
+    """Decode a DDS via the vendored decoder into a Blender image (or None)."""
+    try:
+        from . import dds
+        img = dds.DDS.read(path)
+    except Exception as e:
+        print("  dds->image failed for %s: %s" % (os.path.basename(path), e))
+        return None
+    bi = bpy.data.images.new(name, img.width, img.height, alpha=False)
+    n = img.width * img.height
+    px = [0.0] * (n * 4)
+    rgba = img.rgba
+    # DDS is top-down; Blender images are bottom-up -> flip rows. sRGB->linear.
+    def s2l(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    w = img.width
+    for y in range(img.height):
+        sy = (img.height - 1 - y)
+        for x in range(w):
+            si = (sy * w + x) * 4
+            di = (y * w + x) * 4
+            px[di] = s2l(rgba[si]); px[di+1] = s2l(rgba[si+1]); px[di+2] = s2l(rgba[si+2])
+            px[di+3] = 1.0
+    bi.pixels.foreach_set(px)
+    bi.pack()
+    return bi
+
+
+def _splat_mask_image(name, weight_bytes, W, H):
+    """Build a WxH single-channel (in RGB) Blender image from uint8 splat weights."""
+    bi = bpy.data.images.new(name, W, H, alpha=False, is_data=True)
+    px = [0.0] * (W * H * 4)
+    for y in range(H):
+        sy = (H - 1 - y)  # flip to match Blender bottom-up
+        row = sy * W
+        for x in range(W):
+            w = weight_bytes[row + x] / 255.0
+            di = (y * W + x) * 4
+            px[di] = px[di+1] = px[di+2] = w
+            px[di+3] = 1.0
+    bi.pixels.foreach_set(px)
+    bi.pack()
+    return bi
+
+
+def _build_textured_terrain_material(mf, data_root, world_w, world_h, max_layers=6):
+    """Build a tiled-texture terrain material from the GTRD splatmap, or None.
+
+    Each active layer's real .dds is tiled across the surface (world-scaled UV)
+    and the layers are alpha-composited ("over", layer 0 base) using per-layer
+    splat masks as mix factors -- so roads/fields/grass show real texture detail,
+    matching the game, instead of a flat per-vertex tint.
+    """
+    if not data_root:
+        return None
+    try:
+        sp = mf.get_splatmap()
+    except Exception:
+        sp = None
+    if not sp:
+        return None
+    layers, weights, W, H = sp
+    idx = _dds_index(data_root)
+    if not idx:
+        return None
+    active = [i for i, l in enumerate(layers) if l.get('active')]
+    if not active:
+        return None
+    # resolve layer -> dds image; keep only those that resolve, cap the count
+    resolved = []
+    for i in active:
+        p = _resolve_layer_dds(layers[i]['name'], idx)
+        if p:
+            resolved.append((i, p, float(layers[i].get('uv_scale') or 1.0)))
+        if len(resolved) >= max_layers:
+            break
+    if not resolved:
+        return None
+
+    mat = bpy.data.materials.new("TerrainTextured")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nodes, links = nt.nodes, nt.links
+    for n in list(nodes):
+        nodes.remove(n)
+    out = nodes.new('ShaderNodeOutputMaterial'); out.location = (900, 0)
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled'); bsdf.location = (620, 0)
+    bsdf.inputs['Roughness'].default_value = 1.0
+    links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    uv = nodes.new('ShaderNodeUVMap'); uv.location = (-1100, 0); uv.uv_map = "UVMap"
+
+    # tiling: repeat each texture ~ every TILE world units (scaled by uv_scale)
+    TILE = 12.0
+    prev_color = None
+    y = 0
+    for k, (li, path, uvs) in enumerate(resolved):
+        tex_img = _dds_to_bpy_image(path, "terr_%02d_%s" % (li, os.path.basename(path)))
+        if tex_img is None:
+            continue
+        mapn = nodes.new('ShaderNodeMapping'); mapn.location = (-850, y)
+        reps_x = max(1.0, world_w / TILE * uvs)
+        reps_y = max(1.0, world_h / TILE * uvs)
+        mapn.inputs['Scale'].default_value = (reps_x, reps_y, 1.0)
+        links.new(uv.outputs['UV'], mapn.inputs['Vector'])
+        tnode = nodes.new('ShaderNodeTexImage'); tnode.location = (-650, y)
+        tnode.image = tex_img; tnode.extension = 'REPEAT'
+        links.new(mapn.outputs['Vector'], tnode.inputs['Vector'])
+        if prev_color is None:
+            prev_color = tnode.outputs['Color']
+        else:
+            mask = _splat_mask_image("mask_%02d" % li, weights[li], W, H)
+            mnode = nodes.new('ShaderNodeTexImage'); mnode.location = (-650, y - 130)
+            mnode.image = mask; mnode.extension = 'EXTEND'
+            links.new(uv.outputs['UV'], mnode.inputs['Vector'])
+            mix = nodes.new('ShaderNodeMixRGB'); mix.location = (200, y)
+            mix.blend_type = 'MIX'
+            links.new(mnode.outputs['Color'], mix.inputs['Fac'])
+            links.new(prev_color, mix.inputs['Color1'])
+            links.new(tnode.outputs['Color'], mix.inputs['Color2'])
+            prev_color = mix.outputs['Color']
+        y -= 320
+    if prev_color is not None:
+        links.new(prev_color, bsdf.inputs['Base Color'])
+    return mat
+
+
 def _build_terrain(mf, collection, world_w, world_h, tint_passability,
                    use_heightmap=True, height_res=256, data_root=None,
                    paint_splatmap=True):
@@ -251,8 +378,24 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability,
         mesh.from_pydata(verts, [], faces)
         mesh.update()
 
-        vcolors = None
+        # UV layer (normalized grid coords) for tiled textures / splat masks.
+        uvl = mesh.uv_layers.new(name="UVMap")
+        for loop in mesh.loops:
+            uvl.data[loop.index].uv = uvs[loop.vertex_index]
+
+        # Prefer a real tiled-texture material; keep the per-vertex tint as a
+        # fallback (and for when the layer .dds can't be resolved).
+        tex_mat = None
         if paint_splatmap:
+            try:
+                tex_mat = _build_textured_terrain_material(mf, data_root,
+                                                           world_w, world_h)
+            except Exception as e:
+                print("  textured terrain material failed: %s" % e)
+                tex_mat = None
+
+        vcolors = None
+        if paint_splatmap and tex_mat is None:
             vcolors = _splat_vertex_colors(mf, data_root, uvs)
         if vcolors:
             try:
@@ -265,6 +408,10 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability,
                 vcolors = None
 
         obj = bpy.data.objects.new("Terrain", mesh)
+        if tex_mat is not None:
+            obj.data.materials.append(tex_mat)
+            collection.objects.link(obj)
+            return obj
         mat = bpy.data.materials.new("TerrainMat")
         mat.use_nodes = True
         pr = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)

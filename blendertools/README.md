@@ -73,10 +73,13 @@ ProtoDB.bin                                       # prototype DB (for future mod
     displaced by the decoded GTRD elevation grid (the actual in-game hills;
     *Terrain Resolution* caps subdivisions per axis). Turn off for a flat plane
     with optional *Tint Passability* (green = passable, red = blocked, BLCK).
-  - **Paint Terrain** (*default on*) — tints the terrain per-vertex from the
-    GTRD paint layers (decoded splatmap), so roads / fields / river beds / grass
-    read like the game. Uses the real layer `.dds` ground-texture averages when
-    the *Data Root* is found, else a colour-by-ground-type fallback.
+  - **Paint Terrain** (*default on*) — reproduces the GTRD terrain paint. When the
+    *Data Root* resolves the layer `.dds` files it builds a **tiled-texture**
+    material: each layer's real ground texture is tiled across the surface and the
+    layers are alpha-composited by their splat masks, so roads / fields / river
+    beds / grass show real texture detail like the game. If a texture can't be
+    found it falls back to a per-vertex tint (real layer averages, else a
+    colour-by-ground-type palette).
   - **Place Real Models** — resolves each entity's `Prototype` through
     `ProtoDB.bin` to its `.srm` and instances the actual model at the entity's
     position / yaw / scale, so the scene matches the game (needs the SRM add-on
@@ -136,8 +139,6 @@ converter got wrong:
   per-bone rule lives in the D3D render path and hasn't been reversed yet; a few
   edge cases (e.g. the moskvitch `_speaker` body sits ~0.1 low) need it. `Full`/
   `Off` remain as overrides.
-- **Map terrain has no tiled texture detail.** The splatmap paint is reproduced
-  as a per-vertex tint (roads/fields/grass read correctly), but the layer `.dds`
-  textures are not tiled/baked onto the surface — the terrain is coloured, not
-  texture-mapped.
-- **Single material per mesh.** Sub-mesh/multi-material splitting is not applied.
+- **Single material per mesh.** In practice every shipped mesh carries exactly
+  one submesh (materials are split across separate mesh *nodes*, which the
+  importer already handles), so this is a non-issue on the game corpus.
