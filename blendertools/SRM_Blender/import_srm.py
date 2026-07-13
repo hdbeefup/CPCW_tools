@@ -309,8 +309,53 @@ def _attach_override(mesh, nodes, attach_nodes):
     return None
 
 
+# Upgrade-variant convention (baked into node names by the authoring tool):
+# vehicles pack every loadout in one .srm. A part's variant is read from the
+# name of the bone it is skinned to -- ``_std`` = standard, ``_upg`` = upgraded,
+# ``camo`` = the upgrade's camouflage net (camo nodes also carry ``_upg``, so
+# 'camo' is tested first). Untagged bones are the always-present base hull.
+_VARIANT_KEEP = {
+    'STANDARD': frozenset(('BASE', 'STD')),
+    'UPGRADED': frozenset(('BASE', 'UPG', 'CAMO')),
+}
+
+
+def _variant_tag(name):
+    n = name.lower()
+    if 'camo' in n:
+        return 'CAMO'
+    if '_upg' in n:
+        return 'UPG'
+    if '_std' in n:
+        return 'STD'
+    return 'BASE'
+
+
+def _variant_vertex_keep(mesh, nodes, variant):
+    """Per-vertex keep mask for the selected upgrade variant, or None.
+
+    Returns None when the mesh is unskinned or carries no variant parts (the
+    common case -- most models are entirely 'BASE', so filtering is a no-op).
+    """
+    keep_tags = _VARIANT_KEEP.get(variant)
+    if keep_tags is None or nodes is None:
+        return None
+    bone_idx = mesh.vertex_bone_indices()
+    if not bone_idx:
+        return None
+    palette = mesh.bones
+    tag_by_bi = {}
+    for bi in set(bone_idx):
+        ni = palette[bi] if 0 <= bi < len(palette) else -1
+        nm = nodes[ni].name if 0 <= ni < len(nodes) else ''
+        tag_by_bi[bi] = _variant_tag(nm)
+    if all(t == 'BASE' for t in tag_by_bi.values()):
+        return None  # nothing to filter
+    return [tag_by_bi[bi] in keep_tags for bi in bone_idx]
+
+
 def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
-                attach_nodes=None):
+                attach_nodes=None, variant='ALL'):
     """Build a Blender mesh datablock from an SrmNode's mesh.
 
     CPCW meshes are rigidly skinned: each vertex carries a bone-palette index
@@ -335,6 +380,14 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
     # Winding REVERSED (v0, v2, v1): the handedness swap is a reflection, which
     # flips triangle orientation; reversing restores outward-facing normals.
     faces = [(idx[i], idx[i + 2], idx[i + 1]) for i in range(0, len(idx) - 2, 3)]
+
+    # Upgrade-variant filter: drop faces whose vertices belong to an excluded
+    # loadout (e.g. show the STANDARD tank without the upgraded gun / camo net).
+    # A variant part is a separate geometry island, so all 3 verts share a tag.
+    if variant != 'ALL':
+        keep = _variant_vertex_keep(mesh, nodes, variant)
+        if keep is not None:
+            faces = [f for f in faces if keep[f[0]] and keep[f[1]] and keep[f[2]]]
 
     norm_stream = mesh.stream_by_usage(srm_format.USAGE_NORMAL)
     normals = list(norm_stream.normals()) if norm_stream is not None else None
@@ -409,8 +462,14 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
 
 
 def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
-             apply_skin='AUTO', show_skeleton=False):
-    """Import an SRM file. apply_skin is 'AUTO', 'FULL' or 'NONE'."""
+             apply_skin='AUTO', show_skeleton=False, variant='STANDARD'):
+    """Import an SRM file. apply_skin is 'AUTO', 'FULL' or 'NONE'.
+
+    ``variant`` selects the upgrade loadout for vehicles that pack several into
+    one .srm: 'STANDARD' (base + std parts, the clean default), 'UPGRADED'
+    (base + upgraded parts + camo net), or 'ALL' (every variant, may overlap).
+    Filtering is display-only; export round-trips from the pristine source.
+    """
     nodes = srm_format.parse_srm(filepath)
     world_mats = _build_world_matrices(nodes)
     # Named attach nodes (unk4=8, no mesh) for prop meshes (see _attach_override).
@@ -441,6 +500,7 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
     # file (see export_srm.py) and record the assemble mode used.
     root["cpcw_srm_source"] = os.path.abspath(filepath)
     root["cpcw_assemble"] = apply_skin
+    root["cpcw_variant"] = variant
     collection.objects.link(root)
 
     img_cache = {}
@@ -452,7 +512,12 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
 
         if node.mesh:
             bl_mesh = _build_mesh(node, obj_name, nodes, world_mats, apply_skin,
-                                  attach_nodes)
+                                  attach_nodes, variant)
+            # Whole mesh filtered out by the variant selection (e.g. an all-camo
+            # merged mesh under STANDARD): drop it rather than leave loose verts.
+            if bl_mesh is not None and variant != 'ALL' and not bl_mesh.polygons:
+                bpy.data.meshes.remove(bl_mesh)
+                continue
             obj = bpy.data.objects.new(obj_name, bl_mesh)
             for sm in node.mesh.submeshes:
                 obj.data.materials.append(
@@ -531,6 +596,24 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         ],
         default='AUTO',
     )
+    variant: EnumProperty(
+        name="Variant",
+        description="Which upgrade loadout to show for vehicles that pack "
+                    "several into one file (chosen per-vertex by the bone each "
+                    "part is skinned to). Non-variant models are unaffected",
+        items=[
+            ('STANDARD', "Standard",
+             "Base hull plus the standard parts; hides the upgraded gun/parts "
+             "and the camo net (the clean default)"),
+            ('UPGRADED', "Upgraded",
+             "Base hull plus the upgraded parts and camo net; hides the "
+             "standard parts"),
+            ('ALL', "All (raw)",
+             "Every variant at once (standard + upgraded + camo may overlap "
+             "at attach points). Faithful to the file's full contents"),
+        ],
+        default='STANDARD',
+    )
     show_skeleton: BoolProperty(
         name="Show Skeleton",
         description="Also create an Empty at each skeleton bone (attach points)",
@@ -541,7 +624,7 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         try:
             root = load_srm(context, self.filepath, self.scale,
                             self.import_textures, self.texture_dir,
-                            self.apply_skin, self.show_skeleton)
+                            self.apply_skin, self.show_skeleton, self.variant)
         except Exception as e:
             self.report({'ERROR'}, f"SRM import failed: {e}")
             return {'CANCELLED'}
@@ -555,6 +638,7 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         layout = self.layout
         layout.prop(self, "scale")
         layout.prop(self, "apply_skin")
+        layout.prop(self, "variant")
         layout.prop(self, "show_skeleton")
         layout.prop(self, "import_textures")
         if self.import_textures:
