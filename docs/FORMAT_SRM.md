@@ -280,12 +280,38 @@ Empirically the geometry is authored in a mix:
   merely anchored to a side node) are stored at their final position →
   `InvBind = BoneWorld[bone]⁻¹` → leave in place.
 
-The render path was not recovered from the binary, so the importer's **AUTO**
-mode uses a geometric proxy to pick skin-vs-leave per group (a group is left only
-when it spans most of the mesh AND skinning it would shove it off the x=0 centre
-line). This matches every tested model (car, tank, helicopter, buildings) but is
-a heuristic, not a decoded flag; `FULL` (skin all) and `NONE` (skin none) remain
-as overrides.
+### What the render path actually does (Ghidra, partial)
+
+The D3D9 draw path was traced far enough to establish the **mechanism** (hard
+decompiled evidence; see `N:\gamePAKdata\re\SKINNING_RESULT.md`):
+
+- SRM meshes are drawn through the **programmable (vertex-shader) pipeline**. The
+  SRM geometry class's bind method `FUN_0051b7a0` calls
+  `dev->SetVertexShader(geom+0x18)` (vtable +0x15c) then `SetStreamSource` per
+  stream — a custom VS is bound, so the per-vertex transform runs in that shader.
+- **Fixed-function indexed vertex blending is ruled out:** `SetTransform` is never
+  called with a `D3DTS_WORLDMATRIX(256+i)` state, and `D3DRS_VERTEXBLEND(151)` /
+  `INDEXEDVERTEXBLENDENABLE(167)` appear only in device-init defaults, never in a
+  per-draw setup. So skinning is a **vertex-shader matrix palette indexed by the
+  rigid bone index** (NORMAL byte 3 → BONE palette → node).
+- **Not recovered:** whether the palette matrix for a bone is `boneWorld[node]`
+  (simple) or `boneWorld[node]·invBind[node]`. The `SetVertexShaderConstantF`
+  upload site could not be isolated (vtable-offset collisions + a cached device
+  pointer). The **simple** rule `v_world = boneWorld[palette[idx]]·v_stored` is the
+  most likely and is consistent with every empirical result here (it un-mirrored
+  the train and re-attached the ka_15 windows), but is not *proven* by the code.
+
+The key consequence stands: **no inverse-bind / bind matrix is stored in the SRM**
+(BONE is a u16 palette, PBND a bbox). The exact per-bone matrix is computed by the
+engine's skeleton/animation system at bind time — the wheels/suspension sit at an
+**animation-driven rest pose** that differs from the static node hierarchy, so a
+model's exact rest cannot be reconstructed from the file alone.
+
+Accordingly the importer's **AUTO** mode uses a geometric proxy to pick
+skin-vs-leave per group (a group is left only when it spans most of the mesh AND
+skinning it would shove it off the x=0 centre line). This matches every tested
+model (car, tank, helicopter, buildings) but is a static approximation, not a
+decoded flag; `FULL` (skin all) and `NONE` (skin none) remain as overrides.
 
 ## Upgrade variants (node-name convention)
 

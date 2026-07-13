@@ -39,17 +39,27 @@ Big deliverables since the round-trip writer:
   GLB round-trip vs native SRM import of v200 have identical signed volume
   (125.146, ratio 1.0) -> chirally identical, un-mirrored. [[srm-handedness]].
 
+### Skinning RE — DONE this session (partial, honest)
+Ghidra traced the D3D9 render path (N:\gamePAKdata\re\SKINNING_RESULT.md):
+- PROVEN: SRM meshes draw via the **programmable vertex-shader pipeline**
+  (`FUN_0051b7a0` binds a custom VS + streams); **fixed-function indexed vertex
+  blending RULED OUT**. Skinning = VS matrix palette indexed by the rigid bone
+  index (NORMAL byte3 → BONE → node).
+- NOT recovered: the exact palette matrix (boneWorld vs boneWorld·invBind) — the
+  SetVertexShaderConstantF upload site couldn't be isolated. Simple rule
+  `v_world = boneWorld[palette[idx]]·v_stored` is most likely + consistent, not
+  proven. CONFIRMED: no invBind in the file; it's engine-computed at bind time;
+  wheels/suspension sit at an animation-driven rest pose ≠ static hierarchy.
+- Decision: keep AUTO (best static proxy; FULL is unproven AND breaks moskvitch).
+
 ### STILL TODO
-- **moskvitch body ~0.1-0.2 too low** (wheels clip the body/arches). Its body
-  binds to `suspension0l` (base moskvitch401 binds body->`body0`); AUTO leaves it
-  model-space (correct) but the exact ground-clearance offset isn't in the file;
-  skinning by body0 DISTORTS it (180deg yaw). Needs the real inverse-bind rule.
-- **AUTO skinning is a heuristic, not the game's true rule.** Reversing the D3D
-  render/skinning path is IN PROGRESS this session (background Ghidra agent
-  writing N:\gamePAKdata\re\SKINNING_RESULT.md; scans in skin_scan*.txt). To make
-  skinning exact + fix the moskvitch height, need the load-time inverse-bind /
-  matrix-palette setup. Ghidra project N:\gamePAKdata\re\gp; loader dumps in
-  srm_funcs.txt, render_funcs.txt.
+- **moskvitch body ~0.1-0.2 too low** — now understood as INHERENT to static
+  reconstruction: the suspension bones' true rest pose is animation-driven and not
+  in the .srm. Not a fixable bug from the file. Would need the bind-time
+  skeleton/palette upload traced (different code path than the draw call).
+- **AUTO skinning** stays a heuristic by necessity (see above). If ever revisited,
+  trace the bind-time palette upload, not the render draw. Ghidra project
+  N:\gamePAKdata\re\gp; dumps srm_funcs.txt, render_funcs.txt, SKINNING_RESULT.md.
 
 ## Goal
 Blender import (and eventually export) of Codename: Panzers Cold War `.srm` models
