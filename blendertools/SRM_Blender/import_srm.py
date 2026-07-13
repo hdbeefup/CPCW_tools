@@ -311,19 +311,20 @@ def _attach_override(mesh, nodes, attach_nodes):
 
 # Upgrade-variant convention (baked into node names by the authoring tool):
 # vehicles pack every loadout in one .srm. A part's variant is read from the
-# name of the bone it is skinned to -- ``_std`` = standard, ``_upg`` = upgraded,
-# ``camo`` = the upgrade's camouflage net (camo nodes also carry ``_upg``, so
-# 'camo' is tested first). Untagged bones are the always-present base hull.
+# name of the bone it is skinned to -- the ``_std`` / ``_upg`` SUFFIX marks the
+# standard vs upgraded loadout. The upgrade's camouflage-net parts are named
+# ``camo_..._upg`` (they always carry ``_upg``), so they fall under UPGRADED
+# without a separate rule -- and, crucially, so a model whose *own name* contains
+# "camo" (e.g. ``camo_tent``, not an upgrade) is NOT mis-filtered. Untagged bones
+# are the always-present base hull.
 _VARIANT_KEEP = {
     'STANDARD': frozenset(('BASE', 'STD')),
-    'UPGRADED': frozenset(('BASE', 'UPG', 'CAMO')),
+    'UPGRADED': frozenset(('BASE', 'UPG')),
 }
 
 
 def _variant_tag(name):
     n = name.lower()
-    if 'camo' in n:
-        return 'CAMO'
     if '_upg' in n:
         return 'UPG'
     if '_std' in n:

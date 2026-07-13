@@ -317,18 +317,20 @@ decoded flag; `FULL` (skin all) and `NONE` (skin none) remain as overrides.
 
 Vehicles pack **every upgrade loadout into one .srm** (the shipped file has a few
 pre-merged meshes named `Merged mesh N`, each skinned to a mixed bone palette).
-A part's variant is read from the **name of the bone it is skinned to**:
+A part's variant is read from the **`_std` / `_upg` suffix on the name of the
+bone it is skinned to**:
 
-| Bone-name token | Variant part |
-|-----------------|--------------|
-| `…_std`         | standard loadout (e.g. `gun0m0_std`, `door0_std`) |
-| `…_upg`         | upgraded loadout (`gun2h0_upg`, `camo_body0_upg`) |
-| `camo…`         | the upgrade's camouflage net (these also carry `_upg`) |
-| (untagged)      | always-present base hull / tracks |
+| Bone-name suffix | Variant part |
+|------------------|--------------|
+| `…_std`          | standard loadout (e.g. `gun0m0_std`, `door0_std`) |
+| `…_upg`          | upgraded loadout (`gun2h0_upg`, `radar0_upg`, and camo-net `camo_body0_upg` — camo parts always carry `_upg`) |
+| (neither)        | always-present base hull / tracks / base weapon |
 
 The engine shows the loadout matching the unit's in-game upgrade state; the file
 carries all of them, overlapping at their attach points. The Blender importer
 reproduces this with a **Variant** option that keeps faces per the selected set —
-`STANDARD` = {base, `_std`}, `UPGRADED` = {base, `_upg`, camo}, `ALL` = every
-part — read per-vertex from each vertex's bone tag. Single-variant models are
-entirely untagged (base) so the filter is a no-op for them.
+`STANDARD` = {base, `_std`}, `UPGRADED` = {base, `_upg`}, `ALL` = every part —
+read per-vertex from each vertex's bone tag. Only 18 of 2087 models carry these
+tags; the rest are entirely untagged (base) so the filter is a no-op. Note the
+match is on the `_std`/`_upg` **suffix**, not a bare `camo` substring — otherwise
+a model whose own name contains "camo" (e.g. `camo_tent`) would be wrongly hidden.
