@@ -30,8 +30,34 @@ from . import dds
 # Textures / materials
 # ---------------------------------------------------------------------------
 
+_TEX_INDEX = {}  # dir -> {basename_lower: path}, recursive, cached
+
+
+def _tex_index(d):
+    """Recursive basename -> path index of a directory tree (cached)."""
+    if d in _TEX_INDEX:
+        return _TEX_INDEX[d]
+    idx = {}
+    try:
+        for dp, _dirs, fns in os.walk(d):
+            for fn in fns:
+                stem, ext = os.path.splitext(fn)
+                if ext.lower() in ('.dds', '.tga', '.png'):
+                    idx.setdefault(stem.lower(), os.path.join(dp, fn))
+    except OSError:
+        pass
+    _TEX_INDEX[d] = idx
+    return idx
+
+
 def _find_texture(tex_name, search_dirs):
-    """Locate a texture file by extension-less basename in the search dirs."""
+    """Locate a texture file by extension-less basename in the search dirs.
+
+    Checks each dir directly first (a texture next to the .srm wins), then falls
+    back to a recursive basename index of each dir -- game models routinely
+    reference a shared texture that lives in a sibling folder (e.g. SU_T-54.dds
+    under Vehicles/SovietAdditional while the .srm is in Vehicles/Soviet).
+    """
     base = os.path.splitext(tex_name)[0]
     exts = ('.dds', '.DDS', '.tga', '.TGA', '.png', '.PNG')
     for d in search_dirs:
@@ -41,7 +67,6 @@ def _find_texture(tex_name, search_dirs):
             p = os.path.join(d, base + ext)
             if os.path.isfile(p):
                 return p
-        # case-insensitive fallback
         try:
             low = base.lower()
             for fn in os.listdir(d):
@@ -50,6 +75,14 @@ def _find_texture(tex_name, search_dirs):
                     return os.path.join(d, fn)
         except OSError:
             pass
+    # recursive fallback: shared texture in a sibling folder under the data root
+    base_low = os.path.splitext(tex_name)[0].lower()
+    for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        p = _tex_index(d).get(base_low)
+        if p:
+            return p
     return None
 
 
