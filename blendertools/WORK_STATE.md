@@ -216,3 +216,34 @@ class draw method (callers of 004af8a0).
 - Render: scratchpad/render_srm.py -- <srm.path> <out.png> FULL|PARTS|NONE
   (uses addon_utils.enable after read_factory_settings; re-sync installed addon first).
 - Parser parity (no Blender): import srm_format vs cpcw_srm on N:\gamePAKdata\CPCWPak.
+
+## NEW: standalone D3D9 SRM viewer (viewer/) — ground-truth renderer
+Built `viewer/` — a Win32 + Direct3D 9 fixed-function C++ viewer that renders a
+`.srm` **the way the engine does**: native DirectX left-handed Y-up (NO LH->RH
+reflection, NO winding reversal), rigid+smooth skinning by the PROVEN rule
+`v_world = boneWorld[BONE_palette[boneIdx]] . v_stored` (no inverse-bind). It is
+the ground-truth companion to the Blender importer (Blender converts to RH Z-up,
+so it can only approximate the raster path). Modelled on swinedecomp's
+swine_viewer (same engine family: SWINE -> Panzers -> CPCW), and a seed for a
+future CPCW decompile.
+- Self-contained: Windows SDK `d3d9` only (no legacy DirectX SDK). Ports of
+  srm_format.py (parser) and dds.py (DXT1/3/5) to C++; own column-vector Mat4
+  matching the importer's mathutils (T*R*S, R=Rx*Ry*Rz, world=parent*local).
+- Files: viewer/src/{mathx.h, srm_model.{h,cpp}, dds.{h,cpp}, viewer.cpp},
+  viewer/CMakeLists.txt, viewer/README.md.
+- Build: `cmake -S viewer -B viewer/build -G "Visual Studio 18 2026" -A x64 &&
+  cmake --build viewer/build --config Release` -> viewer/build/Release/cpcw_viewer.exe
+  (builds clean on VS 18 2026 / MSVC 19.50, Windows 10 SDK 10.0.26100).
+- Run: `cpcw_viewer <model.srm> [dataRoot] [--shot out.bmp] [--skin full|none]`.
+  `--shot` renders one frame offscreen to a 24-bit BMP and exits (headless
+  verification / gallery). Interactive: LMB orbit, RMB pan, wheel zoom, W wire,
+  T tex, F skin FULL/NONE, C cull, R reset.
+- VERIFIED headless (renders/viewer/*.png, gitignored): v200 train (lettering
+  reads FORWARD -> handedness correct), M48 Patton FULL (hull/turret/gun/tracks
+  assemble; road wheels+camo net float = documented animated-bone gap, matches
+  Blender FULL) + NONE (raw bind pose), moskvitch (body+wheels, tiny front-wheel
+  residual), ka_15 (canopy/star/rotor disc correct), british_barrack (unskinned
+  by node matrix). All model classes render.
+- Faithful limits (not bugs): animated bones float without animation eval
+  (future phase); diffuse alpha is spec/team mask -> no alpha blend (rotor disc
+  draws opaque); no variant filter yet.
