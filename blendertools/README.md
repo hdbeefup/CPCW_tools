@@ -58,16 +58,19 @@ ProtoDB.bin                                       # prototype DB (for future mod
   exporting it never corrupts it.
   - *Write Back Node Transforms* applies moves/rotations/scales of root-level
     nodes back into the file.
-  - *Write Back Geometry (reshape)* rewrites each mesh's vertex **positions** from
-    the edited Blender mesh, so you can reshape existing geometry and export it.
-    Requires the model to have been imported with **Assemble = Off (raw bind
-    pose)** — that's the only mode whose Blender coordinates invert cleanly back
-    to stored positions — and the vertex count unchanged (reshape, don't add or
-    remove verts; topology-changed meshes are skipped, not corrupted). Indices,
-    UVs, normals and skinning are preserved, so a no-edit export stays
-    byte-identical. (Authoring brand-new meshes/topology from scratch is still
-    future work — the writer's `replace_geometry` supports it, but a full
-    Blender-mesh → VERS/INDS/BONE encoder with new bone weights is not wired up.)
+  - *Write Back Geometry* rewrites each mesh's vertex **positions** from the edited
+    Blender mesh, so you can reshape existing geometry and export it. Requires the
+    model imported with **Assemble = Off (raw bind pose)** — the only mode whose
+    Blender coordinates invert cleanly back to stored positions. With the vertex
+    count unchanged, indices/UVs/normals/skinning are preserved and a no-edit
+    export stays byte-identical.
+  - *Allow Topology Changes (author)* additionally accepts meshes with **added or
+    removed vertices**: it rebuilds the whole mesh — positions, triangles, UVs,
+    normals — and takes each vertex's **bone from its vertex group** (import with
+    *Bone Vertex Groups* on, then assign new geometry to a bone's group; the BONE
+    palette is extended for a newly-referenced bone). Model in the Off/bind-pose
+    space. Caveat: the SRM stores one UV per vertex, so a UV seam that splits a
+    single vertex into two UVs isn't representable.
 - **Map:** *File > Import > CPCW Map (.map)*.
   - **Real Heightmap** (*default on*) — builds a subdivided terrain mesh
     displaced by the decoded GTRD elevation grid (the actual in-game hills;

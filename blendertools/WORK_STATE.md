@@ -78,13 +78,22 @@ inverse in the loop; no InvBind field/string anywhere in the binary.
   moskvitch401 FULL==AUTO; _speaker FULL lifts body (animated suspension0l); patton
   FULL floats road-wheels. Docs/memory/operator descriptions updated to SOLVED.
 
+### New-topology authoring — DONE (commit 3d17dad)
+Full modding round-trip now works: reshape AND add/remove geometry. Import "Bone
+Vertex Groups" exposes each vertex's bone as a group; export "Allow Topology
+Changes" rebuilds meshes (replace_geometry + set_bones), per-vertex bone from the
+dominant group, palette extended for new bones. Requires Assemble='NONE'. Verified
+structurally (authored cube bound to body0 re-imports correctly; no-edit still
+byte-identical). Caveat: per-vertex UV can't split a vertex at a UV seam. NOT
+verifiable in-game here (no game runtime), but structurally valid + re-imports.
+
 ### STILL TODO
-- **AUTO stays default** (best-looking). FULL is now the documented exact rule for
-  faithfulness. The moskvitch_speaker residual is inherent (animated-bone rest pose
-  not in the file) — not fixable statically. This is fully explained now, not open.
-- **New-topology authoring** (add/remove verts + new bone weights). Reshape of
-  EXISTING geometry works (commit 75abc9b). Adding topology needs a bone-weight
-  encoder; can't verify without the game. Only genuinely-remaining feature.
+- Nothing substantive. **AUTO stays default** (best-looking); FULL is the
+  documented exact rule (proven). The moskvitch_speaker residual is inherent
+  (animated-bone rest pose not in the file) — fully explained, not open.
+- Possible future polish (all optional): in-game load test of authored models
+  (needs the game); UV-seam vertex splitting on export; opt-in "hide gameplay
+  markers" (target_*/crew) toggle; terrain splat tiling-scale option.
 
 ## Goal
 Blender import (and eventually export) of Codename: Panzers Cold War `.srm` models
