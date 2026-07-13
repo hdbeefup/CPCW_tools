@@ -21,6 +21,7 @@ the format needed for it is fully documented in ``srm_writer`` and FORMAT_SRM.md
 """
 
 import os
+import struct
 
 import bpy
 from bpy.props import StringProperty, BoolProperty
@@ -36,6 +37,58 @@ _HAND = Matrix(((1, 0, 0, 0),
                 (0, 0, 1, 0),
                 (0, 1, 0, 0),
                 (0, 0, 0, 1)))
+
+
+def _unswap(co):
+    """Un-bake the LH->RH handedness swap on a position (its own inverse)."""
+    return (co[0], co[2], co[1])
+
+
+def _geometry_writeback(root, pmod):
+    """Rewrite each mesh node's POSITION stream from the (edited) Blender mesh.
+
+    Only valid for a model imported with Assemble='NONE' (mesh local coords are
+    then exactly ``swap(stored_pos)``, so un-swapping recovers the stored values;
+    AUTO/FULL bake a bone-world transform in and cannot be inverted here). Only
+    the POSITION stream is touched -- indices, UVs, normals and the bone palette
+    are kept -- so a no-edit export stays byte-identical and vertex reshaping is
+    captured. A mesh whose vertex count no longer matches the source (topology
+    changed) is skipped, not corrupted.
+
+    Returns (written, skipped) where skipped is a list of (name, reason).
+    """
+    written = 0
+    skipped = []
+    kids = root.children_recursive if hasattr(root, 'children_recursive') else []
+    for o in kids:
+        if o.type != 'MESH':
+            continue
+        idx = o.get('cpcw_node_index')
+        if idx is None:
+            continue
+        idx = int(idx)
+        if not (0 <= idx < len(pmod.nodes)):
+            continue
+        mi = pmod.nodes[idx].mesh_index
+        if not (0 <= mi < len(pmod.meshes)):
+            continue
+        ps = pmod.meshes[mi].stream_by_usage(srm_writer.USAGE_POSITION)
+        if ps is None or ps.stride != 12:
+            skipped.append((o.name, "no float3 POSITION stream"))
+            continue
+        me = o.data
+        if len(me.vertices) != ps.vcount:
+            skipped.append((o.name, "vertex count %d != source %d (topology "
+                            "changed; reshape only, don't add/remove verts)"
+                            % (len(me.vertices), ps.vcount)))
+            continue
+        buf = bytearray(ps.vcount * 12)
+        for i, v in enumerate(me.vertices):
+            sx, sy, sz = _unswap(v.co)
+            struct.pack_into('<3f', buf, i * 12, sx, sy, sz)
+        ps.data = bytes(buf)
+        written += 1
+    return written, skipped
 
 
 def _srm_local_matrix(pos, rot, scale):
@@ -83,7 +136,7 @@ def _node_edit(obj, root, model, node_index, tol=1e-5):
     return (loc.x, loc.y, loc.z), (eul.x, eul.y, eul.z), (scl.x, scl.y, scl.z)
 
 
-def export_srm(context, filepath, apply_transforms=True):
+def export_srm(context, filepath, apply_transforms=True, write_geometry=False):
     sel = context.selected_objects or context.scene.objects
     root = None
     for o in sel:
@@ -101,6 +154,19 @@ def export_srm(context, filepath, apply_transforms=True):
     model = srm_writer.read(source)
     pmod = model.pmod()
     changed = 0
+
+    geo_written = 0
+    if write_geometry and pmod is not None:
+        assemble = root.get('cpcw_assemble', 'AUTO')
+        if assemble != 'NONE':
+            raise RuntimeError(
+                "Geometry write-back needs the model imported with Assemble="
+                "'Off (raw bind pose)'; this one used %r, whose vertices are "
+                "bone-transformed and can't be inverted. Re-import with Assemble="
+                "Off to edit and export geometry." % assemble)
+        geo_written, skipped = _geometry_writeback(root, pmod)
+        for name, why in skipped:
+            print("  geometry write-back skipped %s: %s" % (name, why))
 
     if apply_transforms and pmod is not None:
         # map node index -> object
@@ -124,8 +190,8 @@ def export_srm(context, filepath, apply_transforms=True):
 
     model.write(filepath)
     identical = (model.pack() == open(source, 'rb').read())
-    print("Exported %s (%d node transforms updated, identical-to-source=%s)"
-          % (filepath, changed, identical))
+    print("Exported %s (%d node transforms, %d meshes' geometry updated, "
+          "identical-to-source=%s)" % (filepath, changed, geo_written, identical))
     return changed
 
 
@@ -145,14 +211,29 @@ class EXPORT_OT_cpcw_srm(bpy.types.Operator, ExportHelper):
                     "from the original source file",
         default=True,
     )
+    write_geometry: BoolProperty(
+        name="Write Back Geometry (reshape)",
+        description="Rewrite each mesh's vertex POSITIONS from the edited Blender "
+                    "mesh (reshape existing geometry). Requires the model to have "
+                    "been imported with Assemble='Off (raw bind pose)' and the "
+                    "vertex count unchanged. Indices/UVs/normals/skinning are "
+                    "preserved; a no-edit export stays byte-identical",
+        default=False,
+    )
 
     def execute(self, context):
         try:
-            export_srm(context, self.filepath, self.apply_transforms)
+            export_srm(context, self.filepath, self.apply_transforms,
+                       self.write_geometry)
         except Exception as e:
             self.report({'ERROR'}, "SRM export failed: %s" % e)
             return {'CANCELLED'}
         return {'FINISHED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "apply_transforms")
+        layout.prop(self, "write_geometry")
 
 
 def menu_func_export(self, context):

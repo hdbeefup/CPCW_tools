@@ -55,10 +55,19 @@ ProtoDB.bin                                       # prototype DB (for future mod
 - **Export:** *File > Export > CPCW Model (.srm)*. Select an imported model and
   export. The exporter re-writes from the pristine source file (byte-faithful —
   round-trip verified over all 2087 game models), so importing a game asset and
-  exporting it never corrupts it. *Write Back Node Transforms* also applies
-  moves/rotations/scales of root-level nodes back into the file. (Authoring new
-  geometry from scratch is future work — the writer/format supports it; the
-  Blender-mesh → VERS/INDS/BONE encoder is not built yet.)
+  exporting it never corrupts it.
+  - *Write Back Node Transforms* applies moves/rotations/scales of root-level
+    nodes back into the file.
+  - *Write Back Geometry (reshape)* rewrites each mesh's vertex **positions** from
+    the edited Blender mesh, so you can reshape existing geometry and export it.
+    Requires the model to have been imported with **Assemble = Off (raw bind
+    pose)** — that's the only mode whose Blender coordinates invert cleanly back
+    to stored positions — and the vertex count unchanged (reshape, don't add or
+    remove verts; topology-changed meshes are skipped, not corrupted). Indices,
+    UVs, normals and skinning are preserved, so a no-edit export stays
+    byte-identical. (Authoring brand-new meshes/topology from scratch is still
+    future work — the writer's `replace_geometry` supports it, but a full
+    Blender-mesh → VERS/INDS/BONE encoder with new bone weights is not wired up.)
 - **Map:** *File > Import > CPCW Map (.map)*.
   - **Real Heightmap** (*default on*) — builds a subdivided terrain mesh
     displaced by the decoded GTRD elevation grid (the actual in-game hills;
