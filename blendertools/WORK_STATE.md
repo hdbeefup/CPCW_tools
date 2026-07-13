@@ -61,27 +61,30 @@ Big deliverables since the round-trip writer:
 - Render gallery in renders/gallery/ (models + textured maps); AUTO confirmed
   correct vs FULL for tanks (FULL mangles tracks). Tank floaters = AUTO limit.
 
-### Skinning RE — DONE this session (partial, honest)
-Ghidra traced the D3D9 render path (N:\gamePAKdata\re\SKINNING_RESULT.md):
-- PROVEN: SRM meshes draw via the **programmable vertex-shader pipeline**
-  (`FUN_0051b7a0` binds a custom VS + streams); **fixed-function indexed vertex
-  blending RULED OUT**. Skinning = VS matrix palette indexed by the rigid bone
-  index (NORMAL byte3 → BONE → node).
-- NOT recovered: the exact palette matrix (boneWorld vs boneWorld·invBind) — the
-  SetVertexShaderConstantF upload site couldn't be isolated. Simple rule
-  `v_world = boneWorld[palette[idx]]·v_stored` is most likely + consistent, not
-  proven. CONFIRMED: no invBind in the file; it's engine-computed at bind time;
-  wheels/suspension sit at an animation-driven rest pose ≠ static hierarchy.
-- Decision: keep AUTO (best static proxy; FULL is unproven AND breaks moskvitch).
+### Skinning RE — SOLVED this session (2 Ghidra passes)
+`N:\gamePAKdata\re\SKINNING_RESULT.md` (§1-8). **The exact rule is
+`v_world = boneWorld[BONE_palette[boneIdx]] · v_stored` — the node WORLD matrix,
+NO inverse-bind.** HIGH confidence. Pass 1: proved shader-based VS matrix palette,
+ruled out fixed-function. Pass 2: found the palette FILL loop `FUN_004c0160`
+(`0x004c0330`) = pure gather `palette[i]=worldMatrix[BONE[i]]` (×64 into
+`model+0x180`), uploaded as shader const `SkinMatrices`; NO matrix multiply / NO
+inverse in the loop; no InvBind field/string anywhere in the binary.
+- This is EXACT for non-animated bones (body0, turret, hull, panels). The only gap
+  is ANIMATED bones (tank road wheels `rotate*`, suspension): the engine recomputes
+  their world matrix per frame, so their settled rest pose isn't in the static file.
+- FULL = the exact rule (now re-labelled "Full (game's exact rule)"). AUTO (default)
+  = practical heuristic that LEAVES a body anchored to an animated node, hiding that
+  gap on cars. Verified FULL-vs-AUTO renders (renders/gallery/fullauto/): base
+  moskvitch401 FULL==AUTO; _speaker FULL lifts body (animated suspension0l); patton
+  FULL floats road-wheels. Docs/memory/operator descriptions updated to SOLVED.
 
 ### STILL TODO
-- **moskvitch body ~0.1-0.2 too low** — now understood as INHERENT to static
-  reconstruction: the suspension bones' true rest pose is animation-driven and not
-  in the .srm. Not a fixable bug from the file. Would need the bind-time
-  skeleton/palette upload traced (different code path than the draw call).
-- **AUTO skinning** stays a heuristic by necessity (see above). If ever revisited,
-  trace the bind-time palette upload, not the render draw. Ghidra project
-  N:\gamePAKdata\re\gp; dumps srm_funcs.txt, render_funcs.txt, SKINNING_RESULT.md.
+- **AUTO stays default** (best-looking). FULL is now the documented exact rule for
+  faithfulness. The moskvitch_speaker residual is inherent (animated-bone rest pose
+  not in the file) — not fixable statically. This is fully explained now, not open.
+- **New-topology authoring** (add/remove verts + new bone weights). Reshape of
+  EXISTING geometry works (commit 75abc9b). Adding topology needs a bone-weight
+  encoder; can't verify without the game. Only genuinely-remaining feature.
 
 ## Goal
 Blender import (and eventually export) of Codename: Panzers Cold War `.srm` models

@@ -133,12 +133,13 @@ converter got wrong:
 
 ## Known limitations / future work
 
-- **Assembly is an inferred heuristic, not the engine's rule.** *Auto* skins
-  bone-local parts and leaves model-space bodies via a geometric proxy for the
-  unstored inverse-bind (see above). It matches every tested model, but the true
-  per-bone rule lives in the D3D render path and hasn't been reversed yet; a few
-  edge cases (e.g. the moskvitch `_speaker` body sits ~0.1 low) need it. `Full`/
-  `Off` remain as overrides.
+- **Assembly and animated bones.** The engine's exact per-vertex rule was reversed
+  (`world = BoneWorld[bone] @ v`, no inverse-bind — see the SRM notes above); *Full*
+  applies it verbatim and is exact for non-animated bones. It can't reproduce the
+  settled pose of **animated** bones (tank road wheels, suspension travel), whose
+  per-frame rest transform isn't in the static file — those parts render in their
+  un-settled pose under *Full*. *Auto* (default) hides that by leaving an
+  animated-anchored body in place; it looks best but is a heuristic, not the rule.
 - **Single material per mesh.** In practice every shipped mesh carries exactly
   one submesh (materials are split across separate mesh *nodes*, which the
   importer already handles), so this is a non-issue on the game corpus.

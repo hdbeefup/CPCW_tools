@@ -280,38 +280,47 @@ Empirically the geometry is authored in a mix:
   merely anchored to a side node) are stored at their final position →
   `InvBind = BoneWorld[bone]⁻¹` → leave in place.
 
-### What the render path actually does (Ghidra, partial)
+### The exact render transform — SOLVED (Ghidra)
 
-The D3D9 draw path was traced far enough to establish the **mechanism** (hard
-decompiled evidence; see `N:\gamePAKdata\re\SKINNING_RESULT.md`):
+The D3D9 draw and the CPU-side matrix-palette fill were both traced (hard
+decompiled evidence; full write-up in `N:\gamePAKdata\re\SKINNING_RESULT.md`).
+The per-vertex transform is:
 
-- SRM meshes are drawn through the **programmable (vertex-shader) pipeline**. The
-  SRM geometry class's bind method `FUN_0051b7a0` calls
-  `dev->SetVertexShader(geom+0x18)` (vtable +0x15c) then `SetStreamSource` per
-  stream — a custom VS is bound, so the per-vertex transform runs in that shader.
-- **Fixed-function indexed vertex blending is ruled out:** `SetTransform` is never
-  called with a `D3DTS_WORLDMATRIX(256+i)` state, and `D3DRS_VERTEXBLEND(151)` /
-  `INDEXEDVERTEXBLENDENABLE(167)` appear only in device-init defaults, never in a
-  per-draw setup. So skinning is a **vertex-shader matrix palette indexed by the
-  rigid bone index** (NORMAL byte 3 → BONE palette → node).
-- **Not recovered:** whether the palette matrix for a bone is `boneWorld[node]`
-  (simple) or `boneWorld[node]·invBind[node]`. The `SetVertexShaderConstantF`
-  upload site could not be isolated (vtable-offset collisions + a cached device
-  pointer). The **simple** rule `v_world = boneWorld[palette[idx]]·v_stored` is the
-  most likely and is consistent with every empirical result here (it un-mirrored
-  the train and re-attached the ka_15 windows), but is not *proven* by the code.
+> **`v_world = boneWorld[ BONE_palette[boneIdx] ] · v_stored`** — the bone's node
+> **world matrix**, with **NO inverse-bind**. `boneIdx` = NORMAL-stream byte 3.
 
-The key consequence stands: **no inverse-bind / bind matrix is stored in the SRM**
-(BONE is a u16 palette, PBND a bbox). The exact per-bone matrix is computed by the
-engine's skeleton/animation system at bind time — the wheels/suspension sit at an
-**animation-driven rest pose** that differs from the static node hierarchy, so a
-model's exact rest cannot be reconstructed from the file alone.
+Evidence:
+- SRM meshes draw through the **programmable (vertex-shader) pipeline** — the SRM
+  geometry Bind `FUN_0051b7a0` sets a custom vertex shader (`SetVertexShader`,
+  device vtable +0x15c) + stream sources. Fixed-function indexed vertex blending
+  is ruled out (no `D3DTS_WORLDMATRIX(256+i)`; VERTEXBLEND/INDEXEDVERTEXBLEND only
+  in device-init defaults).
+- The bone-matrix palette is filled by `FUN_004c0160` (loop `0x004c0330`–`…3ea`)
+  and uploaded as the named shader constant `SkinMatrices` (string @ `0x00f79bac`).
+  The loop is a **pure gather**: `palette[i] = worldMatrix[ BONE[i] ]` — read the
+  u16 node index, `×64` (matrix stride), index the per-node world-matrix array at
+  `model+0x180`, append the pointer. **No matrix multiply, no inverse in the loop.**
+- **No inverse-bind exists to fold in:** the node struct exposes only *forward*
+  matrices (`LocalMatrix`, `WorldMatrix` @ `node+0x168`, `Transform`); there is no
+  `InvBind`/`BindPose`/`RestPose` field in the struct and **no such string anywhere
+  in the binary**. Confirms: BONE is a u16 palette, PBND a bbox — the file stores
+  no bind matrix because the engine never uses one.
 
-Accordingly the importer's **AUTO** mode uses a geometric proxy to pick
-skin-vs-leave per group (a group is left only when it spans most of the mesh AND
-skinning it would shove it off the x=0 centre line). This matches every tested
-model (car, tank, helicopter, buildings) but is a static approximation, not a
-decoded flag; `FULL` (skin all) and `NONE` (skin none) remain as overrides.
+**Consequence for reconstruction.** The rule is *exact* for **non-animated** bones
+(car body on `body0`, turret, hull, building panels): `boneWorld` from the static
+node hierarchy = the render matrix, so skinning by it is pixel-correct. The only
+gap is **animated** bones (tank road wheels `rotate*`, suspension travel): the
+engine computes their world matrix each frame, so their settled at-rest pose is
+**not in the static file** — skinning by the static hierarchy value can leave those
+parts slightly off (e.g. a wheel/suspension-bound body floats).
+
+Import modes reflect this:
+- **`FULL`** applies the game's exact rule to every vertex — faithful to the file,
+  but animated-bone-bound parts render in their static (un-settled) pose.
+- **`AUTO`** (default) additionally skips skinning a group when doing so would
+  shove a large body off centre — a practical heuristic that hides the
+  animated-rest gap on civilian cars; it is *not* a decoded flag.
+- **`NONE`** leaves the raw bind pose (each mesh placed by its node matrix only).
 
 ## Upgrade variants (node-name convention)
 

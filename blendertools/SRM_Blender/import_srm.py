@@ -6,9 +6,11 @@ materials with DDS textures (decoded by dds.py).
 CPCW models are rigidly skinned: each mesh vertex is stored in the local space
 of one skeleton bone (the bone-palette index is byte 3 of the normal stream) and
 the skeleton is a node hierarchy (each node's parent is its `unk3`). Assembly is
-two steps: (1) transform each vertex by its bone's composed world matrix -- but
-only for bone-local parts, leaving already-posed model-space bodies in place
-(see `_skin_decisions`, an inferred proxy for the engine's inverse-bind); then
+two steps: (1) transform each vertex by its bone's composed world matrix -- the
+game's proven rule is exactly `v_world = BoneWorld[bone] @ v_stored`, no
+inverse-bind (FULL); AUTO additionally leaves a body anchored to an animated node
+in place, since that node's settled rest pose is not in the static file (see
+`_skin_decisions`); then
 (2) convert SRM's DirectX LEFT-handed Y-up frame to Blender's right-handed Z-up
 by BAKING a reflection into the geometry -- swap (x,y,z)->(x,z,y) and reverse
 triangle winding (see `_HAND`). The old importer used a pure rotation Rx(90) for
@@ -263,23 +265,23 @@ def _skin_decisions(verts, bone_idx, palette, world_mats,
     """Decide, per bone-palette group, whether to SKIN it (apply the bone's
     world matrix) or LEAVE it in place (model space).
 
-    NOTE: this is an INFERRED PROXY, not the game's exact rule. The game renders
-    ``world_v = BoneWorld[b] @ InvBind[b] @ v``; the SRM stores no InvBind and
-    the render path was not recovered from the binary, so we reconstruct the
-    skin/leave decision geometrically. It reproduces every ground-truth model we
-    checked (moskvitch car, Patton tank, ka_15 helicopter, buildings) but is a
-    heuristic with hand-tuned thresholds, not a decoded format field — if a model
-    looks wrong, fall back to the FULL or NONE override. The distinction the game
-    encodes: bone-local parts have ``InvBind = I`` while already-posed model-space
-    parts have ``InvBind = BoneWorld[b]**-1``:
+    NOTE: this is a practical HEURISTIC, not the game's rule. Ghidra PROVED the
+    game's exact rule is simply ``world_v = BoneWorld[b] @ v`` (a stored node
+    world matrix per bone, NO inverse-bind — see docs/FORMAT_SRM.md and
+    SKINNING_RESULT.md). That rule is what ``apply_skin='FULL'`` does and it is
+    EXACT for non-animated bones. The catch is animated bones (tank road wheels,
+    suspension travel): the engine recomputes their world matrix per frame, so
+    their settled rest pose is not in the static file, and skinning a body/part
+    bound to one by the *static* hierarchy value misplaces it. AUTO papers over
+    that by LEAVING such a group in model space (equivalent to treating its bone's
+    effective rest transform as identity):
 
     * **bone-local** parts (wheels, gun barrels, turret, tracks, rotor blades,
       building panels, and even whole hulls like the Patton's) are authored at
-      their bone's origin, so ``InvBind = I`` and ``world_v = BoneWorld[b] @ v``
-      -> **SKIN**.
-    * **model-space** parts (a civilian car body/speaker authored already-posed
-      and merely *anchored* to a side node such as ``suspension0l``) have
-      ``InvBind = BoneWorld[b]**-1``, so ``world_v = v`` -> **LEAVE**.
+      their bone's origin, so ``BoneWorld[b] @ v`` places them -> **SKIN**.
+    * a large body merely *anchored* to an animated side node (a civilian car
+      body on ``suspension0l``) would be shoved off-centre by that node's static
+      world matrix, so AUTO -> **LEAVE** (matches the settled look better).
 
     The two are told apart by a robust, vehicle-agnostic proxy for that InvBind:
     a group is model-space (LEAVE) only when it BOTH (a) spans most of the mesh
@@ -616,15 +618,18 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         description="How to assemble the model from its skeleton",
         items=[
             ('AUTO', "Auto (recommended)",
-             "Inferred assembly (a geometric proxy for the engine's inverse-bind, "
-             "not a decoded flag): skin articulated/bone-local parts (wheels, "
-             "turret, tracks, rotors, building panels, hulls) into place, and "
-             "leave already-posed model-space bodies (e.g. a civilian car "
-             "body/speaker) where they are. Matches tested tanks, cars, aircraft "
-             "and buildings; if a model looks wrong, try Full or Off"),
-            ('FULL', "Full (debug)",
-             "Skin every group by its bone. Same as Auto for fully-articulated "
-             "models; shifts a civilian car body off-centre (kept for debugging)"),
+             "A practical heuristic over the game's rule: skin articulated/"
+             "bone-local parts (wheels, turret, tracks, rotors, panels, hulls) "
+             "into place, but LEAVE a large body that is merely anchored to an "
+             "animated side node (e.g. a civilian car body) where it sits, since "
+             "that node's settled rest pose isn't in the file. Best-looking on "
+             "tested cars, tanks, aircraft and buildings"),
+            ('FULL', "Full (game's exact rule)",
+             "Apply the engine's proven transform to every vertex: "
+             "world = BoneWorld[bone] @ v (a stored node world matrix per bone, "
+             "no inverse-bind; verified in the binary). Exact for non-animated "
+             "bones; animated-bone-bound parts (tank road wheels, a suspension-"
+             "anchored body) render in their static, un-settled pose"),
             ('NONE', "Off (raw bind pose)",
              "No skinning; each mesh placed by its node's world matrix only"),
         ],
