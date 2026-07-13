@@ -387,6 +387,39 @@ def _euler_to_quaternion(rx, ry, rz):
     ]
 
 
+# --- Handedness: SRM is DirectX LEFT-handed Y-up; glTF is RIGHT-handed Y-up. ---
+# Converting between them is a REFLECTION M = diag(1, 1, -1) (negate Z), NOT a
+# rotation. Writing SRM coords verbatim into glTF leaves every model MIRRORED
+# (v200 train lettering read reversed). Apply M consistently to positions,
+# normals, node translation and rotation, and reverse triangle winding (a
+# reflection flips orientation). Quaternion under M: (x,y,z,w) -> (-x,-y,z,w).
+
+def _reflect_vec3_bytes(raw, stride, count):
+    """Return a copy of a packed VEC3-float stream with Z negated."""
+    out = bytearray(raw)
+    for vi in range(count):
+        off = vi * stride
+        z = struct.unpack_from('<f', out, off + 8)[0]
+        struct.pack_into('<f', out, off + 8, -z)
+    return bytes(out)
+
+
+def _reflect_translation(t):
+    return [t[0], t[1], -t[2]]
+
+
+def _reflect_quaternion(q):
+    return [-q[0], -q[1], q[2], q[3]]
+
+
+def _reverse_winding(indices):
+    """Reverse each triangle's winding (a, b, c) -> (a, c, b)."""
+    out = list(indices)
+    for i in range(0, len(out) - 2, 3):
+        out[i + 1], out[i + 2] = out[i + 2], out[i + 1]
+    return out
+
+
 def _find_dds(tex_name, search_dirs):
     """Find a DDS texture file by name in the given directories."""
     for d in search_dirs:
@@ -512,9 +545,9 @@ def nodes_to_glb(nodes, output_path, texture_dirs=None):
     for node in nodes:
         gn = {'name': node.name}
 
-        # Transform
-        t = list(node.position)
-        r = _euler_to_quaternion(*node.rotation)
+        # Transform (LH->RH reflection: negate Z of translation, reflect quat)
+        t = _reflect_translation(list(node.position))
+        r = _reflect_quaternion(_euler_to_quaternion(*node.rotation))
         s = list(node.scale)
 
         if any(v != 0 for v in t):
@@ -555,8 +588,10 @@ def nodes_to_glb(nodes, output_path, texture_dirs=None):
                 vert_start = sm.vert_start
                 vert_count = sm.vert_count
                 pos_bytes = vs.data[vert_start * vs.stride:(vert_start + vert_count) * vs.stride]
+                # LH->RH reflection: negate Z on every position.
+                pos_bytes = _reflect_vec3_bytes(pos_bytes, vs.stride, vert_count)
 
-                # Compute bounds
+                # Compute bounds (after reflection)
                 pos_min = [float('inf')] * 3
                 pos_max = [float('-inf')] * 3
                 for vi in range(vert_count):
@@ -584,18 +619,20 @@ def nodes_to_glb(nodes, output_path, texture_dirs=None):
                 if norm_stream and norm_stream.vertex_count > vert_start:
                     vs = norm_stream
                     if vs.stride == 4:
-                        # Packed normals: 4 bytes → convert to float3
+                        # Packed normals: 4 bytes → convert to float3 (negate Z).
                         norm_floats = bytearray()
                         for vi in range(vert_count):
                             off = (vert_start + vi) * vs.stride
                             nx = (vs.data[off] / 127.5) - 1.0
                             ny = (vs.data[off + 1] / 127.5) - 1.0
                             nz = (vs.data[off + 2] / 127.5) - 1.0
-                            norm_floats.extend(struct.pack('<3f', nx, ny, nz))
+                            norm_floats.extend(struct.pack('<3f', nx, ny, -nz))
                         bv = add_buffer(bytes(norm_floats), target=34962)
                         acc_norm = add_accessor(bv, 5126, vert_count, 'VEC3')
                     else:
                         norm_bytes = vs.data[vert_start * vs.stride:(vert_start + vert_count) * vs.stride]
+                        # LH->RH reflection: negate Z on every normal.
+                        norm_bytes = _reflect_vec3_bytes(norm_bytes, vs.stride, vert_count)
                         bv = add_buffer(norm_bytes, target=34962)
                         if vs.stride != 12:
                             gltf_buffer_views[-1]['byteStride'] = vs.stride
@@ -608,6 +645,8 @@ def nodes_to_glb(nodes, output_path, texture_dirs=None):
                 sub_indices = mesh.indices[face_start:face_start + face_count]
                 # Offset indices to be relative to vert_start
                 sub_indices = [i - vert_start for i in sub_indices]
+                # LH->RH reflection flips orientation: reverse triangle winding.
+                sub_indices = _reverse_winding(sub_indices)
 
                 if mesh.idx_stride == 2:
                     idx_bytes = struct.pack(f'<{len(sub_indices)}H', *sub_indices)

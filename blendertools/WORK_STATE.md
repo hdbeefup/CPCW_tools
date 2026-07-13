@@ -33,6 +33,11 @@ Big deliverables since the round-trip writer:
   variant read from the bone name (_std/_upg/camo). Import **Variant** option:
   STANDARD (default) / UPGRADED / ALL, per-vertex-by-bone. Single-variant models
   unaffected. Patton verified. FORMAT_SRM "Upgrade variants" section added.
+- **Standalone glTF mirror fixed:** cpcw_srm.py `nodes_to_glb` now applies the
+  LH->RH reflection for glTF's Y-up frame (M=diag(1,1,-1): negate Z on
+  pos/normal/translation, quat (x,y,z,w)->(-x,-y,z,w), reverse winding). Verified:
+  GLB round-trip vs native SRM import of v200 have identical signed volume
+  (125.146, ratio 1.0) -> chirally identical, un-mirrored. [[srm-handedness]].
 
 ### STILL TODO
 - **moskvitch body ~0.1-0.2 too low** (wheels clip the body/arches). Its body
@@ -45,8 +50,6 @@ Big deliverables since the round-trip writer:
   skinning exact + fix the moskvitch height, need the load-time inverse-bind /
   matrix-palette setup. Ghidra project N:\gamePAKdata\re\gp; loader dumps in
   srm_funcs.txt, render_funcs.txt.
-- **Standalone cpcw_srm.py glTF export still has the latent mirror** (writes LH
-  coords into RH glTF). Deferred; documented in [[srm-handedness]].
 
 ## Goal
 Blender import (and eventually export) of Codename: Panzers Cold War `.srm` models
