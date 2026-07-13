@@ -261,7 +261,11 @@ def _build_textured_terrain_material(mf, data_root, world_w, world_h, max_layers
     idx = _dds_index(data_root)
     if not idx:
         return None
-    active = [i for i, l in enumerate(layers) if l.get('active')]
+    # Skip auxiliary (non-diffuse) layers -- bump/normal/wind/parallax maps are
+    # not ground colour and would paint spurious blobs if shown as diffuse.
+    _AUX = ('bump', 'normal', 'wind', 'parallax', 'detail', '_spec')
+    active = [i for i, l in enumerate(layers)
+              if l.get('active') and not any(a in l['name'].lower() for a in _AUX)]
     if not active:
         return None
     # Choose which layers to show: always the base (first active), then the most
@@ -272,14 +276,12 @@ def _build_textured_terrain_material(mf, data_root, world_w, world_h, max_layers
     cover = {i: sum(1 for b in weights[i] if b) for i in overlays}
     top = sorted(overlays, key=lambda i: -cover[i])[:max(0, max_layers - 1)]
     chosen = sorted([base_i] + top)  # composite in file order
-    # resolve layer -> dds image; keep only those that resolve
-    resolved = []
-    for i in chosen:
-        p = _resolve_layer_dds(layers[i]['name'], idx)
-        if p:
-            resolved.append((i, p, float(layers[i].get('uv_scale') or 1.0)))
-    if not resolved:
-        return None
+    # Every chosen layer contributes: real tiled .dds when it resolves, else its
+    # by-ground-type palette colour (sRGB->linear) as a solid -- so a layer whose
+    # texture can't be found (e.g. a map-specific/typo'd name) still shows the
+    # right ground colour rather than vanishing.
+    resolved = [(i, _resolve_layer_dds(layers[i]['name'], idx),
+                 float(layers[i].get('uv_scale') or 1.0)) for i in chosen]
 
     mat = bpy.data.materials.new("TerrainTextured")
     mat.use_nodes = True
@@ -297,20 +299,29 @@ def _build_textured_terrain_material(mf, data_root, world_w, world_h, max_layers
     TILE = 12.0
     prev_color = None
     y = 0
-    for k, (li, path, uvs) in enumerate(resolved):
-        tex_img = _dds_to_bpy_image(path, "terr_%02d_%s" % (li, os.path.basename(path)))
-        if tex_img is None:
-            continue
-        mapn = nodes.new('ShaderNodeMapping'); mapn.location = (-850, y)
-        reps_x = max(1.0, world_w / TILE * uvs)
-        reps_y = max(1.0, world_h / TILE * uvs)
-        mapn.inputs['Scale'].default_value = (reps_x, reps_y, 1.0)
-        links.new(uv.outputs['UV'], mapn.inputs['Vector'])
-        tnode = nodes.new('ShaderNodeTexImage'); tnode.location = (-650, y)
-        tnode.image = tex_img; tnode.extension = 'REPEAT'
-        links.new(mapn.outputs['Vector'], tnode.inputs['Vector'])
+    for li, path, uvs in resolved:
+        # per-layer colour source: tiled image, or a solid palette colour
+        color_out = None
+        if path:
+            tex_img = _dds_to_bpy_image(path, "terr_%02d_%s" % (li, os.path.basename(path)))
+            if tex_img is not None:
+                mapn = nodes.new('ShaderNodeMapping'); mapn.location = (-850, y)
+                reps_x = max(1.0, world_w / TILE * uvs)
+                reps_y = max(1.0, world_h / TILE * uvs)
+                mapn.inputs['Scale'].default_value = (reps_x, reps_y, 1.0)
+                links.new(uv.outputs['UV'], mapn.inputs['Vector'])
+                tnode = nodes.new('ShaderNodeTexImage'); tnode.location = (-650, y)
+                tnode.image = tex_img; tnode.extension = 'REPEAT'
+                links.new(mapn.outputs['Vector'], tnode.inputs['Vector'])
+                color_out = tnode.outputs['Color']
+        if color_out is None:
+            rgbn = nodes.new('ShaderNodeRGB'); rgbn.location = (-650, y)
+            r, g, b = _keyword_color(layers[li]['name'])
+            rgbn.outputs['Color'].default_value = (
+                _srgb_to_linear(r), _srgb_to_linear(g), _srgb_to_linear(b), 1.0)
+            color_out = rgbn.outputs['Color']
         if prev_color is None:
-            prev_color = tnode.outputs['Color']
+            prev_color = color_out
         else:
             mask = _splat_mask_image("mask_%02d" % li, weights[li], W, H)
             mnode = nodes.new('ShaderNodeTexImage'); mnode.location = (-650, y - 130)
@@ -320,7 +331,7 @@ def _build_textured_terrain_material(mf, data_root, world_w, world_h, max_layers
             mix.blend_type = 'MIX'
             links.new(mnode.outputs['Color'], mix.inputs['Fac'])
             links.new(prev_color, mix.inputs['Color1'])
-            links.new(tnode.outputs['Color'], mix.inputs['Color2'])
+            links.new(color_out, mix.inputs['Color2'])
             prev_color = mix.outputs['Color']
         y -= 320
     if prev_color is not None:
