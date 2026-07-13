@@ -46,6 +46,16 @@ Big deliverables since the round-trip writer:
   only; indices/UVs/normals/bone kept). Gated on Assemble='NONE' + unchanged vert
   count. Verified: no-edit byte-identical (v200); vtx move -> exact stored delta.
   Modders can now RESHAPE existing geometry, not just re-serialize.
+- **Texture sibling-folder fix (commit 2e192e6):** `_find_texture` now falls back
+  to a recursive basename index of the search dirs, so models that reference a
+  texture in a sibling folder (SU_T-54.dds under SovietAdditional) import textured.
+- **Tiled-texture terrain (commit 609a916):** map add-on builds a real node
+  material -- each GTRD layer's .dds tiled across the surface, alpha-composited by
+  per-layer splat masks. Grass/dirt/road texture detail like the game; falls back
+  to per-vertex tint if textures missing. Resolves the "terrain not textured" gap.
+- Multi-submesh materials: investigated, NON-ISSUE (every mesh has 1 submesh).
+- Render gallery in renders/gallery/ (models + textured maps); AUTO confirmed
+  correct vs FULL for tanks (FULL mangles tracks). Tank floaters = AUTO limit.
 
 ### Skinning RE — DONE this session (partial, honest)
 Ghidra traced the D3D9 render path (N:\gamePAKdata\re\SKINNING_RESULT.md):
