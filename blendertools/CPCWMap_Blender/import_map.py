@@ -264,14 +264,20 @@ def _build_textured_terrain_material(mf, data_root, world_w, world_h, max_layers
     active = [i for i, l in enumerate(layers) if l.get('active')]
     if not active:
         return None
-    # resolve layer -> dds image; keep only those that resolve, cap the count
+    # Choose which layers to show: always the base (first active), then the most
+    # heavily-PAINTED overlays (by non-zero weight count) up to the cap -- picking
+    # the first N would drop a heavily-used later layer for a near-empty early one.
+    base_i = active[0]
+    overlays = active[1:]
+    cover = {i: sum(1 for b in weights[i] if b) for i in overlays}
+    top = sorted(overlays, key=lambda i: -cover[i])[:max(0, max_layers - 1)]
+    chosen = sorted([base_i] + top)  # composite in file order
+    # resolve layer -> dds image; keep only those that resolve
     resolved = []
-    for i in active:
+    for i in chosen:
         p = _resolve_layer_dds(layers[i]['name'], idx)
         if p:
             resolved.append((i, p, float(layers[i].get('uv_scale') or 1.0)))
-        if len(resolved) >= max_layers:
-            break
     if not resolved:
         return None
 
