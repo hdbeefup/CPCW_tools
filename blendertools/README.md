@@ -122,8 +122,16 @@ converter got wrong:
   parts (wheels/turret/tracks/rotors/panels/hulls) by their bone matrix, leave
   already-posed model-space bodies in place. It matches every tested model but is
   an inferred heuristic, not a decoded flag — `Full`/`Off` remain as overrides.
-  Rotations compose `Rx @ Ry @ Rz`. Smooth-skinned meshes (266) instead carry
-  explicit BLENDINDICES (`Usage == 2`) + BLENDWEIGHT (`Usage == 1`) streams.
+  Rotations compose `Rx @ Ry @ Rz`.
+- **Smooth-skinned meshes (characters/animals) render in bind pose.** These carry
+  explicit BLENDINDICES (`Usage == 2`) + BLENDWEIGHT (`Usage == 1`) streams and
+  store their vertices in **model space**. The engine's per-bone skin matrix is
+  `BoneWorld @ InvBind`, which at the static rest pose is **identity**, so the
+  faithful result is the bind pose. The importer therefore leaves any mesh with a
+  BLENDINDICES stream unskinned and places it by its owning node's world matrix
+  (like `Off`), regardless of the Assemble mode — applying a rigid bone transform
+  would mangle them (their NORMAL byte3 is 0). They'd only move once animation is
+  evaluated.
 - **Round-trip writer.** `srm_writer.py` parses to an editable model and
   re-serializes byte-for-byte (all 2087 files). This backs the SRM exporter and
   guarantees import→export fidelity.
