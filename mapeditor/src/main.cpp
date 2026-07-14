@@ -19,6 +19,7 @@
 #include "scene.h"
 #include "viewport3d.h"
 #include "mapfile.h"
+#include "protodb.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -423,6 +424,12 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
+        else if (!strcmp(argv[i], "--protodbtest") && i + 1 < argc) {
+            auto idx = protodb_model_index(argv[i+1]);
+            printf("protodb models=%zu\n", idx.size());
+            int shown=0; for (auto& kv : idx) { if(shown++>=3) break; printf("  %s -> %s\n", kv.first.c_str(), kv.second.c_str()); }
+            return 0;
+        }
         else if (!strcmp(argv[i], "--applytest") && i + 7 < argc) {
             // dev: --applytest <map> <id> <px> <py> <pz> <player> <out>
             Scene s; if (!load_map_native(argv[i+1], s)) return 2;

@@ -39,7 +39,7 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC glfw)
 
 # --- editor ------------------------------------------------------------------
-add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp)
+add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp src/protodb.cpp)
 target_link_libraries(cpcw_mapeditor PRIVATE imgui glfw nlohmann_json::nlohmann_json)
 if (WIN32)
     target_link_libraries(cpcw_mapeditor PRIVATE opengl32 comdlg32)
