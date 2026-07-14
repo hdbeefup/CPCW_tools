@@ -15,6 +15,7 @@ struct Entity {
     long dirOff = -1;         // Dir yaw = first float at this offset
     long playerOff = -1;
     unsigned playerFtype = 0; // schema field type of Player (write size)
+    long objtStart = -1, objtEnd = -1;   // byte range of this entity's OBJT in raw
 };
 
 struct Scene {
@@ -29,5 +30,10 @@ struct Scene {
     long heightOff = -1;                // byte offset of the heightmap grid in raw
     bool terrainEdited = false;         // heights changed -> write them on save
     std::vector<unsigned char> heightDirty;  // per-cell: brush-touched (save only these)
+    // structural edits: size-field byte offsets of EVERY container that holds the
+    // entities (SCEN, WRLD, ..., UNTS, OBJS), plus the OBJS absolute schema_offset.
+    std::vector<long> containerSizeOffs;
+    long objsSchemaOff = -1;
+    long untsCountOff = -1;   // UNTS entity_count u32 (decrement on delete)
     bool loaded = false;
 };

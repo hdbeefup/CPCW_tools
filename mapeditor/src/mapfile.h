@@ -15,3 +15,7 @@ bool load_map_native(const std::string& path, Scene& out);
 // the scene to have been loaded from a .map (Scene::raw non-empty).
 bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
                      const std::string& outPath);
+
+// Delete the entity with the given ID: remove its OBJT bytes and fix up the
+// SCEN/UNTS/OBJS chunk sizes + the OBJS schema_offset. Writes to outPath.
+bool delete_entity_native(const Scene& s, long id, const std::string& outPath);

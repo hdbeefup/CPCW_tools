@@ -701,6 +701,16 @@ int main(int argc, char** argv) {
             int shown=0; for (auto& kv : idx) { if(shown++>=3) break; printf("  %s -> %s\n", kv.first.c_str(), kv.second.c_str()); }
             return 0;
         }
+        else if (!strcmp(argv[i], "--deltest") && i + 3 < argc) {
+            Scene s; if (!load_map_native(argv[i+1], s)) return 2;
+            long id = atol(argv[i+2]);
+            bool ok = delete_entity_native(s, id, argv[i+3]);
+            // re-parse the output to confirm it's valid + has one fewer entity
+            Scene s2; bool rok = load_map_native(argv[i+3], s2);
+            printf("deltest del=%d reparse=%d before=%zu after=%zu\n",
+                   (int)ok, (int)rok, s.entities.size(), s2.entities.size());
+            return ok && rok ? 0 : 3;
+        }
         else if (!strcmp(argv[i], "--heighttest") && i + 3 < argc) {
             // dev: --heighttest <map> <cellIndex> <out>  (bump a height, save)
             Scene s; if (!load_map_native(argv[i+1], s)) return 2;
@@ -831,6 +841,13 @@ int main(int argc, char** argv) {
             Entity& e = g_scene.entities[g_selected];
             if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { snapEntity(g_selected); e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { snapEntity(g_selected); e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
+            // Delete: remove the entity (structural) and reload the shortened map
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !g_srcMap.empty()) {
+                long id = e.id;
+                const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
+                std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
+                if (delete_entity_native(g_scene, id, work)) loadScene(work);
+            }
         }
 
         ImGui::SetNextWindowBgAlpha(0.35f);

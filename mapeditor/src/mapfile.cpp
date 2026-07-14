@@ -216,8 +216,12 @@ struct Parser {
         long schd=objs->meta_schema_off;
         size_t dataEnd = (schd>0 && (size_t)schd<objsEnd) ? (size_t)schd : objsEnd;
         while (pos < dataEnd-8) {
-            if (D.tag(pos,"OBJT")) { Obj o; size_t e; parseObjt(pos,e,o); pos=e; out.push_back(std::move(o)); }
-            else break;
+            if (D.tag(pos,"OBJT")) {
+                size_t start=pos; Obj o; size_t e; parseObjt(pos,e,o); pos=e;
+                Value vs{V_INT}; vs.i=(long)start; o["_objtStart"]=vs;
+                Value ve{V_INT}; ve.i=(long)e;     o["_objtEnd"]=ve;
+                out.push_back(std::move(o));
+            } else break;
         }
     }
 
@@ -357,6 +361,13 @@ struct Parser {
     struct V3 { float x,y,z; };
 };
 
+// size-field offset (chunk.offset+4) of every chunk whose byte range contains
+// [es,ee) -- i.e. all ancestors of the entity OBJS.
+static void collect_container_sizes(const Chunk& c, size_t es, size_t ee, std::vector<long>& out) {
+    if (c.offset <= es && c.offset + 8 + c.size >= ee) out.push_back((long)c.offset + 4);
+    for (const auto& ch : c.children) collect_container_sizes(ch, es, ee, out);
+}
+
 } // namespace
 
 bool load_map_native(const std::string& path, Scene& out) {
@@ -381,6 +392,8 @@ bool load_map_native(const std::string& path, Scene& out) {
         auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; e.dirOff=dr->second.off; }
         auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT){ e.player=(int)pl->second.i; e.playerOff=pl->second.off; e.playerFtype=pl->second.ftype; }
         auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT) e.id=id->second.i;
+        auto os=o.find("_objtStart"); if(os!=o.end()) e.objtStart=os->second.i;
+        auto oe=o.find("_objtEnd");   if(oe!=o.end()) e.objtEnd=oe->second.i;
         e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
         out.entities.push_back(std::move(e));
     }
@@ -398,9 +411,50 @@ bool load_map_native(const std::string& path, Scene& out) {
             out.heights.assign((size_t)out.grid_w*out.grid_h, 0.0f);
         }
     }
+    // structural edits: record the size-field offset of EVERY container that
+    // holds the entity OBJS (SCEN, WRLD, ..., UNTS, OBJS) so a delete/insert can
+    // shrink/grow all of them, plus the OBJS absolute schema_offset.
+    const Chunk* untsC = P.find(P.root, "UNTS");
+    const Chunk* objsC = untsC ? P.find(*untsC, "OBJS") : nullptr;
+    if (objsC) {
+        out.objsSchemaOff = (long)objsC->data_off;          // schema_offset u32
+        size_t es = objsC->offset, ee = objsC->offset + 8 + objsC->size;
+        collect_container_sizes(P.root, es, ee, out.containerSizeOffs);
+    }
+    if (untsC) out.untsCountOff = (long)untsC->offset + 12;  // entity_count u32
+
     out.raw = P.buf;          // keep original bytes for native in-place save
     out.srcPath = path;
     out.loaded = true;
+    return true;
+}
+
+bool delete_entity_native(const Scene& s, long id, const std::string& outPath) {
+    if (s.raw.empty()) return false;
+    const Entity* e = nullptr;
+    for (const auto& en : s.entities) if (en.id == id) { e = &en; break; }
+    if (!e || e->objtStart < 0 || e->objtEnd <= e->objtStart) return false;
+    long start = e->objtStart, end = e->objtEnd, removed = end - start;
+    std::vector<unsigned char> b = s.raw;
+    if (end > (long)b.size()) return false;
+    b.erase(b.begin() + start, b.begin() + end);
+    auto patch = [&](long off) {
+        if (off < 0 || off + 4 > (long)b.size()) return;
+        uint32_t v = b[off] | (b[off+1]<<8) | (b[off+2]<<16) | ((uint32_t)b[off+3]<<24);
+        v -= (uint32_t)removed;
+        b[off]=v&0xff; b[off+1]=(v>>8)&0xff; b[off+2]=(v>>16)&0xff; b[off+3]=(v>>24)&0xff;
+    };
+    for (long off : s.containerSizeOffs) patch(off);   // SCEN, WRLD, ..., UNTS, OBJS
+    patch(s.objsSchemaOff);   // SCHD sits after the deleted entity -> shifts earlier
+    if (s.untsCountOff >= 0 && s.untsCountOff + 4 <= (long)b.size()) {   // entity_count -= 1
+        long o = s.untsCountOff;
+        uint32_t v = b[o] | (b[o+1]<<8) | (b[o+2]<<16) | ((uint32_t)b[o+3]<<24);
+        if (v > 0) v -= 1;
+        b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff;
+    }
+    std::ofstream f(outPath, std::ios::binary);
+    if (!f) return false;
+    f.write((const char*)b.data(), (std::streamsize)b.size());
     return true;
 }
 
