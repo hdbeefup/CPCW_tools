@@ -20,13 +20,16 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include "srm_model.h"
 #include "dds.h"
+#include "text.h"
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 #define FVF_MODEL (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1)
 
@@ -69,6 +72,19 @@ static const char* skinName(SkinMode m) { return m==SKIN_AUTO?"AUTO":(m==SKIN_FU
 static int   g_cull = 1;   // 0=none 1=CCW 2=CW
 static bool  g_dragL = false, g_dragR = false;
 static POINT g_lastMouse;
+
+// lighting mode (matches swine_viewer 'L'): 0=3-Point 1=Top-Down 2=Flat 3=Unlit
+static int   g_lightMode = 0;
+static const char* lightName(int m) {
+    static const char* n[] = { "3-Point", "Top-Down", "Flat", "Unlit" };
+    return n[m & 3];
+}
+// MOTS animation
+static int   g_animMotion = -1;     // selected motion index, or -1 (none)
+static bool  g_playing = false;
+static float g_animTime = 0;
+static bool  g_showTree = true, g_showHud = true;
+static LARGE_INTEGER g_qpcFreq = {}, g_qpcLast = {};
 
 // ---------------------------------------------------------------------------
 // Texture index (recursive) + resolution
@@ -177,27 +193,30 @@ static void releaseGpu() {
     g_gpu.clear();
 }
 
-static void buildGpu() {
+static void buildGpu(const std::vector<Mat4>* worldOverride = nullptr,
+                     bool reframe = true, bool verbose = true) {
     releaseGpu();
     std::vector<RenderMesh> meshes;
-    srm_build_render(g_model, g_skin, g_variant, meshes);
+    srm_build_render_w(g_model, g_skin, g_variant, worldOverride, meshes);
 
     // bounds over *referenced* verts (so filtered-out floaters don't skew framing)
-    bool first = true;
-    Vec3 lo, hi;
-    for (auto& rm : meshes)
-        for (uint32_t idx : rm.indices) {
-            if (idx >= rm.verts.size()) continue;
-            const RVertex& v = rm.verts[idx];
-            Vec3 p(v.x, v.y, v.z);
-            if (first) { lo = hi = p; first = false; }
-            lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
-            hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+    if (reframe) {
+        bool first = true;
+        Vec3 lo, hi;
+        for (auto& rm : meshes)
+            for (uint32_t idx : rm.indices) {
+                if (idx >= rm.verts.size()) continue;
+                const RVertex& v = rm.verts[idx];
+                Vec3 p(v.x, v.y, v.z);
+                if (first) { lo = hi = p; first = false; }
+                lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+                hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+            }
+        if (!first) {
+            g_center = (lo + hi) * 0.5f;
+            Vec3 d = hi - lo;
+            g_radius = std::max(0.001f, std::max(d.x, std::max(d.y, d.z)) * 0.5f);
         }
-    if (!first) {
-        g_center = (lo + hi) * 0.5f;
-        Vec3 d = hi - lo;
-        g_radius = std::max(0.001f, std::max(d.x, std::max(d.y, d.z)) * 0.5f);
     }
 
     for (auto& rm : meshes) {
@@ -220,7 +239,18 @@ static void buildGpu() {
         gm.tex = loadTexture(rm.diffuseTex);
         g_gpu.push_back(gm);
     }
-    printf("built %d gpu meshes (skin=%s)\n", (int)g_gpu.size(), skinName(g_skin));
+    if (verbose) printf("built %d gpu meshes (skin=%s)\n", (int)g_gpu.size(), skinName(g_skin));
+}
+
+// Rebuild geometry for the current frame: animated node matrices when playing,
+// rest matrices otherwise.
+static void refreshGeometry(bool reframe, bool verbose) {
+    if (g_playing && g_animMotion >= 0) {
+        std::vector<Mat4> w = srm_animated_world(g_model, g_animMotion, g_animTime);
+        buildGpu(&w, reframe, verbose);
+    } else {
+        buildGpu(nullptr, reframe, verbose);
+    }
 }
 
 static void resetCamera() {
@@ -248,7 +278,15 @@ static bool loadModel(const std::string& path) {
     { int budget = 60000; indexDir(parentDir(path), budget); }   // local textures win
     printf("texture index: %d dds under %s\n", (int)g_texIndex.size(), g_dataRoot.c_str());
 
-    buildGpu();
+    // MOTS animation: auto-select the best spin/loop motion and play it.
+    g_animMotion = srm_loop_motion(g_model);
+    g_animTime = 0;
+    g_playing = (g_animMotion >= 0);
+    if (!g_model.motions.empty())
+        printf("MOTS: %d motion(s); spin motion = %s\n", (int)g_model.motions.size(),
+               g_animMotion >= 0 ? g_model.motions[g_animMotion].name.c_str() : "(none)");
+
+    buildGpu(nullptr, true, true);   // frame on the rest pose (stable)
     resetCamera();
     if (g_hwnd) updateTitle();
     return true;
@@ -259,9 +297,8 @@ static bool loadModel(const std::string& path) {
 // ---------------------------------------------------------------------------
 static void setStates() {
     g_dev->SetRenderState(D3DRS_ZENABLE, TRUE);
-    g_dev->SetRenderState(D3DRS_LIGHTING, TRUE);
+    g_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     g_dev->SetRenderState(D3DRS_NORMALIZENORMALS, TRUE);
-    g_dev->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(70, 72, 78));
     g_dev->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
     D3DCULL cull = g_cull == 0 ? D3DCULL_NONE : (g_cull == 1 ? D3DCULL_CCW : D3DCULL_CW);
     g_dev->SetRenderState(D3DRS_CULLMODE, cull);
@@ -271,6 +308,123 @@ static void setStates() {
     g_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     g_dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
     g_dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+}
+
+// Lighting rig, switchable with 'L' (mirrors swine_viewer's four modes).
+static void applyLighting(Vec3 eye) {
+    for (int i = 0; i < 4; i++) g_dev->LightEnable(i, FALSE);
+    if (g_lightMode == 3) {                    // Unlit — full-bright, ignore normals
+        g_dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        return;
+    }
+    g_dev->SetRenderState(D3DRS_LIGHTING, TRUE);
+    auto dir = [&](int i, Vec3 d, float r, float g, float b) {
+        D3DLIGHT9 L = {}; L.Type = D3DLIGHT_DIRECTIONAL;
+        L.Diffuse.r = r; L.Diffuse.g = g; L.Diffuse.b = b;
+        Vec3 n = normalize(d);
+        L.Direction.x = n.x; L.Direction.y = n.y; L.Direction.z = n.z;
+        g_dev->SetLight(i, &L); g_dev->LightEnable(i, TRUE);
+    };
+    if (g_lightMode == 0) {                    // 3-Point: key + fill + rim
+        g_dev->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(38, 40, 46));
+        dir(0, Vec3(-0.4f, -0.7f, -0.5f), 0.92f, 0.90f, 0.84f);
+        dir(1, Vec3( 0.6f, -0.1f,  0.4f), 0.34f, 0.36f, 0.42f);
+        dir(2, Vec3( 0.1f,  0.7f,  0.3f), 0.30f, 0.30f, 0.36f);
+    } else if (g_lightMode == 1) {             // Top-Down
+        g_dev->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(52, 54, 60));
+        dir(0, Vec3(0.02f, -1.0f, 0.05f), 1.0f, 0.98f, 0.95f);
+    } else {                                   // Flat: bright ambient + soft cam light
+        g_dev->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(150, 152, 158));
+        dir(0, g_center - eye, 0.45f, 0.45f, 0.48f);
+    }
+}
+
+// Parent-chain length, for tree indentation.
+static int nodeDepth(const SrmModel& m, int i) {
+    int d = 0, cur = i, guard = 0;
+    while (cur >= 0 && cur < (int)m.nodes.size() && guard++ < 256) {
+        int p = m.nodes[cur].parentIdx;
+        if (p < 0 || p == cur) break;
+        cur = p; d++;
+    }
+    return d;
+}
+
+// On-screen overlay: node tree (top-left), status (top-right), key hints (bottom).
+static void drawHud() {
+    const DWORD C_DIM = 0xff8B929C, C_MESH = 0xffE0B451, C_ANIM = 0xff86C25A,
+                C_KEY = 0xffB9C0CA, C_PANEL = 0xC0141820, C_HDR = 0xffC99A3C,
+                C_TXT = 0xffE0E3EA;
+    int cw = text_cw(), ch = text_ch();
+
+    std::set<int> animNodes;
+    if (g_animMotion >= 0 && g_animMotion < (int)g_model.motions.size())
+        for (auto& ns : srm_node_spins(g_model.motions[g_animMotion]))
+            if (ns.isRotation()) animNodes.insert(ns.nodeIndex);
+
+    // node tree
+    if (g_showTree && !g_model.nodes.empty()) {
+        int nn = (int)g_model.nodes.size();
+        int maxRows = std::max(6, (g_h - 96) / ch);
+        int limit = std::min(nn, maxRows);
+        char hdr[200];
+        snprintf(hdr, sizeof(hdr), "%s  -  %d nodes, %d meshes",
+                 g_srmPath.empty() ? "(no model)" : baseName(g_srmPath).c_str(),
+                 nn, (int)g_model.meshes.size());
+        int wchars = (int)strlen(hdr);
+        for (int i = 0; i < limit; i++) {
+            int w = nodeDepth(g_model, i) * 2 + 2 + (int)g_model.nodes[i].name.size() + 8;
+            if (w > wchars) wchars = w;
+        }
+        int px = 10, py = 10;
+        int rows = 1 + limit + (nn > limit ? 1 : 0);
+        text_rect(g_dev, px - 5, py - 5, wchars * cw + 16, rows * ch + 12, C_PANEL);
+        text_draw(g_dev, px, py, hdr, C_HDR);
+        int y = py + ch;
+        for (int i = 0; i < limit; i++, y += ch) {
+            const SrmNode& nd = g_model.nodes[i];
+            bool isMesh = nd.meshIndex >= 0;
+            bool isAnim = animNodes.count(i) > 0;
+            std::string nm = nd.name;
+            if (nm.size() > 30) nm = nm.substr(0, 29) + "~";
+            std::string line = std::string(nodeDepth(g_model, i) * 2, ' ')
+                             + (isMesh ? "# " : "- ") + nm + (isAnim ? "  <spin>" : "");
+            text_draw(g_dev, px, y, line.c_str(), isAnim ? C_ANIM : (isMesh ? C_MESH : C_DIM));
+        }
+        if (nn > limit) {
+            char more[48]; snprintf(more, sizeof(more), "  ... +%d more", nn - limit);
+            text_draw(g_dev, px, y, more, C_DIM);
+        }
+    }
+
+    // status (top-right)
+    {
+        const char* var = g_variant == VAR_ALL ? "ALL" : (g_variant == VAR_STANDARD ? "STD" : "UPG");
+        char st[240];
+        if (g_animMotion >= 0)
+            snprintf(st, sizeof(st), "skin %s | var %s | light %s | %s %s",
+                     skinName(g_skin), var, lightName(g_lightMode),
+                     g_model.motions[g_animMotion].name.c_str(), g_playing ? "|>" : "||");
+        else
+            snprintf(st, sizeof(st), "skin %s | var %s | light %s | no anim",
+                     skinName(g_skin), var, lightName(g_lightMode));
+        int w = (int)strlen(st) * cw;
+        text_rect(g_dev, g_w - w - 20, 6, w + 15, ch + 8, C_PANEL);
+        text_draw(g_dev, g_w - w - 12, 10, st, C_TXT);
+    }
+
+    // key hints (bottom)
+    {
+        std::string l1 = "LMB orbit   RMB pan   Wheel zoom    |    W wire   T tex   L light   C cull   R reset";
+        std::string l2 = "F skin   V variant   N tree   H hud   P shot   Esc quit";
+        if (g_animMotion >= 0) l2 = "Space play/pause   [ ] motion    |    " + l2;
+        int bw = std::max((int)l1.size(), (int)l2.size()) * cw + 18;
+        int bh = 2 * ch + 12;
+        int by = g_h - bh - 6;
+        text_rect(g_dev, 6, by, bw, bh, C_PANEL);
+        text_draw(g_dev, 14, by + 6, l1.c_str(), C_KEY);
+        text_draw(g_dev, 14, by + 6 + ch, l2.c_str(), C_KEY);
+    }
 }
 
 static void render() {
@@ -287,15 +441,6 @@ static void render() {
     g_dev->SetTransform(D3DTS_VIEW, &view);
     g_dev->SetTransform(D3DTS_PROJECTION, &proj);
 
-    // headlight from the camera
-    D3DLIGHT9 light = {};
-    light.Type = D3DLIGHT_DIRECTIONAL;
-    light.Diffuse.r = light.Diffuse.g = light.Diffuse.b = 1.0f;
-    Vec3 ld = normalize(g_center - eye);
-    light.Direction.x = ld.x; light.Direction.y = ld.y; light.Direction.z = ld.z;
-    g_dev->SetLight(0, &light);
-    g_dev->LightEnable(0, TRUE);
-
     D3DMATERIAL9 mat = {};
     mat.Diffuse.r = mat.Diffuse.g = mat.Diffuse.b = mat.Diffuse.a = 1.0f;
     mat.Ambient = mat.Diffuse;
@@ -304,6 +449,7 @@ static void render() {
     g_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_XRGB(30, 32, 38), 1.0f, 0);
     g_dev->BeginScene();
     setStates();
+    applyLighting(eye);
     g_dev->SetFVF(FVF_MODEL);
     for (auto& g : g_gpu) {
         bool textured = g_useTex && g.tex && !g_wire;
@@ -321,6 +467,7 @@ static void render() {
         g_dev->SetIndices(g.ib);
         g_dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, g.numVerts, 0, g.numTris);
     }
+    if (g_showHud) drawHud();
     g_dev->EndScene();
     g_dev->Present(nullptr, nullptr, nullptr, nullptr);
 }
@@ -423,8 +570,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case 'T': g_useTex = !g_useTex; updateTitle(); break;
         case 'C': g_cull = (g_cull + 1) % 3; updateTitle(); break;
         case 'R': resetCamera(); break;
-        case 'F': g_skin = (SkinMode)((g_skin + 1) % 3); buildGpu(); updateTitle(); break;
-        case 'V': g_variant = (Variant)((g_variant + 1) % 3); buildGpu(); updateTitle(); break;
+        case 'L': g_lightMode = (g_lightMode + 1) % 4; updateTitle(); break;
+        case 'N': g_showTree = !g_showTree; break;
+        case 'H': g_showHud = !g_showHud; break;
+        case 'F': g_skin = (SkinMode)((g_skin + 1) % 3); refreshGeometry(false, true); updateTitle(); break;
+        case 'V': g_variant = (Variant)((g_variant + 1) % 3); refreshGeometry(false, true); updateTitle(); break;
+        case VK_SPACE:
+            if (g_animMotion >= 0) { g_playing = !g_playing; updateTitle(); }
+            break;
+        case VK_OEM_4:   // '[' previous motion
+        case VK_OEM_6: { // ']' next motion
+            int nM = (int)g_model.motions.size();
+            if (nM > 0) {
+                int dirn = (w == VK_OEM_6) ? 1 : -1;
+                int cur = g_animMotion < 0 ? 0 : g_animMotion;
+                g_animMotion = (cur + dirn + nM) % nM;
+                g_animTime = 0;
+                refreshGeometry(false, false);
+                updateTitle();
+            }
+            break;
+        }
         case 'P': {
             static int n = 0;
             char name[64]; snprintf(name, sizeof(name), "cpcw_shot_%03d.bmp", n++);
@@ -533,6 +699,7 @@ static bool initD3D(bool visible) {
 
 int main(int argc, char** argv) {
     std::string srmPath, shotPath;
+    float shotTime = -1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
@@ -540,6 +707,9 @@ int main(int argc, char** argv) {
             g_skin = (s=="none")?SKIN_NONE:(s=="full")?SKIN_FULL:SKIN_AUTO; }
         else if (a == "--variant" && i + 1 < argc) { std::string s = argv[++i];
             g_variant = (s=="standard")?VAR_STANDARD:(s=="upgraded")?VAR_UPGRADED:VAR_ALL; }
+        else if (a == "--light" && i + 1 < argc) g_lightMode = atoi(argv[++i]) & 3;
+        else if (a == "--time" && i + 1 < argc) shotTime = (float)atof(argv[++i]);
+        else if (a == "--nohud") g_showHud = false;
         else if (srmPath.empty()) srmPath = a;
         else if (g_dataRoot.empty()) g_dataRoot = a;
     }
@@ -581,6 +751,7 @@ int main(int argc, char** argv) {
 
     bool interactive = shotPath.empty();
     if (!initD3D(interactive)) { printf("D3D init failed\n"); return 1; }
+    text_init(g_dev, g_texUsage, g_texPool);   // glyph atlas for the HUD
 
     if (!srmPath.empty() && !loadModel(srmPath) && !interactive) {
         if (g_dev) g_dev->Release(); if (g_d3d) g_d3d->Release();
@@ -589,17 +760,37 @@ int main(int argc, char** argv) {
     updateTitle();
 
     if (!shotPath.empty()) {
+        if (shotTime >= 0 && g_animMotion >= 0) {   // capture an animated pose
+            g_animTime = shotTime;
+            std::vector<Mat4> wm = srm_animated_world(g_model, g_animMotion, g_animTime);
+            buildGpu(&wm, false, false);
+        }
         render(); render();   // a couple of frames to settle, then capture
         bool ok = saveShot(shotPath);
         if (g_dev) g_dev->Release(); if (g_d3d) g_d3d->Release();
         return ok ? 0 : 2;
     }
 
+    QueryPerformanceFrequency(&g_qpcFreq);
+    QueryPerformanceCounter(&g_qpcLast);
     MSG msg = {};
     while (msg.message != WM_QUIT) {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-        else render();
+        else {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            float dt = g_qpcFreq.QuadPart
+                ? (float)((double)(now.QuadPart - g_qpcLast.QuadPart) / (double)g_qpcFreq.QuadPart) : 0.0f;
+            g_qpcLast = now;
+            if (dt > 0.1f) dt = 0.1f;   // clamp after a stall
+            if (g_playing && g_animMotion >= 0) {
+                g_animTime += dt;
+                std::vector<Mat4> wm = srm_animated_world(g_model, g_animMotion, g_animTime);
+                buildGpu(&wm, false, false);   // animate: no reframe, quiet
+            }
+            render();
+        }
     }
+    text_release();
     releaseGpu();
     for (auto& kv : g_texCache) if (kv.second) kv.second->Release();
     if (g_dev) g_dev->Release(); if (g_d3d) g_d3d->Release();

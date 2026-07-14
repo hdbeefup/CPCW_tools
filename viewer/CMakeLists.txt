@@ -8,10 +8,12 @@ add_executable(cpcw_viewer
     src/viewer.cpp
     src/srm_model.cpp
     src/dds.cpp
+    src/text.cpp
 )
 
-# d3d9.h / d3d9.lib ship in the Windows SDK — no legacy DirectX SDK needed.
-target_link_libraries(cpcw_viewer PRIVATE d3d9 comdlg32)
+# d3d9.h / d3d9.lib + gdi32 (glyph atlas) ship in the Windows SDK — no legacy
+# DirectX SDK needed.
+target_link_libraries(cpcw_viewer PRIVATE d3d9 comdlg32 gdi32)
 
 if (MSVC)
     target_compile_options(cpcw_viewer PRIVATE /W3 /EHsc)

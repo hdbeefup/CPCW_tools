@@ -8,6 +8,7 @@
 // which is exactly what the importer's apply_skin='FULL' does.
 #pragma once
 #include <cstdint>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <map>
@@ -50,11 +51,39 @@ struct SrmNode {
     int meshIndex = -1;     // index into SrmModel::meshes, or -1
 };
 
+// --- MOTS node animation (see cpcw_mots.py; reverse-engineered + Ghidra-checked)
+// A channel's keys are the up-to-6 per-DOF component tracks (tx,ty,tz,rx,ry,rz);
+// the moving one carries the animation. Provisional playback: rotation DOF value
+// = angle in radians about the node's local axis, linear/uniform over duration.
+struct MotsKey { float v0 = 0, v1 = 0; };
+struct MotsChannel { std::vector<MotsKey> keys; };
+struct MotsMotion {
+    std::string name;
+    float duration = 0;
+    std::vector<int> nodeChannel;        // per model node -> channel idx (-1 static)
+    std::vector<MotsChannel> channels;
+};
+
 struct SrmModel {
     std::vector<SrmNode> nodes;
     std::vector<SrmMesh> meshes;
+    std::vector<MotsMotion> motions;
     std::string path;
 };
+
+// The dominant animated DOF of one node over a motion (provisional).
+struct NodeSpin { int nodeIndex = -1; int dof = 0; float v0 = 0, v1 = 0, duration = 0;
+    bool isRotation() const { return dof >= 3; }
+    float sample(float t) const {                      // linear, looping
+        if (duration <= 0) return v1;
+        float f = (t - duration * std::floor(t / duration)) / duration;
+        return v0 + (v1 - v0) * f;
+    }
+};
+std::vector<NodeSpin> srm_node_spins(const MotsMotion& mo);
+// Index of the motion best suited to a looping spin preview (most rotation
+// tracks), or -1 if the model has none.
+int srm_loop_motion(const SrmModel& m);
 
 bool srm_parse(const std::string& path, SrmModel& out, std::string* err = nullptr);
 
@@ -84,6 +113,17 @@ struct RenderMesh {
 // Build world matrices per node (parent chain, T*R*S, R=Rx*Ry*Rz).
 std::vector<Mat4> srm_world_matrices(const SrmModel& m);
 
+// World matrices with `motionIdx` evaluated at time t: each animated node's
+// local euler gets its rotation-DOF component overridden by the sampled angle
+// (native SRM space -> faithful). timeSec loops over the clip. motionIdx < 0
+// returns the rest matrices.
+std::vector<Mat4> srm_animated_world(const SrmModel& m, int motionIdx, float timeSec);
+
 // Produce world-space render meshes (skinned per `mode`, filtered per `variant`).
 void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
                       std::vector<RenderMesh>& out);
+// Same, but with caller-provided per-node world matrices (e.g. animated).
+// `worldOverride` size must equal m.nodes.size(); nullptr = compute rest.
+void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
+                        const std::vector<Mat4>* worldOverride,
+                        std::vector<RenderMesh>& out);

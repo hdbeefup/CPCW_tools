@@ -94,6 +94,59 @@ void parseMesh(const uint8_t* d, size_t start, size_t end, SrmMesh& mesh) {
     }
 }
 
+// Parse a MOTS chunk body [start,end) (starts with 'v004') into `out`.
+void parseMots(const uint8_t* d, size_t start, size_t end, std::vector<MotsMotion>& out) {
+    if (start + 4 > end || memcmp(d + start, "v004", 4) != 0) return;
+    size_t p = start + 4;
+    while (p + 8 <= end) {
+        uint32_t sz = u32(d, p + 4);
+        size_t chunkEnd = p + 8 + sz;
+        if (chunkEnd > end) break;
+        if (memcmp(d + p, "MOTI", 4) != 0) { p = chunkEnd; continue; }
+        size_t q = p + 8;
+        MotsMotion mo;
+        uint16_t nlen = u16(d, q); q += 2;
+        mo.name.assign((const char*)(d + q), nlen); q += nlen;
+        q += 4;                                   // target_obj
+        q += 4;                                   // weight
+        q += 4;                                   // zero
+        uint32_t nodeCount = u32(d, q); q += 4;
+        mo.nodeChannel.resize(nodeCount);
+        for (uint32_t i = 0; i < nodeCount; i++) { mo.nodeChannel[i] = i32(d, q); q += 4; }
+        if (q + 8 <= chunkEnd && memcmp(d + q, "ANIM", 4) == 0) {
+            uint32_t animSize = u32(d, q + 4);
+            size_t a = q + 8;                     // -> 'v002'
+            size_t animEnd = a + animSize;
+            if (animEnd > end) animEnd = end;
+            if (a + 4 <= animEnd && memcmp(d + a, "v002", 4) == 0) {
+                size_t r = a + 4;                 // key offsets are relative to here
+                mo.duration = f32(d, r);
+                uint32_t channelCount = u32(d, r + 16);
+                size_t rec = r + 32;
+                std::vector<int> keyCounts, keyOffsets;
+                for (uint32_t c = 0; c < channelCount; c++) {
+                    if (rec + 68 > animEnd) break;
+                    keyCounts.push_back((int)i32(d, rec + 40));
+                    keyOffsets.push_back((int)i32(d, rec + 48));
+                    rec += 68;
+                }
+                mo.channels.resize(channelCount);
+                for (size_t c = 0; c < keyCounts.size(); c++) {
+                    size_t o = r + (size_t)(uint32_t)keyOffsets[c];
+                    for (int k = 0; k < keyCounts[c]; k++) {
+                        if (o + 68 > animEnd) break;
+                        MotsKey key; key.v0 = f32(d, o + 28); key.v1 = f32(d, o + 32);
+                        mo.channels[c].keys.push_back(key);
+                        o += 68;
+                    }
+                }
+            }
+        }
+        out.push_back(std::move(mo));
+        p = chunkEnd;
+    }
+}
+
 } // namespace
 
 bool srm_parse(const std::string& path, SrmModel& out, std::string* err) {
@@ -144,19 +197,61 @@ bool srm_parse(const std::string& path, SrmModel& out, std::string* err) {
                 out.meshes.push_back(std::move(mesh));
                 p = meshEnd;
             }
+        } else if (memcmp(d + pos, "MOTS", 4) == 0) {
+            parseMots(d, pos + 8, chunkEnd, out.motions);
         }
         pos = chunkEnd;
     }
     return true;
 }
 
-std::vector<Mat4> srm_world_matrices(const SrmModel& m) {
+// --- MOTS animation helpers -------------------------------------------------
+
+std::vector<NodeSpin> srm_node_spins(const MotsMotion& mo) {
+    std::vector<NodeSpin> out;
+    for (size_t ni = 0; ni < mo.nodeChannel.size(); ni++) {
+        int ch = mo.nodeChannel[ni];
+        if (ch < 0 || ch >= (int)mo.channels.size()) continue;
+        const auto& keys = mo.channels[ch].keys;
+        if (keys.empty()) continue;
+        int best = -1; float bestSpan = 0;
+        int lim = (int)keys.size(); if (lim > 6) lim = 6;
+        for (int i = 0; i < lim; i++) {
+            float s = std::fabs(keys[i].v1 - keys[i].v0);
+            if (s > bestSpan) { bestSpan = s; best = i; }
+        }
+        if (best < 0 || bestSpan < 1e-3f) continue;
+        NodeSpin ns; ns.nodeIndex = (int)ni; ns.dof = best;
+        ns.v0 = keys[best].v0; ns.v1 = keys[best].v1; ns.duration = mo.duration;
+        out.push_back(ns);
+    }
+    return out;
+}
+
+int srm_loop_motion(const SrmModel& m) {
+    int best = -1, bestRot = 0;
+    for (size_t i = 0; i < m.motions.size(); i++) {
+        int rot = 0;
+        for (auto& ns : srm_node_spins(m.motions[i])) if (ns.isRotation()) rot++;
+        if (rot > bestRot) { bestRot = rot; best = (int)i; }
+    }
+    return best;
+}
+
+static Mat4 node_local(const SrmNode& nd) {
+    Mat4 R = Mat4::rotX(nd.rotation.x) * Mat4::rotY(nd.rotation.y) * Mat4::rotZ(nd.rotation.z);
+    Mat4 T = Mat4::translation(nd.position.x, nd.position.y, nd.position.z);
+    Mat4 S = Mat4::scale(nd.scale.x, nd.scale.y, nd.scale.z);
+    return T * R * S;
+}
+
+// Compose per-node world matrices from provided local matrices (parent chain,
+// iterative with a cycle guard).
+static std::vector<Mat4> compose_world(const SrmModel& m, const std::vector<Mat4>& local) {
     size_t n = m.nodes.size();
     std::vector<Mat4> world(n);
     std::vector<char> done(n, 0);
-    // iterative resolve with cycle guard
     for (size_t i = 0; i < n; i++) {
-        // build chain
         std::vector<int> chain;
         int cur = (int)i;
         while (cur >= 0 && cur < (int)n && !done[cur]) {
@@ -165,21 +260,79 @@ std::vector<Mat4> srm_world_matrices(const SrmModel& m) {
             if (par == cur) break;
             cur = par;
         }
-        // resolve from top of chain down
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             int idx = *it;
-            const SrmNode& nd = m.nodes[idx];
-            Mat4 R = Mat4::rotX(nd.rotation.x) * Mat4::rotY(nd.rotation.y) * Mat4::rotZ(nd.rotation.z);
-            Mat4 T = Mat4::translation(nd.position.x, nd.position.y, nd.position.z);
-            Mat4 S = Mat4::scale(nd.scale.x, nd.scale.y, nd.scale.z);
-            Mat4 local = T * R * S;
-            int par = nd.parentIdx;
+            int par = m.nodes[idx].parentIdx;
             if (par >= 0 && par < (int)n && par != idx && done[par])
-                world[idx] = world[par] * local;
+                world[idx] = world[par] * local[idx];
             else
-                world[idx] = local;
+                world[idx] = local[idx];
             done[idx] = 1;
         }
+    }
+    return world;
+}
+
+std::vector<Mat4> srm_world_matrices(const SrmModel& m) {
+    std::vector<Mat4> local(m.nodes.size());
+    for (size_t i = 0; i < m.nodes.size(); i++) local[i] = node_local(m.nodes[i]);
+    return compose_world(m, local);
+}
+
+static Vec3 readPos(const SrmStream& s, int i);   // fwd
+
+// Descendants of `node` (inclusive), by parent chain.
+static std::vector<int> nodeGroup(const SrmModel& m, int node) {
+    std::vector<int> grp, stack{ node };
+    while (!stack.empty()) {
+        int c = stack.back(); stack.pop_back();
+        grp.push_back(c);
+        for (int i = 0; i < (int)m.nodes.size(); i++)
+            if (m.nodes[i].parentIdx == c && i != c) stack.push_back(i);
+    }
+    return grp;
+}
+
+// Rotation by `ang` about a world axis (0=X,1=Y,2=Z) through `pivot`.
+static Mat4 rotAboutAxis(int axis, float ang, Vec3 pivot) {
+    Mat4 R = axis == 0 ? Mat4::rotX(ang) : (axis == 1 ? Mat4::rotY(ang) : Mat4::rotZ(ang));
+    return Mat4::translation(pivot.x, pivot.y, pivot.z) * R *
+           Mat4::translation(-pivot.x, -pivot.y, -pivot.z);
+}
+
+std::vector<Mat4> srm_animated_world(const SrmModel& m, int motionIdx, float timeSec) {
+    std::vector<Mat4> world = srm_world_matrices(m);
+    if (motionIdx < 0 || motionIdx >= (int)m.motions.size()) return world;
+
+    // A rotor/dish spins about its shaft. We don't yet have the engine's exact
+    // node-local axis (the stored DOF is in a converted space -> naive euler
+    // override tumbles it), so pick the axis GEOMETRICALLY: a disc is thinnest
+    // along its shaft, so rotate the node+descendants about the group's
+    // minimum-extent world axis through the group centroid. Matches the Blender
+    // demo (blendertools/mots_play.py) and is robust. Provisional.
+    for (const NodeSpin& ns : srm_node_spins(m.motions[motionIdx])) {
+        if (!ns.isRotation()) continue;
+        if (ns.nodeIndex < 0 || ns.nodeIndex >= (int)m.nodes.size()) continue;
+        std::vector<int> grp = nodeGroup(m, ns.nodeIndex);
+        Vec3 lo(1e9f, 1e9f, 1e9f), hi(-1e9f, -1e9f, -1e9f);
+        bool any = false;
+        for (int gi : grp) {
+            const SrmNode& nd = m.nodes[gi];
+            if (nd.meshIndex < 0 || nd.meshIndex >= (int)m.meshes.size()) continue;
+            const SrmStream* pos = m.meshes[nd.meshIndex].byUsage(USAGE_POSITION);
+            if (!pos) continue;
+            for (int v = 0; v < pos->vertexCount; v++) {
+                Vec3 wp = world[gi].point(readPos(*pos, v));
+                if (!any) { lo = hi = wp; any = true; }
+                lo.x=std::min(lo.x,wp.x); lo.y=std::min(lo.y,wp.y); lo.z=std::min(lo.z,wp.z);
+                hi.x=std::max(hi.x,wp.x); hi.y=std::max(hi.y,wp.y); hi.z=std::max(hi.z,wp.z);
+            }
+        }
+        if (!any) continue;
+        Vec3 c = (lo + hi) * 0.5f, e = hi - lo;
+        int axis = (e.x < e.y) ? (e.x < e.z ? 0 : 2) : (e.y < e.z ? 1 : 2);
+        Mat4 R = rotAboutAxis(axis, ns.sample(timeSec), c);
+        for (int gi : grp) world[gi] = R * world[gi];   // rigid group spin
     }
     return world;
 }
@@ -266,7 +419,14 @@ static void auto_bind_groups(const SrmMesh& mesh, const SrmStream& pos,
 
 void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
                       std::vector<RenderMesh>& out) {
-    std::vector<Mat4> world = srm_world_matrices(m);
+    srm_build_render_w(m, mode, variant, nullptr, out);
+}
+
+void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
+                        const std::vector<Mat4>* worldOverride,
+                        std::vector<RenderMesh>& out) {
+    std::vector<Mat4> world = (worldOverride && worldOverride->size() == m.nodes.size())
+                              ? *worldOverride : srm_world_matrices(m);
     std::vector<Mat4> rot(world.size());
     for (size_t i = 0; i < world.size(); i++) { rot[i] = world[i]; for (int r=0;r<3;r++){ rot[i].m[r][3]=0; } rot[i].m[3][0]=rot[i].m[3][1]=rot[i].m[3][2]=0; }
 

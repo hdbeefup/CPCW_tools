@@ -83,7 +83,26 @@ cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin auto|full|none]
 
 Interactive: **LMB** orbit · **RMB** pan · **wheel** zoom · **drag-drop** a
 `.srm` to load · **W** wireframe · **T** textures · **F** skin AUTO/FULL/NONE ·
-**V** variant cycle · **C** cull cycle · **P** screenshot · **R** reset · **Esc**.
+**V** variant cycle · **L** light mode (3-Point / Top-Down / Flat / Unlit) ·
+**C** cull cycle · **Space** play/pause animation · **[** / **]** cycle motion ·
+**N** node tree · **H** HUD · **P** screenshot · **R** reset · **Esc**.
+An on-screen overlay shows the **node tree** (parent/child; `#` mesh, `-`
+transform, green `<spin>` = animated), a status line, and a key legend.
+
+Extra `--shot` flags for headless capture: `--light 0..3`, `--time <sec>`
+(pose the animation at that clip time), `--nohud`.
+
+## MOTS animation
+
+Models with a `MOTS` chunk (helicopters, radars, machinery — 95 of 2087) carry
+keyframed node animation. The viewer auto-selects the looping "spin" motion and
+plays it (**Space** pauses, **[** / **]** cycle motions). Animated nodes are
+listed green in the tree. Playback is **provisional** (see `../cpcw_mots.py` and
+`docs/FORMAT_SRM.md §MOTS`): constant-speed, and the spin axis is derived
+geometrically (a rotor/dish is thinnest along its shaft) since the engine's exact
+per-frame evaluator (timing/interpolation) is still being read in Ghidra
+(`N:/gamePAKdata/re/MOTS_RESULT.md`). It's a preview, not yet the engine's exact
+motion.
 
 ## Upgrade variants
 
