@@ -60,7 +60,12 @@ bool srm_parse(const std::string& path, SrmModel& out, std::string* err = nullpt
 
 // --- render build ---
 
-enum SkinMode { SKIN_FULL, SKIN_NONE };   // FULL = exact game rule; NONE = raw bind pose
+// AUTO  = per-mesh heuristic: skin bone-local (vehicle) meshes, leave
+//         model-space (building/character) meshes in bind pose. Default.
+// FULL  = apply the exact skin rule to every rigid mesh (assembles vehicles;
+//         scatters model-space buildings — use to see the raw rule).
+// NONE  = raw bind pose, nothing skinned.
+enum SkinMode { SKIN_AUTO, SKIN_FULL, SKIN_NONE };
 
 // Upgrade-variant filter. Vehicles pack every loadout in one .srm; a part's
 // variant is read from the SUFFIX of the bone it is skinned to (_std / _upg;

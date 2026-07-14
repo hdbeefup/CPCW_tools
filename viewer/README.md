@@ -18,19 +18,28 @@ own conventions, which is exactly what a `reccmp`-style effort matches against
 - Parses `.srm` directly (port of `blendertools/SRM_Blender/srm_format.py`):
   MAIN → PMOD node headers + MESH block; BONE palette, INDS indices, VERS
   streams keyed by **D3DDECLUSAGE**.
-- **Skinning** — two cases, distinguished by how the vertices are stored:
+- **Skinning** — the vertices come in two storage conventions:
   - *Rigid* (vehicles): no `BLENDINDICES` stream; each vertex's bone-palette
     index is **byte 3 of the NORMAL stream** and its position is in that bone's
     **local** space, so the proven rule `v_world = boneWorld[palette[idx]] · v`
     assembles it (verified in Ghidra: no inverse-bind).
-  - *Smooth* (characters): has `BLENDINDICES` + `BLENDWEIGHT` streams and the
+  - *Smooth* (characters/animals): has `BLENDINDICES` + `BLENDWEIGHT` and the
     vertices are in **model** space. The engine's per-bone skin matrix is
     `boneWorld · inverseBind`, which at the static rest pose is **identity** —
     so a static viewer must render the **bind pose** (applying `boneWorld`
-    alone would double-transform and mangle the mesh). We therefore leave
-    smooth meshes in bind pose; they'd only move once animation is evaluated.
-  - *Unskinned* meshes (most buildings/props): placed by the owning node's
-    world matrix (`T·R·S`, `R = Rx·Ry·Rz`, composed up the parent chain).
+    alone double-transforms and mangles the mesh). Smooth meshes are therefore
+    always left in bind pose.
+  - *Unskinned* meshes: placed by the owning node's world matrix (`T·R·S`,
+    `R = Rx·Ry·Rz`, up the parent chain).
+- **The catch: the `.srm` alone can't say whether a *rigid* mesh should be
+  skinned.** A vehicle's rigid parts are bone-local (skinning assembles them);
+  a building's rigid mesh is often model-space (skinning *scatters* it) — the
+  same data, drawn differently by the game's unit-vs-building logic, which isn't
+  in the file. The **AUTO** mode (default) resolves this per bone-group: it skins
+  a group only if `boneWorld` moves its centroid a *small* amount relative to the
+  mesh size, and leaves groups that would fly far (building beams, and animated
+  road-wheel floaters) in bind pose. **FULL** applies the raw rule to everything
+  (assembles vehicles; scatters model-space buildings); **NONE** skins nothing.
 - Native **left-handed** rendering: no LH→RH reflection, no winding reversal —
   the mirror-sensitive test (train lettering "DEUTSCHE BUNDESBAHN" reads
   forward; the ka_15's one-sided canopy sits correctly) passes natively.
@@ -53,7 +62,7 @@ cmake --build build --config Release
 ## Usage
 
 ```sh
-cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin full|none]
+cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin auto|full|none]
             [--variant all|standard|upgraded] [--info]
 ```
 
@@ -64,7 +73,8 @@ cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin full|none]
   like `Vehicles`) for full texture coverage.
 - `--shot out.bmp` — render one frame offscreen, write a 24-bit BMP, exit
   (headless; used for the render gallery / CI-style checks).
-- `--skin full` (default) = the exact game rule; `--skin none` = raw bind pose.
+- `--skin auto` (default) = per-group heuristic (see above); `full` = raw rule;
+  `none` = bind pose.
 - `--variant standard|upgraded` — show only that upgrade loadout (default
   `all` shows every variant merged; see below).
 - `--info` — **no display needed**: parse the model and print node/mesh counts
@@ -72,7 +82,7 @@ cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin full|none]
   a disconnected Remote Desktop session.
 
 Interactive: **LMB** orbit · **RMB** pan · **wheel** zoom · **drag-drop** a
-`.srm` to load · **W** wireframe · **T** textures · **F** skin FULL/NONE ·
+`.srm` to load · **W** wireframe · **T** textures · **F** skin AUTO/FULL/NONE ·
 **V** variant cycle · **C** cull cycle · **P** screenshot · **R** reset · **Esc**.
 
 ## Upgrade variants
@@ -94,14 +104,14 @@ connected-RDP case. For inspection without any display, use `--info`.
 
 ## Known limits (faithful, not bugs)
 
-- **Animated bones float.** A static file has no settled pose for bones the
-  engine animates per frame (tank road wheels, suspension, rotor). Under the
-  exact rule (`--skin full`) these parts render at their *un-animated* bone
-  transform — the road wheels/camo net hover above a Patton, the moskvitch's
-  front wheels sit slightly forward. This is inherent to a static viewer;
-  settling them needs the animation data evaluated (a future phase). Blender's
-  `AUTO` heuristic hides it by leaving such parts in model space, but that's a
-  guess, not the engine rule — this viewer stays honest and shows the rule.
+- **Animated bones.** A static file has no settled pose for bones the engine
+  animates per frame (tank road wheels, suspension, rotor, some prop panels).
+  Under `--skin full` these render at their un-animated transform — road
+  wheels/camo net hover above a Patton. `AUTO` hides the ones that fly far, but
+  parts that move only moderately (the Patton's wheels, the moskvitch's front
+  wheels, a tilted newsstand display board) still show their rest pose. Settling
+  them exactly needs the animation data evaluated (a future phase), not more
+  static heuristics — those would be guessing.
 - **Diffuse alpha is a specular/team mask, not opacity** (per the format notes),
   so it's intentionally left unwired — no alpha blending. The ka_15 rotor-blur
   disc therefore draws opaque/dark rather than as a translucent disc.

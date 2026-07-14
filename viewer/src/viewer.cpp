@@ -63,8 +63,9 @@ static float g_yaw = 35, g_pitch = 22, g_dist = 10;
 static Vec3  g_center;
 static float g_radius = 5;
 static bool  g_wire = false, g_useTex = true;
-static SkinMode g_skin = SKIN_FULL;
+static SkinMode g_skin = SKIN_AUTO;
 static Variant g_variant = VAR_ALL;
+static const char* skinName(SkinMode m) { return m==SKIN_AUTO?"AUTO":(m==SKIN_FULL?"FULL":"NONE"); }
 static int   g_cull = 1;   // 0=none 1=CCW 2=CW
 static bool  g_dragL = false, g_dragR = false;
 static POINT g_lastMouse;
@@ -219,7 +220,7 @@ static void buildGpu() {
         gm.tex = loadTexture(rm.diffuseTex);
         g_gpu.push_back(gm);
     }
-    printf("built %d gpu meshes (skin=%s)\n", (int)g_gpu.size(), g_skin==SKIN_FULL?"FULL":"NONE");
+    printf("built %d gpu meshes (skin=%s)\n", (int)g_gpu.size(), skinName(g_skin));
 }
 
 static void resetCamera() {
@@ -379,7 +380,7 @@ static void updateTitle() {
     char buf[400];
     snprintf(buf, sizeof(buf), "CPCW Viewer  -  %s  |  skin=%s  variant=%s  tex=%s  cull=%s  %s",
              g_srmPath.empty() ? "(no model)" : baseName(g_srmPath).c_str(),
-             g_skin==SKIN_FULL?"FULL":"NONE", var, g_useTex?"on":"off",
+             skinName(g_skin), var, g_useTex?"on":"off",
              g_cull==0?"none":(g_cull==1?"CCW":"CW"), g_wire?"[wire]":"");
     SetWindowTextA(g_hwnd, buf);
 }
@@ -422,7 +423,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case 'T': g_useTex = !g_useTex; updateTitle(); break;
         case 'C': g_cull = (g_cull + 1) % 3; updateTitle(); break;
         case 'R': resetCamera(); break;
-        case 'F': g_skin = (g_skin == SKIN_FULL) ? SKIN_NONE : SKIN_FULL; buildGpu(); updateTitle(); break;
+        case 'F': g_skin = (SkinMode)((g_skin + 1) % 3); buildGpu(); updateTitle(); break;
         case 'V': g_variant = (Variant)((g_variant + 1) % 3); buildGpu(); updateTitle(); break;
         case 'P': {
             static int n = 0;
@@ -535,7 +536,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
-        else if (a == "--skin" && i + 1 < argc) { std::string s = argv[++i]; g_skin = (s=="none")?SKIN_NONE:SKIN_FULL; }
+        else if (a == "--skin" && i + 1 < argc) { std::string s = argv[++i];
+            g_skin = (s=="none")?SKIN_NONE:(s=="full")?SKIN_FULL:SKIN_AUTO; }
         else if (a == "--variant" && i + 1 < argc) { std::string s = argv[++i];
             g_variant = (s=="standard")?VAR_STANDARD:(s=="upgraded")?VAR_UPGRADED:VAR_ALL; }
         else if (srmPath.empty()) srmPath = a;
