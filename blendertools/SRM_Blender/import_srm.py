@@ -390,6 +390,16 @@ def _variant_vertex_keep(mesh, nodes, variant):
     return [tag_by_bi[bi] in keep_tags for bi in bone_idx]
 
 
+def _mesh_is_smooth(mesh):
+    """True if the mesh is smooth-skinned (carries a BLENDINDICES stream).
+
+    Smooth meshes (characters, animals) store their vertices in MODEL space and
+    must be rendered in the bind pose; rigid meshes instead carry a single
+    bone-palette index in NORMAL byte3 and are assembled by skinning.
+    """
+    return mesh.stream_by_usage(srm_format.USAGE_BLENDINDICES) is not None
+
+
 def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
                 attach_nodes=None, variant='ALL'):
     """Build a Blender mesh datablock from an SrmNode's mesh.
@@ -429,11 +439,22 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
     normals = list(norm_stream.normals()) if norm_stream is not None else None
 
     # (1) Assemble in SRM space (skip in NONE; the object matrix places it).
+    # SMOOTH-skinned meshes (characters/animals -- a BLENDINDICES stream) store
+    # their vertices in MODEL space; the engine's per-bone skin matrix is
+    # boneWorld @ inverseBind, which at the static rest pose is IDENTITY, so the
+    # faithful result is the BIND POSE. (Applying a rigid bone transform mangles
+    # them: their NORMAL byte3 is 0, so the old code skinned every vertex to
+    # palette[0].)  We treat them exactly like NONE mode -- leave the verts in
+    # model space here and place the object by its node's world matrix in
+    # :func:`load_srm` (see ``_mesh_is_smooth``).  Rigid meshes (bone-local
+    # verts, no BLENDINDICES) still skin normally.
+    is_smooth = _mesh_is_smooth(mesh)
     bone_idx = None
-    if apply_skin != 'NONE' and nodes is not None and world_mats is not None:
+    if apply_skin != 'NONE' and not is_smooth and nodes is not None and world_mats is not None:
         bone_idx = mesh.vertex_bone_indices()
     # A named-prop mesh (speaker/awning/…) is pinned wholesale to its attach node.
-    attach_ni = _attach_override(mesh, nodes, attach_nodes) if apply_skin != 'NONE' else None
+    attach_ni = (_attach_override(mesh, nodes, attach_nodes)
+                 if (apply_skin != 'NONE' and not is_smooth) else None)
     if bone_idx is not None:
         palette = mesh.bones
         if attach_ni is not None:
@@ -599,9 +620,12 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
                 obj.data.materials.append(
                     _make_material(sm, search_dirs, import_textures,
                                    img_cache, mat_cache))
-            # With no skinning, place the mesh at its node's (Blender-space)
-            # world transform; assembled meshes already bake world+swap in.
-            if apply_skin == 'NONE':
+            # Place by the node's (Blender-space) world transform when the mesh
+            # is NOT assembled here: NONE mode (nothing skinned) OR a smooth mesh
+            # (model-space verts left in bind pose by _build_mesh). Skinned
+            # (rigid) meshes already bake world+swap into the geometry, so they
+            # stay at identity.
+            if apply_skin == 'NONE' or _mesh_is_smooth(node.mesh):
                 obj.matrix_basis = world_mats_bl[i]
             if make_vertex_groups:
                 _assign_bone_groups(obj, node.mesh, nodes)
