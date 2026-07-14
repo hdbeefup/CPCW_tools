@@ -7,7 +7,7 @@
 // Usage:
 //   cpcw_viewer <model.srm> [dataRoot] [--shot out.bmp] [--skin full|none]
 //
-// Interactive keys: LMB orbit, RMB pan, wheel zoom,
+// Interactive keys: LMB orbit, RMB pan, wheel zoom, O open file picker,
 //   W wireframe, T textures, F skin full/none, C cull cycle, R reset, Esc quit.
 
 #define WIN32_LEAN_AND_MEAN
@@ -66,9 +66,9 @@ static float g_yaw = 35, g_pitch = 22, g_dist = 10;
 static Vec3  g_center;
 static float g_radius = 5;
 static bool  g_wire = false, g_useTex = true;
-static SkinMode g_skin = SKIN_AUTO;
+static SkinMode g_skin = SKIN_FULL;
 static Variant g_variant = VAR_ALL;
-static const char* skinName(SkinMode m) { return m==SKIN_AUTO?"AUTO":(m==SKIN_FULL?"FULL":"NONE"); }
+static const char* skinName(SkinMode m) { return m==SKIN_FULL?"FULL":"NONE"; }
 static int   g_cull = 1;   // 0=none 1=CCW 2=CW
 static bool  g_dragL = false, g_dragR = false;
 static POINT g_lastMouse;
@@ -416,7 +416,7 @@ static void drawHud() {
     // key hints (bottom)
     {
         std::string l1 = "LMB orbit   RMB pan   Wheel zoom    |    W wire   T tex   L light   C cull   R reset";
-        std::string l2 = "F skin   V variant   N tree   H hud   P shot   Esc quit";
+        std::string l2 = "O open   F skin   V variant   N tree   H hud   P shot   Esc quit";
         if (g_animMotion >= 0) l2 = "Space play/pause   [ ] motion    |    " + l2;
         int bw = std::max((int)l1.size(), (int)l2.size()) * cw + 18;
         int bh = 2 * ch + 12;
@@ -532,6 +532,16 @@ static void updateTitle() {
     SetWindowTextA(g_hwnd, buf);
 }
 
+// Open a native file picker (O key) and load the chosen .srm without restarting.
+static void browseAndLoad() {
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn = {}; ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = "SRM models\0*.srm\0All\0*.*\0"; ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetOpenFileNameA(&ofn) && file[0]) loadModel(file);
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -570,10 +580,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case 'T': g_useTex = !g_useTex; updateTitle(); break;
         case 'C': g_cull = (g_cull + 1) % 3; updateTitle(); break;
         case 'R': resetCamera(); break;
+        case 'O': browseAndLoad(); break;
         case 'L': g_lightMode = (g_lightMode + 1) % 4; updateTitle(); break;
         case 'N': g_showTree = !g_showTree; break;
         case 'H': g_showHud = !g_showHud; break;
-        case 'F': g_skin = (SkinMode)((g_skin + 1) % 3); refreshGeometry(false, true); updateTitle(); break;
+        case 'F': g_skin = (SkinMode)((g_skin + 1) % 2); refreshGeometry(false, true); updateTitle(); break;
         case 'V': g_variant = (Variant)((g_variant + 1) % 3); refreshGeometry(false, true); updateTitle(); break;
         case VK_SPACE:
             if (g_animMotion >= 0) { g_playing = !g_playing; updateTitle(); }
@@ -704,7 +715,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
         else if (a == "--skin" && i + 1 < argc) { std::string s = argv[++i];
-            g_skin = (s=="none")?SKIN_NONE:(s=="full")?SKIN_FULL:SKIN_AUTO; }
+            g_skin = (s=="none")?SKIN_NONE:SKIN_FULL; }
         else if (a == "--variant" && i + 1 < argc) { std::string s = argv[++i];
             g_variant = (s=="standard")?VAR_STANDARD:(s=="upgraded")?VAR_UPGRADED:VAR_ALL; }
         else if (a == "--light" && i + 1 < argc) g_lightMode = atoi(argv[++i]) & 3;

@@ -255,7 +255,7 @@ def export_srm(context, filepath, apply_transforms=True, write_geometry=False,
 
     geo_written = 0
     if write_geometry and pmod is not None:
-        assemble = root.get('cpcw_assemble', 'AUTO')
+        assemble = root.get('cpcw_assemble', 'FULL')
         if assemble != 'NONE':
             raise RuntimeError(
                 "Geometry write-back needs the model imported with Assemble="

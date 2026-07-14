@@ -380,41 +380,26 @@ static bool variantKeep(int tag, Variant v) {
     return tag == 0 || tag == 2;   // VAR_UPGRADED
 }
 
-// AUTO heuristic (per bone-GROUP): a rigid mesh mixes bone-local parts (which
-// assemble under boneWorld) with model-space parts (buildings) and animated
-// bones whose static pose is wrong (tank road wheels). For each group we skin
-// its centroid and measure how far it MOVES relative to the mesh size; a group
-// that flies far (> FLY x extent) is either model-space or an animated floater,
-// so we LEAVE it in bind pose. Groups that assemble with small displacement
-// (vehicle hull/turret/tracks) are skinned. Verified: guardtower stays intact,
-// Patton assembles without its animated-wheel floaters. Heuristic; FULL/NONE
-// override it. Returns the set of bone-palette indices to leave in bind pose.
-static void auto_bind_groups(const SrmMesh& mesh, const SrmStream& pos,
-                             const SrmStream* nrm, const std::vector<Mat4>& world,
-                             std::set<int>& leave) {
-    if (!nrm || nrm->stride != 4) return;
-    int vc = pos.vertexCount;
-    Vec3 lo = readPos(pos, 0), hi = lo;
-    for (int i = 1; i < vc; i++) { Vec3 p = readPos(pos, i);
-        lo.x=std::min(lo.x,p.x); lo.y=std::min(lo.y,p.y); lo.z=std::min(lo.z,p.z);
-        hi.x=std::max(hi.x,p.x); hi.y=std::max(hi.y,p.y); hi.z=std::max(hi.z,p.z); }
-    float ext = std::max(hi.x-lo.x, std::max(hi.y-lo.y, hi.z-lo.z));
-    if (ext < 1e-4f) return;
-    std::map<int, std::pair<Vec3,int>> stored, skinned;
-    for (int i = 0; i < vc; i++) {
-        int b = nrm->data[(size_t)i * nrm->stride + 3];
-        int bn = (b < (int)mesh.bones.size()) ? mesh.bones[b] : -1;
-        Vec3 p = readPos(pos, i);
-        stored[b].first = stored[b].first + p; stored[b].second++;
-        Vec3 sp = (bn >= 0 && bn < (int)world.size()) ? world[bn].point(p) : p;
-        skinned[b].first = skinned[b].first + sp; skinned[b].second++;
-    }
-    for (auto& kv : stored) {
-        int b = kv.first;
-        Vec3 sc = kv.second.first * (1.0f / kv.second.second);
-        Vec3 kc = skinned[b].first * (1.0f / skinned[b].second);
-        if (std::sqrt(dot(kc - sc, kc - sc)) / ext > 1.0f) leave.insert(b);
-    }
+// Palette compaction: a BONE-palette value V does NOT index nodes directly; it
+// indexes a COMPACT bone-node array (the Ghidra model+0x180 gather). That array
+// is a file-order subset of nodes selected by the unk4 role bitfield:
+//   bone bits 0x02 (wheel) | 0x08 (deform) | 0x10 (scroll) | 0x20 (rotate).
+// A few baked "merged" tanks reference plain nodes too; there the palette
+// overflows the bone-bit subset and the array is all non-container nodes
+// (unk4 != 4). Both branches are strictly file-order subsets so result[V] is
+// monotonic. Verified corpus-wide (Vehicles/Buildings/Objects 100%).
+std::vector<int> srm_bone_node_list(const SrmModel& m) {
+    std::vector<int> c3a;
+    for (size_t i = 0; i < m.nodes.size(); i++)
+        if (m.nodes[i].unk4 & 0x3A) c3a.push_back((int)i);
+    int maxpal = -1;
+    for (const auto& mesh : m.meshes)
+        for (uint16_t v : mesh.bones) if ((int)v > maxpal) maxpal = (int)v;
+    if (maxpal < (int)c3a.size()) return c3a;
+    std::vector<int> all;
+    for (size_t i = 0; i < m.nodes.size(); i++)
+        if (m.nodes[i].unk4 != 4) all.push_back((int)i);
+    return all;
 }
 
 void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
@@ -429,6 +414,8 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
                               ? *worldOverride : srm_world_matrices(m);
     std::vector<Mat4> rot(world.size());
     for (size_t i = 0; i < world.size(); i++) { rot[i] = world[i]; for (int r=0;r<3;r++){ rot[i].m[r][3]=0; } rot[i].m[3][0]=rot[i].m[3][1]=rot[i].m[3][2]=0; }
+    // Palette value -> real node index (compaction). node = bnl[palette_value].
+    std::vector<int> bnl = srm_bone_node_list(m);
 
     for (size_t ni = 0; ni < m.nodes.size(); ni++) {
         const SrmNode& node = m.nodes[ni];
@@ -450,9 +437,6 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
         // no BLENDINDICES: their verts are in bone-LOCAL space -> skin normally.
         bool smooth = haveBones && bi && bi->stride == 4;
         bool rigid = haveBones && !smooth && nrm && nrm->stride == 4;
-        // AUTO: per-group, leave model-space / animated groups in bind pose.
-        std::set<int> autoLeave;
-        if (rigid && mode == SKIN_AUTO) auto_bind_groups(mesh, *pos, nrm, world, autoLeave);
 
         RenderMesh rm;
         rm.nodeIndex = (int)ni;
@@ -473,19 +457,22 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
                     const uint8_t* bwd = bw->data.data() + (size_t)vi * bw->stride;
                     for (int k = 0; k < 4; k++) w[k] = bwd[k] / 255.0f;
                 }
-                // dominant influence -> variant tag
+                // dominant influence -> variant tag (remap palette value -> node)
                 int best = 0; for (int k = 1; k < 4; k++) if (w[k] > w[best]) best = k;
                 int bl = bid[best];
-                if (bl < (int)mesh.bones.size()) boneNode = mesh.bones[bl];
+                if (bl < (int)mesh.bones.size()) {
+                    int V = mesh.bones[bl];
+                    if (V >= 0 && V < (int)bnl.size()) boneNode = bnl[V];
+                }
                 // Smooth: always bind pose (static skin matrix == identity).
                 wp = world[ni].point(p); wn = rot[ni].dir(nrmv);
             } else if (haveBones && rigid) {
                 const uint8_t* nd = nrm->data.data() + (size_t)vi * nrm->stride;
                 int local = nd[3];
-                int bn = (local < (int)mesh.bones.size()) ? mesh.bones[local] : -1;
+                int V = (local < (int)mesh.bones.size()) ? mesh.bones[local] : -1;
+                int bn = (V >= 0 && V < (int)bnl.size()) ? bnl[V] : -1;
                 if (bn >= 0 && bn < (int)world.size()) boneNode = bn;
-                bool doSkin = (mode == SKIN_FULL) ||
-                              (mode == SKIN_AUTO && !autoLeave.count(local));
+                bool doSkin = (mode == SKIN_FULL);
                 if (doSkin && bn >= 0 && bn < (int)world.size()) {
                     wp = world[bn].point(p); wn = rot[bn].dir(nrmv);
                 } else { wp = world[ni].point(p); wn = rot[ni].dir(nrmv); }

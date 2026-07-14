@@ -31,15 +31,15 @@ own conventions, which is exactly what a `reccmp`-style effort matches against
     always left in bind pose.
   - *Unskinned* meshes: placed by the owning node's world matrix (`T·R·S`,
     `R = Rx·Ry·Rz`, up the parent chain).
-- **The catch: the `.srm` alone can't say whether a *rigid* mesh should be
-  skinned.** A vehicle's rigid parts are bone-local (skinning assembles them);
-  a building's rigid mesh is often model-space (skinning *scatters* it) — the
-  same data, drawn differently by the game's unit-vs-building logic, which isn't
-  in the file. The **AUTO** mode (default) resolves this per bone-group: it skins
-  a group only if `boneWorld` moves its centroid a *small* amount relative to the
-  mesh size, and leaves groups that would fly far (building beams, and animated
-  road-wheel floaters) in bind pose. **FULL** applies the raw rule to everything
-  (assembles vehicles; scatters model-space buildings); **NONE** skins nothing.
+- **The bone-palette compaction.** A rigid vertex's palette value `V` is **not**
+  a direct node index — it indexes a compact, file-order bone-node subset chosen
+  by the `unk4` role bitfield (`srm_bone_node_list`; see `docs/FORMAT_SRM.md`).
+  Using `V` as a raw node index binds wheels to marker nodes → they collapse to
+  centre or float; the compaction fixes this. **FULL** (default) applies the exact
+  engine rule `v_world = boneWorld[bone_node_list[V]] · v` to every rigid vertex;
+  **NONE** skins nothing (raw bind pose). Non-animated parts are pixel-exact;
+  genuinely animated bones (tank road wheels, suspension) render in their static
+  authoring pose (their settled runtime pose is not in the file).
 - Native **left-handed** rendering: no LH→RH reflection, no winding reversal —
   the mirror-sensitive test (train lettering "DEUTSCHE BUNDESBAHN" reads
   forward; the ka_15's one-sided canopy sits correctly) passes natively.
@@ -62,7 +62,7 @@ cmake --build build --config Release
 ## Usage
 
 ```sh
-cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin auto|full|none]
+cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin full|none]
             [--variant all|standard|upgraded] [--info]
 ```
 
@@ -73,8 +73,8 @@ cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin auto|full|none]
   like `Vehicles`) for full texture coverage.
 - `--shot out.bmp` — render one frame offscreen, write a 24-bit BMP, exit
   (headless; used for the render gallery / CI-style checks).
-- `--skin auto` (default) = per-group heuristic (see above); `full` = raw rule;
-  `none` = bind pose.
+- `--skin full` (default) = exact engine rule with the palette compaction (see
+  above); `none` = raw bind pose.
 - `--variant standard|upgraded` — show only that upgrade loadout (default
   `all` shows every variant merged; see below).
 - `--info` — **no display needed**: parse the model and print node/mesh counts
@@ -82,7 +82,7 @@ cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin auto|full|none]
   a disconnected Remote Desktop session.
 
 Interactive: **LMB** orbit · **RMB** pan · **wheel** zoom · **drag-drop** a
-`.srm` to load · **W** wireframe · **T** textures · **F** skin AUTO/FULL/NONE ·
+`.srm` to load · **W** wireframe · **T** textures · **F** skin FULL/NONE ·
 **V** variant cycle · **L** light mode (3-Point / Top-Down / Flat / Unlit) ·
 **C** cull cycle · **Space** play/pause animation · **[** / **]** cycle motion ·
 **N** node tree · **H** HUD · **P** screenshot · **R** reset · **Esc**.
@@ -124,13 +124,11 @@ connected-RDP case. For inspection without any display, use `--info`.
 ## Known limits (faithful, not bugs)
 
 - **Animated bones.** A static file has no settled pose for bones the engine
-  animates per frame (tank road wheels, suspension, rotor, some prop panels).
-  Under `--skin full` these render at their un-animated transform — road
-  wheels/camo net hover above a Patton. `AUTO` hides the ones that fly far, but
-  parts that move only moderately (the Patton's wheels, the moskvitch's front
-  wheels, a tilted newsstand display board) still show their rest pose. Settling
-  them exactly needs the animation data evaluated (a future phase), not more
-  static heuristics — those would be guessing.
+  animates per frame (tank road wheels `rotate*`, suspension travel). These
+  render at their static authoring transform — a Patton's road wheels can sit
+  slightly off their settled height. Settling them exactly needs the animation
+  data evaluated at runtime (terrain-contact IK), which is not in the file — not
+  more static heuristics, which would be guessing.
 - **Diffuse alpha is a specular/team mask, not opacity** (per the format notes),
   so it's intentionally left unwired — no alpha blending. The ka_15 rotor-blur
   disc therefore draws opaque/dark rather than as a translucent disc.

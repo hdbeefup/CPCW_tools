@@ -317,42 +317,60 @@ def _build_world_matrices(nodes):
     return [world(i) for i in range(len(nodes))]
 
 
+def bone_node_list(nodes):
+    """Map a BONE-palette value V to the file-order node index it refers to.
+
+    Rigid skinning stores, per vertex, a small palette index (NORMAL byte 3) that
+    selects an entry of the mesh's BONE palette. The engine does NOT use that
+    palette value as a direct node index; it indexes a COMPACT per-bone
+    world-matrix array (Ghidra ``model+0x180`` gather, see docs/FORMAT_SRM.md).
+    That compact array is a file-order subset of nodes selected by the ``unk4``
+    role bitfield:
+
+        0x02 wheel bone | 0x08 generic deform bone | 0x10 scroll | 0x20 rotate
+        0x04 = "Merged mesh" container (never a bone) | 0x01 owns-own-mesh flag
+        0x00 = plain transform / gameplay marker (lamp/man/target/...)
+
+    Two exporter regimes, disambiguated by whether any palette value overflows
+    the bone-bit subset (both are strictly file-order subsets, so ``result[V]``
+    is monotonic):
+      * "skinned"  -> bone-bit nodes ``unk4 & 0x3A``            (the common case)
+      * "merged"   -> all non-container nodes ``unk4 != 4``     (a few baked tanks)
+
+    Returns a list ``bnl`` such that the correct node for palette value V is
+    ``bnl[V]``. Verified corpus-wide (Vehicles/Buildings/Objects 100%).
+    """
+    c3a = [i for i, n in enumerate(nodes) if (n.unk4 & 0x3A)]
+    maxpal = max([max(n.mesh.bones) for n in nodes
+                  if n.mesh is not None and n.mesh.bones] or [-1])
+    if maxpal < len(c3a):
+        return c3a
+    return [i for i, n in enumerate(nodes) if n.unk4 != 4]
+
+
 def _transform_point(m, x, y, z):
     return (m[0][0]*x + m[0][1]*y + m[0][2]*z + m[0][3],
             m[1][0]*x + m[1][1]*y + m[1][2]*z + m[1][3],
             m[2][0]*x + m[2][1]*y + m[2][2]*z + m[2][3])
 
 
-def _compact_bone_groups(pos, bidx, ratio=0.85):
-    """{bone_index: skin?} -- a group is skinned unless it spans nearly the whole
-    mesh (the static model-space body); see the 'parts' skin mode."""
-    groups = {}
-    xs = []; ys = []; zs = []
-    for vi in range(pos.vertex_count):
-        x, y, z = struct.unpack_from('<3f', pos.data, vi * pos.stride)
-        xs.append(x); ys.append(y); zs.append(z)
-        groups.setdefault(bidx[vi], []).append((x, y, z))
-    mesh_diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 +
-                 (max(zs) - min(zs)) ** 2) ** 0.5 or 1.0
-    out = {}
-    for bi, pts in groups.items():
-        gx = [p[0] for p in pts]; gy = [p[1] for p in pts]; gz = [p[2] for p in pts]
-        gdiag = ((max(gx) - min(gx)) ** 2 + (max(gy) - min(gy)) ** 2 +
-                 (max(gz) - min(gz)) ** 2) ** 0.5
-        out[bi] = (gdiag / mesh_diag) < ratio
-    return out
-
-
 def bake_skinning(nodes, mode='full'):
     """Rigidly skin each mesh in place: rewrite POSITION streams so vertices are
     transformed by their bone's world matrix, assembling articulated models.
 
-    mode 'full'  : skin every part (tanks/tracked vehicles; whole model bone-local)
-    mode 'parts' : skin only compact parts, leave the large static body in place
-                   (cars whose body shifts / wheels float in 'full')
-    Static models (buildings) should not be skinned at all -- use --no-skin.
+    Applies the exact engine rule ``v_world = boneWorld[node] . v_stored`` to
+    every rigid vertex, where ``node = bone_node_list(nodes)[palette_value]``
+    (the palette compaction -- see bone_node_list). Non-animated bones (car
+    bodies/wheels, gun, turret, window frames) reconstruct pixel-exact; genuinely
+    animated bones (tank road wheels / suspension travel) render in their static
+    authoring pose because the settled runtime pose is not stored in the file.
+    Static models (buildings) should not be skinned -- use --no-skin.
+
+    ``mode`` is accepted for CLI compatibility but only 'none' (handled by the
+    caller) skips skinning; every other value performs the faithful assembly.
     """
     world = _build_world_matrices(nodes)
+    bnl = bone_node_list(nodes)
     for node in nodes:
         if node.mesh is None:
             continue
@@ -361,15 +379,15 @@ def bake_skinning(nodes, mode='full'):
         if pos is None or bidx is None:
             continue
         pal = node.mesh.bones
-        skin_group = (_compact_bone_groups(pos, bidx) if mode == 'parts'
-                      else {bi: True for bi in set(bidx)})
+        # Remap each palette value to its real node once per mesh.
+        rpal = [bnl[v] if 0 <= v < len(bnl) else -1 for v in pal]
         data = bytearray(pos.data)
         for vi in range(pos.vertex_count):
             bi = bidx[vi]
-            if skin_group.get(bi) and 0 <= bi < len(pal) and 0 <= pal[bi] < len(world):
+            if 0 <= bi < len(rpal) and 0 <= rpal[bi] < len(world):
                 off = vi * pos.stride
                 x, y, z = struct.unpack_from('<3f', data, off)
-                nx, ny, nz = _transform_point(world[pal[bi]], x, y, z)
+                nx, ny, nz = _transform_point(world[rpal[bi]], x, y, z)
                 struct.pack_into('<3f', data, off, nx, ny, nz)
         pos.data = bytes(data)
 
@@ -787,7 +805,7 @@ def _get_texture_dirs(srm_path, data_root=None):
 
 
 def cmd_convert(filepath, output, batch=False, data_root=None, skin_mode='full'):
-    """Convert SRM to GLB. skin_mode: 'full', 'parts' or 'none'."""
+    """Convert SRM to GLB. skin_mode: 'full' or 'none'."""
     if batch:
         count = 0
         tex_found = 0
@@ -879,11 +897,10 @@ def main():
     p_conv.add_argument('-o', '--output', help='Output GLB file or directory')
     p_conv.add_argument('--batch', action='store_true', help='Batch convert directory')
     p_conv.add_argument('--no-tex', action='store_true', help='Skip texture embedding')
-    p_conv.add_argument('--skin', choices=['full', 'parts', 'none'], default='full',
-                        help="Assembly mode: 'full' skins every part (tanks etc.); "
-                             "'parts' skins only small parts and leaves the static "
-                             "body (cars whose body shifts/wheels float in full); "
-                             "'none' for static models such as buildings")
+    p_conv.add_argument('--skin', choices=['full', 'none'], default='full',
+                        help="Assembly: 'full' applies the exact engine skin rule "
+                             "(bone-palette compaction) to every part; 'none' for "
+                             "static models such as buildings")
     p_conv.add_argument('--no-skin', action='store_true',
                         help="Alias for --skin none")
 

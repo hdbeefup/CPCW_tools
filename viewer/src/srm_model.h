@@ -89,12 +89,10 @@ bool srm_parse(const std::string& path, SrmModel& out, std::string* err = nullpt
 
 // --- render build ---
 
-// AUTO  = per-mesh heuristic: skin bone-local (vehicle) meshes, leave
-//         model-space (building/character) meshes in bind pose. Default.
-// FULL  = apply the exact skin rule to every rigid mesh (assembles vehicles;
-//         scatters model-space buildings — use to see the raw rule).
-// NONE  = raw bind pose, nothing skinned.
-enum SkinMode { SKIN_AUTO, SKIN_FULL, SKIN_NONE };
+// FULL  = apply the exact engine skin rule to every rigid vertex:
+//         v_world = boneWorld[node] * v, node = bone_node_list[palette]. Default.
+// NONE  = raw bind pose, nothing skinned (each mesh placed by its node matrix).
+enum SkinMode { SKIN_FULL, SKIN_NONE };
 
 // Upgrade-variant filter. Vehicles pack every loadout in one .srm; a part's
 // variant is read from the SUFFIX of the bone it is skinned to (_std / _upg;
@@ -112,6 +110,14 @@ struct RenderMesh {
 
 // Build world matrices per node (parent chain, T*R*S, R=Rx*Ry*Rz).
 std::vector<Mat4> srm_world_matrices(const SrmModel& m);
+
+// Map a BONE-palette value V to the file-order node index it refers to. The
+// palette does NOT index nodes directly; it indexes a COMPACT bone array (the
+// Ghidra model+0x180 gather). That array is a file-order subset chosen by the
+// unk4 role bitfield: bone bits 0x02|0x08|0x10|0x20 (the common "skinned"
+// export), or all non-container nodes (unk4 != 4) for a few baked "merged"
+// tanks whose palette overflows the bone-bit subset. result[V] = node index.
+std::vector<int> srm_bone_node_list(const SrmModel& m);
 
 // World matrices with `motionIdx` evaluated at time t: each animated node's
 // local euler gets its rotation-DOF component overridden by the sampled angle

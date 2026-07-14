@@ -74,10 +74,24 @@ ParentIdx:  i32 LE (parent node index, -1 = root)   [was mislabelled "Unknown3, 
 Position:   3x f32 LE (X, Y, Z translation)
 Rotation:   3x f32 LE (X, Y, Z Euler angles in radians; compose Rx @ Ry @ Rz)
 Scale:      4x f32 LE (X, Y, Z scale + W, W typically 1.0)
-Unknown4:   u32 LE
+NodeRole:   u32 LE  (role bitfield; drives the bone-palette compaction)  [was "Unknown4"]
 MeshIndex:  i32 LE (index into the mesh block; -1 = transform-only node)  [was "Unknown5"]
 Unknown6:   i32 LE (always -1)
 ```
+
+**NodeRole (`unk4`) bitfield** — identifies each node's role and, crucially,
+which nodes make up the compact "bone" array a BONE palette indexes (see
+"Rigid skinning / assembly"):
+
+| bit  | value | meaning |
+|------|-------|---------|
+| 0x01 | 1     | node owns its own MESH chunk (modifier flag) |
+| 0x02 | 2     | wheel deform-bone (`wheel*`, `bodybone`) |
+| 0x04 | 4     | "Merged mesh" **container** node — never a skin bone |
+| 0x08 | 8     | generic deform-bone (body, wheels, gun/turret, antennas) |
+| 0x10 | 16    | scroll bone (track-scroll animation) |
+| 0x20 | 32    | rotate bone (road-wheel spin animation) |
+| 0x00 | 0     | plain transform / gameplay marker (lamp/man/target/entrance/suspension/shadow) |
 
 **Per-node fixed data after name: 56 bytes** (4 + 12 + 12 + 16 + 4 + 4 + 4)
 
@@ -286,8 +300,33 @@ The D3D9 draw and the CPU-side matrix-palette fill were both traced (hard
 decompiled evidence; full write-up in `N:\gamePAKdata\re\SKINNING_RESULT.md`).
 The per-vertex transform is:
 
-> **`v_world = boneWorld[ BONE_palette[boneIdx] ] · v_stored`** — the bone's node
-> **world matrix**, with **NO inverse-bind**. `boneIdx` = NORMAL-stream byte 3.
+> **`v_world = boneWorld[ node ] · v_stored`** — the bone's node **world matrix**,
+> with **NO inverse-bind**. `boneIdx` = NORMAL-stream byte 3 selects a BONE-palette
+> value `V = BONE[boneIdx]`, and `node = bone_node_list(nodes)[V]` (see next).
+
+**The palette compaction — `V` is NOT a direct node index (RESOLVED).**
+The Ghidra gather (below) reads `SkinMatrices[i] = model+0x180[ BONE[i] ]`. The
+population of that `model+0x180` array was the one undecoded residual gap in
+`SKINNING_RESULT.md` §5/§8 — and it is **not** the raw file-order node array: it
+is a **compact, file-order subset of nodes** selected by the `NodeRole` (`unk4`)
+bitfield. Indexing the full node array directly (as the old tooling did) binds
+wheels to lamp/man marker nodes → wheels collapse to the model centre or float
+off. The correct rule (`bone_node_list`, verified corpus-wide, Vehicles/
+Buildings/Objects 100%):
+
+```
+c3a = [i for i,n in enumerate(nodes) if (n.unk4 & 0x3A)]   # bone bits 0x02|0x08|0x10|0x20
+if max(all BONE palette values) < len(c3a):
+    bone_node_list = c3a                                    # "skinned" export (common)
+else:
+    bone_node_list = [i for i,n in enumerate(nodes) if n.unk4 != 4]   # "merged" export
+node = bone_node_list[V]
+```
+
+Two exporter regimes (the same tank ships both ways); both are strictly
+file-order subsets, so `bone_node_list[V]` is monotonic. Implemented identically
+in `cpcw_srm.py` (`bone_node_list`), `blendertools/SRM_Blender/srm_format.py`,
+and `viewer/src/srm_model.cpp` (`srm_bone_node_list`).
 
 Evidence:
 - SRM meshes draw through the **programmable (vertex-shader) pipeline** — the SRM
@@ -298,8 +337,10 @@ Evidence:
 - The bone-matrix palette is filled by `FUN_004c0160` (loop `0x004c0330`–`…3ea`)
   and uploaded as the named shader constant `SkinMatrices` (string @ `0x00f79bac`).
   The loop is a **pure gather**: `palette[i] = worldMatrix[ BONE[i] ]` — read the
-  u16 node index, `×64` (matrix stride), index the per-node world-matrix array at
+  u16 index, `×64` (matrix stride), index the **compact** world-matrix array at
   `model+0x180`, append the pointer. **No matrix multiply, no inverse in the loop.**
+  (`model+0x180` is the compacted bone-node array decoded above, *not* every
+  node — see "The palette compaction".)
 - **No inverse-bind exists to fold in:** the node struct exposes only *forward*
   matrices (`LocalMatrix`, `WorldMatrix` @ `node+0x168`, `Transform`); there is no
   `InvBind`/`BindPose`/`RestPose` field in the struct and **no such string anywhere
@@ -314,20 +355,33 @@ engine computes their world matrix each frame, so their settled at-rest pose is
 **not in the static file** — skinning by the static hierarchy value can leave those
 parts slightly off (e.g. a wheel/suspension-bound body floats).
 
-Import modes reflect this:
-- **`FULL`** applies the game's exact rule to every vertex — faithful to the file,
-  but animated-bone-bound parts render in their static (un-settled) pose.
-- **`AUTO`** (default) additionally skips skinning a group when doing so would
-  shove a large body off centre — a practical heuristic that hides the
-  animated-rest gap on civilian cars; it is *not* a decoded flag.
+Import/viewer modes:
+- **`FULL`** (default) applies the game's exact rule to every vertex — with the
+  palette compaction, non-animated parts (car bodies/wheels, gun, turret, window
+  frames, building panels) are pixel-correct. Genuinely animated bones (tank road
+  wheels `rotate*`, suspension travel) render in their static (un-settled) pose,
+  since that settled pose is computed at runtime and is not in the file.
 - **`NONE`** leaves the raw bind pose (each mesh placed by its node matrix only).
+
+*(An earlier `AUTO` "fly" heuristic and a name-matching `_attach_override` were
+removed: both existed only to paper over the missing palette compaction — with
+`bone_node_list` correct, every part binds to the right node, so props like the
+moskvitch roof speaker and the ka_15 window seat natively.)*
 
 ## Upgrade variants (node-name convention)
 
-Vehicles pack **every upgrade loadout into one .srm** (the shipped file has a few
-pre-merged meshes named `Merged mesh N`, each skinned to a mixed bone palette).
+Vehicles pack **every upgrade loadout into one .srm**. The shipped file has a few
+pre-merged meshes named `Merged mesh N` — these are produced by the **game's own
+authoring/export tool**, which combines many parts (body + wheels + window + …)
+into a few vertex buffers, each skinned to a *mixed* bone palette (that is why a
+single `Merged mesh` node can carry a whole vehicle). They are **not** an artefact
+of any tool in this repo, and there is no merge/join code here — the importer's
+job is to *un-merge* them by skinning each vertex to its real bone via the palette
+compaction above.
+
 A part's variant is read from the **`_std` / `_upg` suffix on the name of the
-bone it is skinned to**:
+bone it is skinned to** (resolved through `bone_node_list`, not the raw palette
+value):
 
 | Bone-name suffix | Variant part |
 |------------------|--------------|

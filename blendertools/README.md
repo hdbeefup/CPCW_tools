@@ -38,18 +38,16 @@ ProtoDB.bin                                       # prototype DB (for future mod
   The left-handed→right-handed conversion is baked into geometry (models import
   upright and un-mirrored); the root Empty carries only the uniform scale.
   - **Assemble** modes:
-    - **Auto** — *default*. Decides **per bone-group**: skins a group only if its
-      bone's world matrix moves the group centroid a *small* amount relative to
-      the mesh size, and leaves groups that would fly far — model-space building
-      parts (whole walls/beams) and animated-bone floaters (tank road wheels) —
-      in bind pose. One setting for tanks, cars, aircraft *and* buildings.
+    - **Full** — *default*. Applies the exact engine rule to every rigid vertex:
+      `v_world = BoneWorld[node] @ v`, where `node` comes from the bone-palette
+      compaction (`srm_format.bone_node_list`; a rigid vertex's palette value is
+      **not** a direct node index — it indexes a compact bone-node subset chosen
+      by the `unk4` role bitfield). Non-animated parts (car bodies/wheels, gun,
+      turret, window frames, building panels) are pixel-exact. Genuinely animated
+      bones (tank road wheels `rotate*`, suspension travel) render in their static
+      authoring pose — their settled runtime pose is not in the file.
       (Smooth-skinned meshes — characters/animals, with a BLENDINDICES stream —
-      are always bind pose; see the format notes.) An inferred proxy for the
-      engine's unstored inverse-bind, not a decoded flag; if a model looks wrong,
-      try the overrides below. Matches the standalone `viewer/` AUTO mode.
-    - **Full (debug)** — skins *every* rigid group by its bone (the exact engine
-      rule): assembles fully-articulated vehicles, but *scatters* model-space
-      buildings and floats animated bones.
+      are always bind pose; see the format notes.)
     - **Off (raw bind pose)** — no skinning; each mesh placed by its node matrix.
   - **Variant** — vehicles pack every upgrade loadout into one file; the part's
     variant is read from the bone it is skinned to (`_std` / `_upg` / `camo`).
@@ -119,16 +117,17 @@ converter got wrong:
   bakes a **reflection** into geometry: swap `(x,y,z)→(x,z,y)` on positions and
   normals (det −1) and **reverse triangle winding**; node/bone matrices are
   conjugated `P·M·P` so the skeleton still assembles.
-- **Rigid skinning + AUTO assembly.** Each vertex stores a **bone-palette index
-  in byte 3 of the NORMAL stream** (`Usage == 3`; corpus-verified
-  `max(byte3) <= bone_count-1`). The game renders `BoneWorld[b] @ InvBind[b] @ v`
-  but stores no InvBind, so **Auto** mode uses a per-group proxy: for each
-  bone-group, skin it by its bone matrix only if that moves the group's centroid
-  a small amount relative to the mesh size, else leave it in bind pose. This skins
-  bone-local vehicle parts (hull/turret/tracks) while leaving model-space building
-  parts and animated-bone floaters where they belong. It matches every tested
-  model (and the standalone `viewer/`) but is an inferred heuristic, not a decoded
-  flag — `Full`/`Off` remain as overrides. Rotations compose `Rx @ Ry @ Rz`.
+- **Rigid skinning + palette compaction.** Each vertex stores a **bone-palette
+  index in byte 3 of the NORMAL stream** (`Usage == 3`; corpus-verified
+  `max(byte3) <= bone_count-1`) that selects a BONE-palette value `V`. Crucially,
+  `V` is **not** a direct node index — it indexes a compact, file-order bone-node
+  subset chosen by the `unk4` role bitfield (`srm_format.bone_node_list`; bone bits
+  `0x02|0x08|0x10|0x20`, or all non-container nodes for a few "merged" tanks). The
+  game renders `v_world = BoneWorld[bone_node_list[V]] @ v`, no InvBind (none is
+  stored). **Full** applies this to every rigid vertex and is pixel-exact for
+  non-animated bones. (Using `V` as a raw node index — the old bug — bound wheels
+  to lamp/man markers, collapsing or floating them.) Rotations compose
+  `Rx @ Ry @ Rz`.
 - **Smooth-skinned meshes (characters/animals) render in bind pose.** These carry
   explicit BLENDINDICES (`Usage == 2`) + BLENDWEIGHT (`Usage == 1`) streams and
   store their vertices in **model space**. The engine's per-bone skin matrix is

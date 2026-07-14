@@ -7,10 +7,9 @@ CPCW models are rigidly skinned: each mesh vertex is stored in the local space
 of one skeleton bone (the bone-palette index is byte 3 of the normal stream) and
 the skeleton is a node hierarchy (each node's parent is its `unk3`). Assembly is
 two steps: (1) transform each vertex by its bone's composed world matrix -- the
-game's proven rule is exactly `v_world = BoneWorld[bone] @ v_stored`, no
-inverse-bind (FULL); AUTO additionally leaves a body anchored to an animated node
-in place, since that node's settled rest pose is not in the static file (see
-`_skin_decisions`); then
+game's proven rule is exactly `v_world = BoneWorld[node] @ v_stored`, no
+inverse-bind, where `node` comes from the bone-palette compaction (see
+`srm_format.bone_node_list`); then
 (2) convert SRM's DirectX LEFT-handed Y-up frame to Blender's right-handed Z-up
 by BAKING a reflection into the geometry -- swap (x,y,z)->(x,z,y) and reverse
 triangle winding (see `_HAND`). The old importer used a pure rotation Rx(90) for
@@ -260,72 +259,6 @@ def _build_world_matrices(nodes):
     return [world(i) for i in range(len(nodes))]
 
 
-def _skin_decisions(verts, bone_idx, palette, world_mats, fly=1.0):
-    """Decide, per bone-palette group, whether to SKIN it or LEAVE it (bind pose).
-
-    Ports the standalone viewer's per-group rule (``auto_bind_groups`` in
-    ``viewer/src/srm_model.cpp``). A rigid mesh mixes bone-local parts (which
-    assemble under ``BoneWorld[b] @ v``) with model-space parts (whole buildings)
-    and animated bones whose static pose is wrong (tank road wheels). For each
-    group we skin its centroid by its bone's world matrix and measure how far it
-    MOVES relative to the mesh size: a group that flies far (> ``fly`` x extent)
-    is model-space or an animated floater, so we LEAVE it in bind pose; groups
-    that assemble with small displacement (vehicle hull/turret/tracks) are
-    skinned. (Mesh-owning nodes are identity in the corpus, so a left group's
-    stored coords already ARE its bind-pose world position.)
-
-    This replaces the earlier dominant-body / off-centre proxy, which mis-skinned
-    model-space rigid *buildings* (e.g. the guardtower exploded). Still a
-    heuristic — the .srm does not flag skin-vs-static, the game decides by object
-    type — so ``FULL`` / ``OFF`` remain as overrides.
-
-    Returns ``{palette_index: skin_bool}``.
-    """
-    xs = [p[0] for p in verts]; ys = [p[1] for p in verts]; zs = [p[2] for p in verts]
-    ext = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1.0
-    groups = {}
-    for vi, bi in enumerate(bone_idx):
-        groups.setdefault(bi, []).append(verts[vi])
-    out = {}
-    for bi, pts in groups.items():
-        n = len(pts)
-        cx = sum(p[0] for p in pts) / n
-        cy = sum(p[1] for p in pts) / n
-        cz = sum(p[2] for p in pts) / n
-        bn = palette[bi] if 0 <= bi < len(palette) else -1
-        if 0 <= bn < len(world_mats):
-            sc = world_mats[bn] @ Vector((cx, cy, cz))
-            disp = ((sc.x - cx) ** 2 + (sc.y - cy) ** 2 + (sc.z - cz) ** 2) ** 0.5
-            out[bi] = (disp / ext) <= fly
-        else:
-            out[bi] = False
-    return out
-
-
-def _attach_override(mesh, nodes, attach_nodes):
-    """Return a node index a whole mesh should be pinned to, or None.
-
-    A few add-on props (the moskvitch's roof *speaker*, a Studebaker *awning*, a
-    *helipad*) are separate meshes named after a dedicated attach node (unk4=8,
-    no mesh of its own). The mesh-merge that produced the shipped .srm rebound
-    them to an unrelated physics/suspension bone, so their bone palette places
-    them wrong. When a mesh's texture basename exactly matches such an attach
-    node — and that node is NOT already in its palette — pin the whole mesh to
-    it. Corpus-verified: this fires on exactly 3 of 2087 models, all genuine
-    prop attachments, so it cannot mis-skin ordinary meshes.
-    """
-    if not attach_nodes:
-        return None
-    palette = set(mesh.bones)
-    for sm in mesh.submeshes:
-        for tex in sm.textures.values():
-            base = os.path.splitext(os.path.basename(tex.replace('\\', '/')))[0].lower()
-            ni = attach_nodes.get(base)
-            if ni is not None and ni not in palette:
-                return ni
-    return None
-
-
 # Upgrade-variant convention (baked into node names by the authoring tool):
 # vehicles pack every loadout in one .srm. A part's variant is read from the
 # name of the bone it is skinned to -- the ``_std`` / ``_upg`` SUFFIX marks the
@@ -362,9 +295,11 @@ def _variant_vertex_keep(mesh, nodes, variant):
     if not bone_idx:
         return None
     palette = mesh.bones
+    bnl = srm_format.bone_node_list(nodes)
     tag_by_bi = {}
     for bi in set(bone_idx):
-        ni = palette[bi] if 0 <= bi < len(palette) else -1
+        v = palette[bi] if 0 <= bi < len(palette) else -1
+        ni = bnl[v] if 0 <= v < len(bnl) else -1
         nm = nodes[ni].name if 0 <= ni < len(nodes) else ''
         tag_by_bi[bi] = _variant_tag(nm)
     if all(t == 'BASE' for t in tag_by_bi.values()):
@@ -382,21 +317,22 @@ def _mesh_is_smooth(mesh):
     return mesh.stream_by_usage(srm_format.USAGE_BLENDINDICES) is not None
 
 
-def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
-                attach_nodes=None, variant='ALL'):
+def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='FULL',
+                variant='ALL'):
     """Build a Blender mesh datablock from an SrmNode's mesh.
 
     CPCW meshes are rigidly skinned: each vertex carries a bone-palette index
     (byte 3 of the normal stream).  We (1) assemble in SRM space by transforming
-    each vertex by its bone's world matrix -- per :func:`_skin_decisions`, which
-    skins articulated/bone-local parts and leaves already-posed model-space
-    bodies -- then (2) BAKE the LH->RH handedness swap into the result: swap each
-    position/normal component (x,y,z)->(x,z,y) and REVERSE triangle winding so
-    faces stay outward (see :data:`_HAND`).
+    each vertex by its bone's world matrix -- the exact engine rule
+    ``v_world = BoneWorld[node] @ v`` where ``node`` comes from the palette
+    compaction (:func:`srm_format.bone_node_list`) -- then (2) BAKE the LH->RH
+    handedness swap into the result: swap each position/normal component
+    (x,y,z)->(x,z,y) and REVERSE triangle winding so faces stay outward (see
+    :data:`_HAND`).
 
-    ``apply_skin``:  'AUTO' = the true per-group rule (default);  'FULL' = skin
-    every group (debug/fully-articulated);  'NONE' = raw bind pose, no skinning
-    (mesh is placed by its node's world matrix in :func:`load_srm`).
+    ``apply_skin``:  'FULL' = skin every rigid vertex (default);  'NONE' = raw
+    bind pose, no skinning (mesh is placed by its node's world matrix in
+    :func:`load_srm`).
     """
     mesh = node.mesh
     pos_stream = mesh.stream_by_usage(srm_format.USAGE_POSITION)
@@ -434,24 +370,19 @@ def _build_mesh(node, name, nodes=None, world_mats=None, apply_skin='AUTO',
     bone_idx = None
     if apply_skin != 'NONE' and not is_smooth and nodes is not None and world_mats is not None:
         bone_idx = mesh.vertex_bone_indices()
-    # A named-prop mesh (speaker/awning/…) is pinned wholesale to its attach node.
-    attach_ni = (_attach_override(mesh, nodes, attach_nodes)
-                 if (apply_skin != 'NONE' and not is_smooth) else None)
     if bone_idx is not None:
         palette = mesh.bones
-        if attach_ni is not None:
-            skin_group = {bi: True for bi in set(bone_idx)}
-        elif apply_skin == 'FULL':
-            skin_group = {bi: True for bi in set(bone_idx)}
-        else:  # 'AUTO'
-            skin_group = _skin_decisions(verts, bone_idx, palette, world_mats)
+        # Remap each palette value to its real node (the compaction) then skin
+        # every rigid vertex by that node's world matrix -- the exact engine rule.
+        bnl = srm_format.bone_node_list(nodes)
+        node_of_local = [bnl[v] if 0 <= v < len(bnl) else -1 for v in palette]
         rot3 = [wm.to_3x3() for wm in world_mats]
         out_v = []
         out_n = [] if normals is not None else None
         for vi, p in enumerate(verts):
             bi = bone_idx[vi]
-            bn = attach_ni if attach_ni is not None else (palette[bi] if 0 <= bi < len(palette) else -1)
-            if skin_group.get(bi) and 0 <= bn < len(world_mats):
+            bn = node_of_local[bi] if 0 <= bi < len(node_of_local) else -1
+            if 0 <= bn < len(world_mats):
                 v = world_mats[bn] @ Vector(p)
                 out_v.append((v.x, v.y, v.z))
                 if out_n is not None and vi < len(normals):
@@ -517,10 +448,15 @@ def _assign_bone_groups(obj, srm_mesh, nodes):
     palette = srm_mesh.bones
     if len(bidx) != len(obj.data.vertices):
         return  # vertex counts must line up to map groups safely
+    # Groups are NAMED after the real (remapped) node, but cpcw_bone_map records
+    # the RAW palette value V so the exporter reconstructs mesh.bones verbatim
+    # (byte-faithful round-trip). Only the display name changes.
+    bnl = srm_format.bone_node_list(nodes)
     group_of_pi = {}
     name_map = {}
     used = set()
-    for pi, nidx in enumerate(palette):
+    for pi, V in enumerate(palette):
+        nidx = bnl[V] if 0 <= V < len(bnl) else -1
         base = (nodes[nidx].name if 0 <= nidx < len(nodes) and nodes[nidx].name
                 else "bone_%d" % pi)
         nm = base
@@ -529,7 +465,7 @@ def _assign_bone_groups(obj, srm_mesh, nodes):
             nm = "%s.%03d" % (base, k); k += 1
         used.add(nm)
         group_of_pi[pi] = obj.vertex_groups.new(name=nm)
-        name_map[nm] = nidx
+        name_map[nm] = V
     buckets = {}
     for vi, bi in enumerate(bidx):
         if 0 <= bi < len(palette):
@@ -540,9 +476,9 @@ def _assign_bone_groups(obj, srm_mesh, nodes):
 
 
 def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
-             apply_skin='AUTO', show_skeleton=False, variant='STANDARD',
+             apply_skin='FULL', show_skeleton=False, variant='STANDARD',
              make_vertex_groups=True):
-    """Import an SRM file. apply_skin is 'AUTO', 'FULL' or 'NONE'.
+    """Import an SRM file. apply_skin is 'FULL' or 'NONE'.
 
     ``variant`` selects the upgrade loadout for vehicles that pack several into
     one .srm: 'STANDARD' (base + std parts, the clean default), 'UPGRADED'
@@ -551,9 +487,6 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
     """
     nodes = srm_format.parse_srm(filepath)
     world_mats = _build_world_matrices(nodes)
-    # Named attach nodes (unk4=8, no mesh) for prop meshes (see _attach_override).
-    attach_nodes = {n.name.lower(): i for i, n in enumerate(nodes)
-                    if n.mesh is None and n.unk4 == 8 and n.name}
     # Node/bone world matrices expressed in Blender space: conjugate by the
     # handedness swap (P @ M @ P, P == P**-1) so Empties and NONE-mode meshes
     # sit consistently with the baked geometry and stay proper rotations.
@@ -591,7 +524,7 @@ def load_srm(context, filepath, scale=1.0, import_textures=True, texture_dir="",
 
         if node.mesh:
             bl_mesh = _build_mesh(node, obj_name, nodes, world_mats, apply_skin,
-                                  attach_nodes, variant)
+                                  variant)
             # Whole mesh filtered out by the variant selection (e.g. an all-camo
             # merged mesh under STANDARD): drop it rather than leave loose verts.
             if bl_mesh is not None and variant != 'ALL' and not bl_mesh.polygons:
@@ -665,23 +598,17 @@ class IMPORT_OT_cpcw_srm(bpy.types.Operator, ImportHelper):
         name="Assemble",
         description="How to assemble the model from its skeleton",
         items=[
-            ('AUTO', "Auto (recommended)",
-             "A practical heuristic over the game's rule: skin articulated/"
-             "bone-local parts (wheels, turret, tracks, rotors, panels, hulls) "
-             "into place, but LEAVE a large body that is merely anchored to an "
-             "animated side node (e.g. a civilian car body) where it sits, since "
-             "that node's settled rest pose isn't in the file. Best-looking on "
-             "tested cars, tanks, aircraft and buildings"),
             ('FULL', "Full (game's exact rule)",
              "Apply the engine's proven transform to every vertex: "
-             "world = BoneWorld[bone] @ v (a stored node world matrix per bone, "
-             "no inverse-bind; verified in the binary). Exact for non-animated "
-             "bones; animated-bone-bound parts (tank road wheels, a suspension-"
-             "anchored body) render in their static, un-settled pose"),
+             "world = BoneWorld[node] @ v, where node comes from the bone-palette "
+             "compaction (no inverse-bind; verified in the binary). Exact for "
+             "non-animated bones (car bodies/wheels, gun, turret, window frames); "
+             "genuinely animated-bone-bound parts (tank road wheels, suspension "
+             "travel) render in their static, un-settled pose"),
             ('NONE', "Off (raw bind pose)",
              "No skinning; each mesh placed by its node's world matrix only"),
         ],
-        default='AUTO',
+        default='FULL',
     )
     variant: EnumProperty(
         name="Variant",

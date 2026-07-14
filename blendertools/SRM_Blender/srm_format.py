@@ -200,6 +200,35 @@ def parse_srm(filepath):
     return nodes
 
 
+def bone_node_list(nodes):
+    """Map a BONE-palette value V to the file-order node index it refers to.
+
+    A rigid vertex's palette value is NOT a direct node index; the engine indexes
+    a COMPACT per-bone world-matrix array (the Ghidra ``model+0x180`` gather; see
+    docs/FORMAT_SRM.md). That array is a file-order subset of nodes selected by
+    the ``unk4`` role bitfield:
+
+        0x02 wheel bone | 0x08 generic deform bone | 0x10 scroll | 0x20 rotate
+        0x04 = "Merged mesh" container (never a bone) | 0x01 owns-own-mesh flag
+        0x00 = plain transform / gameplay marker (lamp/man/target/...)
+
+    Two exporter regimes, disambiguated by whether any palette value overflows the
+    bone-bit subset (both branches are strictly file-order subsets, so
+    ``result[V]`` is monotonic):
+      * "skinned" -> bone-bit nodes ``unk4 & 0x3A``          (the common case)
+      * "merged"  -> all non-container nodes ``unk4 != 4``   (a few baked tanks)
+
+    Returns ``bnl`` such that the correct node for palette value V is ``bnl[V]``.
+    Verified corpus-wide (Vehicles/Buildings/Objects 100%).
+    """
+    c3a = [i for i, n in enumerate(nodes) if (n.unk4 & 0x3A)]
+    maxpal = max([max(n.mesh.bones) for n in nodes
+                  if n.mesh is not None and n.mesh.bones] or [-1])
+    if maxpal < len(c3a):
+        return c3a
+    return [i for i, n in enumerate(nodes) if n.unk4 != 4]
+
+
 def _parse_pmod(data, start, end):
     """Parse a PMOD chunk into a list of SrmNode.
 
