@@ -1509,14 +1509,17 @@ def cmd_scene(mf, output=None):
                     scene['terrain']['colormap'] = os.path.basename(rgb)
     for e in mf.get_entities():
         pos = e.get('Pos') or [0, 0, 0]
+        t = e.get('_type', '?')
+        kind = 1 if t == 'SBuildingUnitDesc' else (0 if t == 'SDoodadDesc' else 2)
         scene['entities'].append({
-            'type': e.get('_type', '?'),
+            'type': t,
             'proto': e.get('Prototype', ''),
             'pos': [round(float(pos[0]), 3), round(float(pos[1]), 3),
                     round(float(pos[2]), 3)] if len(pos) >= 3 else [0, 0, 0],
             'dir': e.get('Dir', 0.0),
             'player': e.get('Player', 0),
             'id': e.get('ID', 0),
+            'kind': kind,   # 0 doodad, 1 building/unit, 2 effect/sound/deformer
         })
     text = json.dumps(scene, separators=(',', ':'))
     if output and output != '-':

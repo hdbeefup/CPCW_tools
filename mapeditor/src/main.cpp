@@ -56,6 +56,8 @@ static char  g_mapPath[512] = "(no map loaded)";
 static char  g_openPath[512] = "";
 static bool  g_openPopup = false;
 static bool  g_orbiting = false, g_panning = false;
+static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
+static bool  g_entDirty = false;
 
 static void glfwError(int e, const char* d) { fprintf(stderr, "GLFW %d: %s\n", e, d); }
 
@@ -153,6 +155,7 @@ static bool parseScene(const std::string& txt, const std::string& baseDir, Scene
             if (d.is_number()) en.dir = d.get<float>();
             else if (d.is_array() && !d.empty() && d[0].is_number()) en.dir = d[0].get<float>();
             en.player = e.value("player", 0);
+            en.kind = e.value("kind", 0);
             auto idv = e.value("id", nlohmann::json(0));
             if (idv.is_number_integer()) en.id = idv.get<long>();
             s.entities.push_back(std::move(en));
@@ -291,6 +294,12 @@ static void drawEntities() {
     snprintf(title, sizeof(title), "Entities (%d)###ents", (int)g_scene.entities.size());
     if (ImGui::Begin(title, &g_showEntities)) {
         if (!g_scene.loaded) ImGui::TextDisabled("No map loaded (File > Open).");
+        bool ch = false;
+        ch |= ImGui::Checkbox("Doodads", &g_showKind[0]); ImGui::SameLine();
+        ch |= ImGui::Checkbox("Buildings", &g_showKind[1]); ImGui::SameLine();
+        ch |= ImGui::Checkbox("Effects", &g_showKind[2]);
+        if (ch) g_entDirty = true;
+        ImGui::Separator();
         ImGuiListClipper clip; clip.Begin((int)g_scene.entities.size());
         while (clip.Step())
             for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
@@ -384,7 +393,8 @@ int main(int argc, char** argv) {
 
     // headless render-to-BMP: one frame of the 3D scene, full framebuffer, exit.
     if (!shotPath.empty()) {
-        g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene); g_sceneDirty = false;
+        g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+        g_sceneDirty = false;
         int fbw = 1360, fbh = 850;
         // render into an offscreen FBO (reliable regardless of window visibility)
         GLuint fbo, tex, rbo;
@@ -452,7 +462,11 @@ int main(int argc, char** argv) {
         ImGui::End();
 
         if (g_sceneDirty && g_glReady) {
-            g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene); g_sceneDirty = false;
+            g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+            g_sceneDirty = false;
+        }
+        if (g_entDirty && g_glReady) {
+            g_vp.buildEntities(g_scene, g_showKind); g_entDirty = false;
         }
 
         ImGui::Render();

@@ -98,8 +98,10 @@ public:
         entProg = glProgram(
             "#version 330 core\n"
             "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aCol;\n"
+            "layout(location=2) in float aSize;\n"
             "uniform mat4 uMVP; uniform float uSize; out vec3 vCol;\n"
-            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=uSize; vCol=aCol; }\n",
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0);\n"
+            " gl_PointSize = uSize > 0.0 ? uSize : aSize; vCol=aCol; }\n",
             "#version 330 core\n"
             "in vec3 vCol; out vec4 F; uniform int uWhite;\n"
             "void main(){ vec2 c=gl_PointCoord*2.0-1.0; if(dot(c,c)>1.0) discard;\n"
@@ -153,17 +155,25 @@ public:
         glBindVertexArray(0);
     }
 
-    void buildEntities(const Scene& s) {
+    // Rebuild the entity point cloud. ``show[kind]`` toggles visibility per
+    // category (0 doodad, 1 building, 2 effect); hidden ones get size 0 (so the
+    // VBO index still equals the entity index for selection). Marker size scales
+    // with category so gameplay buildings stand out over doodad clutter.
+    void buildEntities(const Scene& s, const bool show[3] = nullptr) {
         entCount = (int)s.entities.size();
         if (entCount == 0) return;
         static const float pal[8][3] = {
             {0.8f,0.8f,0.8f},{0.86f,0.27f,0.27f},{0.27f,0.47f,0.86f},{0.31f,0.78f,0.35f},
             {0.86f,0.78f,0.27f},{0.78f,0.35f,0.82f},{0.31f,0.82f,0.82f},{0.90f,0.55f,0.24f}};
-        std::vector<float> v; v.reserve((size_t)entCount*6);
+        static const float kindSize[3] = {4.0f, 10.0f, 6.0f};  // doodad / building / effect
+        std::vector<float> v; v.reserve((size_t)entCount*7);
         for (const Entity& e : s.entities) {
             const float* c = pal[((e.player%8)+8)%8];
+            int k = (e.kind >= 0 && e.kind < 3) ? e.kind : 2;
+            float sz = (show && !show[k]) ? 0.0f : kindSize[k];
             v.push_back(e.pos[0]); v.push_back(e.pos[2]); v.push_back(e.pos[1]); // X, elev, Y
             v.push_back(c[0]); v.push_back(c[1]); v.push_back(c[2]);
+            v.push_back(sz);
         }
         if (!entVAO) glGenVertexArrays(1,&entVAO);
         if (!entVBO) glGenBuffers(1,&entVBO);
@@ -171,9 +181,11 @@ public:
         glBindBuffer(GL_ARRAY_BUFFER, entVBO);
         glBufferData(GL_ARRAY_BUFFER, v.size()*sizeof(float), v.data(), GL_STATIC_DRAW);
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,7*sizeof(float),(void*)0);
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,7*sizeof(float),(void*)(3*sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2,1,GL_FLOAT,GL_FALSE,7*sizeof(float),(void*)(6*sizeof(float)));
         glBindVertexArray(0);
     }
 
@@ -194,7 +206,7 @@ public:
         if (entCount) {
             glUseProgram(entProg);
             glUniformMatrix4fv(uEntMVP,1,GL_FALSE,mvp.m);
-            glUniform1i(uEntWhite,0); glUniform1f(uEntSize,7.0f);
+            glUniform1i(uEntWhite,0); glUniform1f(uEntSize,0.0f);  // 0 => per-vertex size
             glBindVertexArray(entVAO);
             glDrawArrays(GL_POINTS, 0, entCount);
             if (selected >= 0 && selected < entCount) {

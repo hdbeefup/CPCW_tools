@@ -9,6 +9,7 @@ struct Entity {
     float dir = 0;
     int player = 0;
     long id = 0;
+    int kind = 0;   // 0 doodad, 1 building/unit, 2 effect/sound/deformer
 };
 
 struct Scene {
