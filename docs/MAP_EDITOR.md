@@ -89,12 +89,17 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       central node. Compact GL loader (`glcore.h`), no glad/glew. Heightmap via a
       raw-f32 sidecar from `cpcw_map.py scene`; NaN sentinel cells sanitised.
       Verified with `--shot` FBO render-to-BMP (Ring of Fire, Fields of Glory).
-- [~] **M5b — splat-textured terrain** (done): `cpcw_map.py` gains `get_splatmap`
+- [x] **M5b — splat-textured terrain**: `cpcw_map.py` gains `get_splatmap`
       (upstreamed from the Blender fork) + a ground-type palette; `scene` bakes a
-      per-vertex RGB colormap sidecar; the editor colours the terrain by it (grass/
-      field/road/water/rock), height-ramp fallback when absent. Still TODO under
-      M5b: **port parse/write to C++** (drop the Python bridge) and render real
-      entity **models** (reuse the `.srm` loader) instead of point markers.
+      per-vertex RGB colormap sidecar; the editor colours the terrain by it.
+- [x] **M5c — native C++ .map parser** (`mapfile.cpp`): a faithful port of
+      `cpcw_map.py` (chunk tree, SCHD schemas, OBJT/VOBJ entities, heightmap
+      locator, splatmap colormap). The editor loads `.map` **directly, no Python**.
+      Verified vs the Python oracle: entity counts / grid dims / render match
+      exactly (Ring of Fire 779, Fields of Glory 2116, Grinder 805, M_02 3152).
+      `cpcw_map.py` still handles the byte-faithful **save** path.
+- [ ] **M5d** — render real entity **models** (reuse the `.srm` loader) instead of
+      point markers (ties into the open handedness question, Finding 1).
 - [~] **M6 — GUI editing** (started): the Properties panel edits a selected
       entity's Player/Pos; File > Save edits (Ctrl+S) writes the changes back
       through `cpcw_map.py apply` to `<map>_edited.map` (never overwrites the

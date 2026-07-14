@@ -18,6 +18,7 @@
 #include "glcore.h"
 #include "scene.h"
 #include "viewport3d.h"
+#include "mapfile.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -173,27 +174,20 @@ static bool parseScene(const std::string& txt, const std::string& baseDir, Scene
 }
 
 static bool loadScene(const std::string& path) {
-    std::string txt, baseDir;
+    Scene s;
     if (endsWithI(path, ".json")) {
+        // a pre-exported scene (cpcw_map.py scene) + its sidecars
         std::ifstream f(path, std::ios::binary);
         if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
-        std::stringstream ss; ss << f.rdbuf(); txt = ss.str();
-        baseDir = dirOf(path);
+        std::stringstream ss; ss << f.rdbuf();
+        if (!parseScene(ss.str(), dirOf(path), s)) return false;
     } else {
-        const char* env = getenv("CPCW_MAP_PY");
-        std::string script = env ? env : "cpcw_map.py";
-        const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
-        std::string tj = std::string(tmp) + "/cpcw_mapedit_scene.json";
-        std::string cmd = "python \"" + script + "\" scene \"" + path + "\" \"" + tj + "\"";
-        runCapture(cmd);                                   // writes tj + .r32 sidecar
-        std::ifstream f(tj, std::ios::binary);
-        if (!f) { fprintf(stderr, "scene export failed for %s (python/CPCW_MAP_PY?)\n",
-                          path.c_str()); return false; }
-        std::stringstream ss; ss << f.rdbuf(); txt = ss.str();
-        baseDir = dirOf(tj);
+        // a .map: parse natively (no Python) straight into a Scene
+        if (!load_map_native(path, s)) {
+            fprintf(stderr, "native .map parse failed for %s\n", path.c_str());
+            return false;
+        }
     }
-    Scene s;
-    if (!parseScene(txt, baseDir, s)) return false;
     g_scene = std::move(s); g_selected = -1; g_sceneDirty = true;
     g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
     g_edited.clear(); g_saveStatus[0] = '\0';
