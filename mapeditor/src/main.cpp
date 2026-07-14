@@ -80,12 +80,67 @@ static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
 static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
+
+// --- undo/redo -------------------------------------------------------------
+struct EditCmd {
+    bool terrain = false;
+    int idx = -1; float pos0[3]{}, pos1[3]{}; float dir0 = 0, dir1 = 0; int pl0 = 0, pl1 = 0;
+    std::vector<int> cells; std::vector<float> h0, h1;   // terrain stroke
+};
+static std::vector<EditCmd> g_undo, g_redo;
+static bool g_snapActive = false; static EditCmd g_snap;   // pending entity snapshot
+static bool g_strokeActive = false; static std::vector<float> g_strokeH0;
 static std::string g_dataRoot;                     // folder holding ProtoDB.bin + models
 static std::string g_srcMap;                       // original .map (empty if .json)
 static std::set<long> g_edited;                    // ids with pending field edits
 static char  g_saveStatus[256] = "";
 
 static void glfwError(int e, const char* d) { fprintf(stderr, "GLFW %d: %s\n", e, d); }
+
+static void applyCmd(const EditCmd& c, bool useNew) {
+    if (c.terrain) {
+        for (size_t i = 0; i < c.cells.size(); i++)
+            if (c.cells[i] >= 0 && c.cells[i] < (int)g_scene.heights.size())
+                g_scene.heights[c.cells[i]] = useNew ? c.h1[i] : c.h0[i];
+        g_scene.terrainEdited = true; g_terrainDirty = true;
+        if (g_scene.heightDirty.size() == g_scene.heights.size())
+            for (int ci : c.cells) g_scene.heightDirty[ci] = 1;
+    } else if (c.idx >= 0 && c.idx < (int)g_scene.entities.size()) {
+        Entity& e = g_scene.entities[c.idx];
+        for (int k = 0; k < 3; k++) e.pos[k] = useNew ? c.pos1[k] : c.pos0[k];
+        e.dir = useNew ? c.dir1 : c.dir0; e.player = useNew ? c.pl1 : c.pl0;
+        g_edited.insert(e.id); g_entDirty = true; g_modelsDirty = true;
+    }
+}
+static void undoEdit() {
+    if (g_undo.empty()) return;
+    EditCmd c = g_undo.back(); g_undo.pop_back(); applyCmd(c, false); g_redo.push_back(c);
+}
+static void redoEdit() {
+    if (g_redo.empty()) return;
+    EditCmd c = g_redo.back(); g_redo.pop_back(); applyCmd(c, true); g_undo.push_back(c);
+}
+// snapshot the selected entity's state before an edit begins
+static void snapEntity(int idx) {
+    if (idx < 0 || idx >= (int)g_scene.entities.size()) { g_snapActive = false; return; }
+    const Entity& e = g_scene.entities[idx];
+    g_snap = EditCmd{}; g_snap.idx = idx;
+    for (int k = 0; k < 3; k++) g_snap.pos0[k] = e.pos[k];
+    g_snap.dir0 = e.dir; g_snap.pl0 = e.player; g_snapActive = true;
+}
+// commit the snapshot as an undo command if the entity actually changed
+static void commitEntity() {
+    if (!g_snapActive || g_snap.idx < 0 || g_snap.idx >= (int)g_scene.entities.size()) { g_snapActive = false; return; }
+    const Entity& e = g_scene.entities[g_snap.idx];
+    bool changed = e.dir != g_snap.dir0 || e.player != g_snap.pl0;
+    for (int k = 0; k < 3; k++) if (e.pos[k] != g_snap.pos0[k]) changed = true;
+    if (changed) {
+        for (int k = 0; k < 3; k++) g_snap.pos1[k] = e.pos[k];
+        g_snap.dir1 = e.dir; g_snap.pl1 = e.player;
+        g_undo.push_back(g_snap); g_redo.clear();
+    }
+    g_snapActive = false;
+}
 
 // write a 24-bit BMP from an RGB framebuffer read (rows bottom-up, as GL gives)
 static void writeBMP(const char* path, int w, int h, const unsigned char* rgb) {
@@ -340,7 +395,8 @@ static void drawMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
-        ImGui::MenuItem("Undo", "Ctrl+Z"); ImGui::MenuItem("Redo", "Ctrl+R");
+        if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !g_undo.empty())) undoEdit();
+        if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !g_redo.empty())) redoEdit();
         ImGui::Separator();
         ImGui::MenuItem("Cut", "Ctrl+X"); ImGui::MenuItem("Copy", "Ctrl+C");
         ImGui::MenuItem("Paste", "Ctrl+V"); ImGui::MenuItem("Delete", "Ctrl+Del");
@@ -446,15 +502,21 @@ static void drawProperties() {
             if (ImGui::InputInt("Player", &player)) {
                 e.player = player; g_edited.insert(e.id); g_entDirty = true;
             }
+            if (ImGui::IsItemActivated()) snapEntity(g_selected);
+            if (ImGui::IsItemDeactivatedAfterEdit()) commitEntity();
             float pos[3] = {e.pos[0], e.pos[1], e.pos[2]};
             if (ImGui::DragFloat3("Pos", pos, 0.5f)) {
                 e.pos[0]=pos[0]; e.pos[1]=pos[1]; e.pos[2]=pos[2];
                 g_edited.insert(e.id); g_entDirty = true; g_modelsDirty = true;
             }
+            if (ImGui::IsItemActivated()) snapEntity(g_selected);
+            if (ImGui::IsItemDeactivatedAfterEdit()) commitEntity();
             float dir = e.dir;
             if (ImGui::DragFloat("Dir (yaw)", &dir, 1.0f)) {
                 e.dir = dir; g_edited.insert(e.id); g_modelsDirty = true;
             }
+            if (ImGui::IsItemActivated()) snapEntity(g_selected);
+            if (ImGui::IsItemDeactivatedAfterEdit()) commitEntity();
             if (g_edited.count(e.id)) ImGui::TextDisabled("(edited — File > Save edits)");
         }
         if (g_saveStatus[0]) { ImGui::Separator(); ImGui::TextWrapped("%s", g_saveStatus); }
@@ -553,6 +615,7 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     // heightmap instead of selecting entities.
     bool brushing = (g_mode == 0 && (g_activeTool == 1 || g_activeTool == 2 || g_activeTool == 6));
     if (over && brushing && ImGui::IsMouseDown(0)) {
+        if (!g_strokeActive) { g_strokeH0 = g_scene.heights; g_strokeActive = true; }
         float gx, gy;
         if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) applyTerrainBrush(gx, gy, g_activeTool);
         return;   // don't pick/move entities while brushing
@@ -577,7 +640,7 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
                 float d = fabsf(sx - mp.x) + fabsf(sy - mp.y);
                 if (d < best) { best = d; bi = i; }
             }
-            if (bi >= 0) { g_selected = bi; g_draggingEnt = true; }
+            if (bi >= 0) { g_selected = bi; g_draggingEnt = true; snapEntity(bi); }
         }
     }
     // Left-drag moves the selected entity along the ground plane.
@@ -593,7 +656,17 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
             g_edited.insert(e.id); g_entDirty = true;   // live marker; model on release
         }
     }
-    if (g_draggingEnt && !ImGui::IsMouseDown(0)) { g_draggingEnt = false; g_modelsDirty = true; }
+    if (g_draggingEnt && !ImGui::IsMouseDown(0)) { g_draggingEnt = false; g_modelsDirty = true; commitEntity(); }
+    // finalize a terrain brush stroke into one undo command
+    if (g_strokeActive && !ImGui::IsMouseDown(0)) {
+        EditCmd c; c.terrain = true;
+        for (size_t i = 0; i < g_scene.heights.size() && i < g_strokeH0.size(); i++)
+            if (g_scene.heights[i] != g_strokeH0[i]) {
+                c.cells.push_back((int)i); c.h0.push_back(g_strokeH0[i]); c.h1.push_back(g_scene.heights[i]);
+            }
+        if (!c.cells.empty()) { g_undo.push_back(c); g_redo.clear(); }
+        g_strokeActive = false; g_strokeH0.clear();
+    }
 }
 
 int main(int argc, char** argv) {
@@ -750,12 +823,14 @@ int main(int argc, char** argv) {
         ImGuiIO& kio = ImGui::GetIO();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) doSave();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) doOpen();
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoEdit();
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redoEdit();
         // [ / ] rotate the selected entity 5 degrees (yaw)
         if (!kio.WantCaptureKeyboard && g_selected >= 0 &&
             g_selected < (int)g_scene.entities.size()) {
             Entity& e = g_scene.entities[g_selected];
-            if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; }
-            if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; }
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { snapEntity(g_selected); e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
+            if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { snapEntity(g_selected); e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
         }
 
         ImGui::SetNextWindowBgAlpha(0.35f);
