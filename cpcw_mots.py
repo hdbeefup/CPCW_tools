@@ -202,6 +202,90 @@ def parse_mots(path):
     return motions
 
 
+# ---------------------------------------------------------------------------
+# PROVISIONAL playback (not engine-proven -- see the "still open" note above).
+#
+# Empirical model, from the shipped data: a channel's ``key_count`` records are
+# NOT time samples -- they are the up-to-6 per-DOF component tracks of the node's
+# local transform, in order (tx, ty, tz, rx, ry, rz). Five sit static at their
+# ``base[10]`` rest value; the animated one carries the motion, and its span
+# ``value1 - value0`` is the total change over ``duration``. For rotation tracks
+# (dof 3/4/5) that span is an angle in radians about the node's local x/y/z --
+# clean multiples of 2*pi (rotor -20*pi = 10 turns, tail rotor +40*pi, lamp -2*pi).
+#
+# Provisional choices (flagged; revisit once the engine evaluator is read):
+#   * per-key time is uniform over ``duration`` (linear, constant speed);
+#   * only the single dominant track per node is played (enough for spins/lifts);
+#   * the dof index gives the NODE-LOCAL rotation axis (rx/ry/rz). To get a world
+#     axis you must compose it with the node's rest orientation AND the importer's
+#     handedness swap -- applying the dof axis to a Blender object's local euler
+#     naively makes rotors tumble. blendertools/mots_play.py sidesteps this with a
+#     robust geometric shortcut: a rotor/dish is thinnest along its shaft, so it
+#     spins about the group's minimum-extent world axis through the centroid.
+# NOTE: reliable when a channel carries all 6 DOF tracks (key_count==6, tracks in
+# order tx,ty,tz,rx,ry,rz); channels with fewer tracks don't pin the dof by index.
+# ---------------------------------------------------------------------------
+
+_DOF_NAME = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
+
+
+class NodeSpin:
+    """One node's dominant animated DOF over a motion (provisional)."""
+    __slots__ = ('node_idx', 'dof', 'v0', 'v1', 'duration')
+
+    @property
+    def is_rotation(self):
+        return self.dof >= 3
+
+    @property
+    def axis(self):
+        """local axis index for a rotation dof (0=x,1=y,2=z), else None."""
+        return (self.dof - 3) if self.dof >= 3 else None
+
+    @property
+    def span(self):
+        return self.v1 - self.v0
+
+    def sample(self, t, loop=True):
+        """Value of this DOF at time t (seconds), linear over duration."""
+        d = self.duration
+        if d <= 0:
+            return self.v1
+        f = (t % d) / d if loop else max(0.0, min(1.0, t / d))
+        return self.v0 + (self.v1 - self.v0) * f
+
+    def __repr__(self):
+        return ("NodeSpin(node=%d %s span=%+.3f dur=%.3f)"
+                % (self.node_idx, _DOF_NAME[self.dof], self.span, self.duration))
+
+
+def node_spins(motion, min_span=1e-3):
+    """Provisional: dominant animated DOF per node. Returns list[NodeSpin].
+
+    Picks, per animated node, the component track with the largest |value1-value0|
+    (the moving DOF), skipping nodes whose largest span is below ``min_span``.
+    """
+    out = []
+    for ni, ch in motion.animated_nodes().items():
+        if not ch.keys:
+            continue
+        best_i, best_span = -1, 0.0
+        for i, k in enumerate(ch.keys[:6]):
+            s = abs(k.value1 - k.value)
+            if s > best_span:
+                best_span, best_i = s, i
+        if best_i < 0 or best_span < min_span:
+            continue
+        ns = NodeSpin()
+        ns.node_idx = ni
+        ns.dof = best_i
+        ns.v0 = ch.keys[best_i].value
+        ns.v1 = ch.keys[best_i].value1
+        ns.duration = motion.duration
+        out.append(ns)
+    return out
+
+
 def _main(argv):
     if not argv:
         print("usage: cpcw_mots.py <model.srm> [...]")
@@ -215,6 +299,11 @@ def _main(argv):
             for ni, ch in an.items():
                 vals = ', '.join(f"{k.value:+.3f}" for k in ch.keys)
                 print(f"    node[{ni}] ch keys[{ch.key_count}] values=[{vals}]")
+            for ns in node_spins(m):
+                turns = ns.span / (2 * 3.14159265) if ns.is_rotation else None
+                extra = (" (%.2f turns about local %s)" % (turns, "xyz"[ns.axis])
+                         if ns.is_rotation else " (translation)")
+                print(f"    SPIN {ns}{extra}")
     return 0
 
 
