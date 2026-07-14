@@ -79,14 +79,19 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       `CPCW_MAP_PY`) and shows an entity list + top-down markers (player-coloured,
       click-select) + properties. Verified headlessly (`--selftest`): 779
       entities / 576x576 terrain load on both paths.
-- [ ] **M5 — port parse/write to C++** (drop the Python bridge) using the Python
-      oracle; real 3D terrain mesh + entity models (reuse the `.srm` loader).
 - [x] **M4c — save path**: `cpcw_map.py apply <map> <out> --edits e.json` applies
       an edit list (entity pos/player/hp/... by ID) through the in-place setters.
       Verified full round-trip: scene -> edit -> apply -> reload persists, only the
       edited fields' bytes change (8 bytes on an 8.9 MB map), byte-faithful.
-- [ ] **M5 — port parse/write to C++** (drop the Python bridge) using the Python
-      oracle; real 3D terrain mesh + entity models (reuse the `.srm` loader).
+- [x] **M5a — 3D viewport**: real OpenGL 3.3 terrain mesh from the heightmap
+      (elevation-shaded + Lambert lighting), entity markers (player-coloured points,
+      selection highlight), orbit/pan/zoom camera, rendered into the dockspace
+      central node. Compact GL loader (`glcore.h`), no glad/glew. Heightmap via a
+      raw-f32 sidecar from `cpcw_map.py scene`; NaN sentinel cells sanitised.
+      Verified with `--shot` FBO render-to-BMP (Ring of Fire, Fields of Glory).
+- [ ] **M5b — port parse/write to C++** (drop the Python bridge) using the Python
+      oracle; render real entity **models** (reuse the `.srm` loader) not just point
+      markers; splat/texture the terrain.
 - [ ] **M6 — GUI editing**: brushes/gizmos drive the edit-ops in the viewport and
       emit the edit list / call the save path; undo/redo; structural edits
       (add/remove entity — needs chunk-size recompute + schema-offset fixups).

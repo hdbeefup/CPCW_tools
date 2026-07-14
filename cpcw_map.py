@@ -1411,6 +1411,16 @@ def cmd_scene(mf, output=None):
     if hm:
         scene['terrain']['grid_w'] = hm[1]
         scene['terrain']['grid_h'] = hm[2]
+        # For a file export, dump the elevation grid as a compact raw f32 sidecar
+        # (row-major, grid_w*grid_h) the 3D editor loads directly -- far smaller
+        # and faster than embedding ~333k floats in JSON.
+        if output and output != '-':
+            import array as _arr
+            heights, W, H = mf.get_heightmap()
+            r32 = os.path.splitext(output)[0] + '.r32'
+            with open(r32, 'wb') as hf:
+                _arr.array('f', heights).tofile(hf)
+            scene['terrain']['heightmap'] = os.path.basename(r32)
     for e in mf.get_entities():
         pos = e.get('Pos') or [0, 0, 0]
         scene['entities'].append({
