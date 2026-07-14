@@ -98,8 +98,13 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       Verified vs the Python oracle: entity counts / grid dims / render match
       exactly (Ring of Fire 779, Fields of Glory 2116, Grinder 805, M_02 3152).
       `cpcw_map.py` still handles the byte-faithful **save** path.
-- [ ] **M5d** — render real entity **models** (reuse the `.srm` loader) instead of
-      point markers (ties into the open handedness question, Finding 1).
+- [x] **M5d** — real entity **models** (native ProtoDB resolve `Prototype`->`.srm` +
+      the viewer's `.srm` loader) with **DDS textures**, placed at each entity's
+      pos+yaw. Buildings/vehicles/aircraft render textured on the terrain.
+- [x] **M5e** — native everything: `.map` load + save + ProtoDB all in C++ (no
+      Python). Native Windows Open dialog + drag-and-drop. WASD/arrow camera with a
+      speed floor. 3D click-select, drag-to-move, `[`/`]` rotate, editable Pos/Dir/
+      Player in Properties, Ctrl+S native byte-faithful save.
 - [~] **M6 — GUI editing** (started): the Properties panel edits a selected
       entity's Player/Pos; File > Save edits (Ctrl+S) writes the changes back
       through `cpcw_map.py apply` to `<map>_edited.map` (never overwrites the

@@ -12,6 +12,7 @@ struct Entity {
     int kind = 0;         // 0 doodad, 1 building/unit, 2 effect/sound/deformer
     // byte offsets of editable fields in Scene::raw (for native in-place save)
     long posOff = -1;         // FT_VEC3 (12 bytes)
+    long dirOff = -1;         // Dir yaw = first float at this offset
     long playerOff = -1;
     unsigned playerFtype = 0; // schema field type of Player (write size)
 };

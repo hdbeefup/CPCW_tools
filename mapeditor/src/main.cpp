@@ -394,12 +394,16 @@ static void drawProperties() {
             ImGui::TextWrapped("Proto: %s", e.proto.c_str());
             int player = e.player;
             if (ImGui::InputInt("Player", &player)) {
-                e.player = player; g_edited.insert(e.id); g_sceneDirty = true;
+                e.player = player; g_edited.insert(e.id); g_entDirty = true;
             }
             float pos[3] = {e.pos[0], e.pos[1], e.pos[2]};
             if (ImGui::DragFloat3("Pos", pos, 0.5f)) {
                 e.pos[0]=pos[0]; e.pos[1]=pos[1]; e.pos[2]=pos[2];
-                g_edited.insert(e.id); g_sceneDirty = true;
+                g_edited.insert(e.id); g_entDirty = true; g_modelsDirty = true;
+            }
+            float dir = e.dir;
+            if (ImGui::DragFloat("Dir (yaw)", &dir, 1.0f)) {
+                e.dir = dir; g_edited.insert(e.id); g_modelsDirty = true;
             }
             if (g_edited.count(e.id)) ImGui::TextDisabled("(edited — File > Save edits)");
         }
@@ -604,6 +608,13 @@ int main(int argc, char** argv) {
         ImGuiIO& kio = ImGui::GetIO();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) doSave();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) doOpen();
+        // [ / ] rotate the selected entity 5 degrees (yaw)
+        if (!kio.WantCaptureKeyboard && g_selected >= 0 &&
+            g_selected < (int)g_scene.entities.size()) {
+            Entity& e = g_scene.entities[g_selected];
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; }
+            if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; }
+        }
 
         ImGui::SetNextWindowBgAlpha(0.35f);
         if (ImGui::Begin("##status", nullptr,

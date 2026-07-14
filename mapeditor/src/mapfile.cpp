@@ -378,7 +378,7 @@ bool load_map_native(const std::string& path, Scene& out) {
         auto it=o.find("_type"); e.type = (it!=o.end()&&it->second.kind==V_STR)?it->second.s:"?";
         auto pr=o.find("Prototype"); if(pr!=o.end()&&pr->second.kind==V_STR) e.proto=pr->second.s;
         auto ps=o.find("Pos"); if(ps!=o.end()&&ps->second.kind==V_VEC3){ e.pos[0]=(float)ps->second.v3[0]; e.pos[1]=(float)ps->second.v3[1]; e.pos[2]=(float)ps->second.v3[2]; e.posOff=ps->second.off; }
-        auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; }
+        auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; e.dirOff=dr->second.off; }
         auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT){ e.player=(int)pl->second.i; e.playerOff=pl->second.off; e.playerFtype=pl->second.ftype; }
         auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT) e.id=id->second.i;
         e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
@@ -418,6 +418,7 @@ bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
         for (const auto& en : s.entities) if (en.id==id) { e=&en; break; }
         if (!e) continue;
         if (e->posOff>=0) { putf(e->posOff,e->pos[0]); putf(e->posOff+4,e->pos[1]); putf(e->posOff+8,e->pos[2]); }
+        if (e->dirOff>=0) putf(e->dirOff, e->dir);   // Dir yaw = first float
         if (e->playerOff>=0) {
             long o=e->playerOff; uint32_t v=(uint32_t)e->player;
             switch (e->playerFtype) {
