@@ -303,7 +303,7 @@ static void drawMenuBar() {
         ImGui::Separator();
         ImGui::MenuItem("3D models", nullptr, &g_showModels);
         ImGui::MenuItem("Entity dots", nullptr, &g_showDots);
-        ImGui::MenuItem("Wireframe", "W", &g_wireframe);
+        ImGui::MenuItem("Wireframe", nullptr, &g_wireframe);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Mode")) {
@@ -411,6 +411,19 @@ static void drawProperties() {
 static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     ImGuiIO& io = ImGui::GetIO();
     bool over = ImGui::IsMouseHoveringRect(cmin, cmax, false) && !io.WantCaptureMouse;
+
+    // WASD / arrow-key movement over the ground plane. Speed has a floor so it
+    // does NOT crawl when zoomed in (was purely distance-scaled before).
+    if (!io.WantCaptureKeyboard && !io.KeyCtrl) {
+        float dt = io.DeltaTime > 0.0f ? io.DeltaTime : 0.016f;
+        float sp = (g_cam.dist * 0.5f + 15.0f) * dt * (io.KeyShift ? 3.0f : 1.0f);
+        V3 fwd = norm(g_cam.target - g_cam.eye()); fwd.y = 0; fwd = norm(fwd);
+        V3 right = norm(cross(fwd, V3{0, 1, 0}));
+        if (ImGui::IsKeyDown(ImGuiKey_W) || ImGui::IsKeyDown(ImGuiKey_UpArrow))    g_cam.target = g_cam.target + fwd * sp;
+        if (ImGui::IsKeyDown(ImGuiKey_S) || ImGui::IsKeyDown(ImGuiKey_DownArrow))  g_cam.target = g_cam.target - fwd * sp;
+        if (ImGui::IsKeyDown(ImGuiKey_A) || ImGui::IsKeyDown(ImGuiKey_LeftArrow))  g_cam.target = g_cam.target - right * sp;
+        if (ImGui::IsKeyDown(ImGuiKey_D) || ImGui::IsKeyDown(ImGuiKey_RightArrow)) g_cam.target = g_cam.target + right * sp;
+    }
     if (over && ImGui::IsMouseClicked(2)) g_orbiting = true;
     if (!ImGui::IsMouseDown(2)) g_orbiting = false;
     if (over && ImGui::IsMouseClicked(1)) g_panning = true;
@@ -424,7 +437,7 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     if (g_panning) {
         V3 e = g_cam.eye(), fwd = norm(g_cam.target - e);
         V3 right = norm(cross(fwd, {0,1,0})), up = cross(right, fwd);
-        float k = g_cam.dist * 0.0016f;
+        float k = g_cam.dist * 0.0016f + 0.02f;   // floor so it pans when zoomed in
         g_cam.target = g_cam.target - right * (io.MouseDelta.x * k)
                                     + up    * (io.MouseDelta.y * k);
     }
@@ -558,7 +571,7 @@ int main(int argc, char** argv) {
         if (ImGui::Begin("##status", nullptr,
                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav))
-            ImGui::Text("Mode: %s | Map: %s | %d entities | MMB orbit  RMB pan  wheel zoom",
+            ImGui::Text("Mode: %s | Map: %s | %d entities | WASD/arrows move  MMB orbit  RMB pan  wheel zoom",
                         kModes[g_mode].name, g_mapPath, (int)g_scene.entities.size());
         ImGui::End();
 
