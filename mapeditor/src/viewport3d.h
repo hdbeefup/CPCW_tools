@@ -4,8 +4,12 @@
 #pragma once
 #include "glcore.h"
 #include "scene.h"
+#include "protodb.h"
+#include "srm_model.h"        // viewer's .srm geometry loader (added to the build)
 #include <cmath>
 #include <cstdio>
+#include <map>
+#include <string>
 #include <vector>
 
 // ------------------------------------------------------------------ math ----
@@ -30,6 +34,10 @@ static inline M4 perspective(float fovy, float aspect, float zn, float zf) {
     r.m[10]=(zf+zn)/(zn-zf); r.m[11]=-1.0f; r.m[14]=(2*zf*zn)/(zn-zf);
     return r;
 }
+static inline M4 translate(V3 t){ M4 m; m.m[12]=t.x; m.m[13]=t.y; m.m[14]=t.z; return m; }
+static inline M4 scaleM(float x,float y,float z){ M4 m; m.m[0]=x; m.m[5]=y; m.m[10]=z; return m; }
+static inline M4 rotY(float a){ M4 m; float c=std::cos(a),s=std::sin(a); m.m[0]=c; m.m[2]=-s; m.m[8]=s; m.m[10]=c; return m; }
+
 static inline M4 lookAt(V3 eye, V3 c, V3 up) {
     V3 f=norm(c-eye), s=norm(cross(f,up)), u=cross(s,f);
     M4 r; r.m[0]=s.x; r.m[4]=s.y; r.m[8]=s.z;
@@ -72,6 +80,8 @@ static inline GLuint glProgram(const char* vs, const char* fs) {
 }
 
 class Viewport3D {
+    struct GLModel { GLuint vao=0, vbo=0, ebo=0; int count=0; };
+    struct ModelInst { GLModel* model; M4 xf; };
 public:
     void init() {
         terrainProg = glProgram(
@@ -109,7 +119,45 @@ public:
         uEntMVP = glGetUniformLocation(entProg, "uMVP");
         uEntSize = glGetUniformLocation(entProg, "uSize");
         uEntWhite = glGetUniformLocation(entProg, "uWhite");
+
+        modelProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
+            "uniform mat4 uMVP; uniform mat4 uModel; out vec3 vN;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aN; }\n",
+            "#version 330 core\n"
+            "in vec3 vN; out vec4 F; uniform vec3 uLight, uColor;\n"
+            "void main(){ float d=max(dot(normalize(vN),normalize(uLight)),0.0)*0.7+0.35;\n"
+            " F=vec4(uColor*d,1.0); }\n");
+        uMdlMVP=glGetUniformLocation(modelProg,"uMVP");
+        uMdlModel=glGetUniformLocation(modelProg,"uModel");
+        uMdlLight=glGetUniformLocation(modelProg,"uLight");
+        uMdlColor=glGetUniformLocation(modelProg,"uColor");
     }
+
+    // Resolve each entity's Prototype (ProtoDB at dataRoot/ProtoDB.bin) to a
+    // model .srm under dataRoot, load unique models, and place an instance at the
+    // entity's world position + yaw. Models are assembled with the exact engine
+    // skin rule (SKIN_FULL). Missing files are skipped.
+    void buildModels(const Scene& s, const std::string& dataRoot) {
+        clearModels(); modelsBuilt = true;
+        if (dataRoot.empty()) return;
+        auto index = protodb_model_index(dataRoot + "/ProtoDB.bin");
+        if (index.empty()) return;
+        for (const Entity& e : s.entities) {
+            if (e.proto.empty()) continue;
+            std::string g; for (char c : e.proto) g += (char)tolower((unsigned char)c);
+            auto it = index.find(g); if (it == index.end()) continue;
+            GLModel* gm = loadModel(dataRoot + "/" + it->second);
+            if (!gm || gm->count == 0) continue;
+            V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
+            float yaw = e.dir * 3.14159265f / 180.0f;
+            M4 xf = mul(mul(translate(wp), rotY(yaw)), scaleM(-1.0f, 1.0f, 1.0f));
+            instances.push_back({ gm, xf });
+        }
+    }
+    int modelInstanceCount() const { return (int)instances.size(); }
+    bool modelsAreBuilt() const { return modelsBuilt; }
 
     void buildTerrain(const Scene& s) {
         terrainCount = 0;
@@ -189,10 +237,66 @@ public:
         glBindVertexArray(0);
     }
 
-    void render(const Camera& cam, float aspect, bool wireframe, int selected) {
+    GLModel* loadModel(const std::string& path) {
+        auto it = modelCache.find(path);
+        if (it != modelCache.end()) return &it->second;
+        GLModel gm{};
+        SrmModel m;
+        if (srm_parse(path, m, nullptr)) {
+            std::vector<RenderMesh> rms;
+            srm_build_render(m, SKIN_FULL, VAR_ALL, rms);
+            std::vector<float> verts; std::vector<unsigned> idx; unsigned base = 0;
+            for (auto& rm : rms) {
+                for (auto& v : rm.verts) {
+                    verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
+                    verts.push_back(v.nx); verts.push_back(v.ny); verts.push_back(v.nz);
+                }
+                for (auto i : rm.indices) idx.push_back(base + i);
+                base += (unsigned)rm.verts.size();
+            }
+            if (!idx.empty()) {
+                gm.count = (int)idx.size();
+                glGenVertexArrays(1,&gm.vao); glGenBuffers(1,&gm.vbo); glGenBuffers(1,&gm.ebo);
+                glBindVertexArray(gm.vao);
+                glBindBuffer(GL_ARRAY_BUFFER,gm.vbo);
+                glBufferData(GL_ARRAY_BUFFER,verts.size()*sizeof(float),verts.data(),GL_STATIC_DRAW);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm.ebo);
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER,idx.size()*sizeof(unsigned),idx.data(),GL_STATIC_DRAW);
+                glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+                glEnableVertexAttribArray(1); glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+                glBindVertexArray(0);
+            }
+        }
+        modelCache[path] = gm; return &modelCache[path];
+    }
+    void clearModels() {
+        for (auto& kv : modelCache) {
+            if (kv.second.vao) glDeleteVertexArrays(1,&kv.second.vao);
+            if (kv.second.vbo) glDeleteBuffers(1,&kv.second.vbo);
+            if (kv.second.ebo) glDeleteBuffers(1,&kv.second.ebo);
+        }
+        modelCache.clear(); instances.clear(); modelsBuilt = false;
+    }
+
+    void render(const Camera& cam, float aspect, bool wireframe, int selected,
+                bool showModels = true, bool showDots = true) {
         M4 mvp = cam.viewProj(aspect);
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+        if (showModels && !instances.empty()) {
+            glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+            glUseProgram(modelProg);
+            float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uMdlLight,1,light);
+            float col[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,col);
+            for (auto& inst : instances) {
+                M4 mvpM = mul(mvp, inst.xf);
+                glUniformMatrix4fv(uMdlMVP,1,GL_FALSE,mvpM.m);
+                glUniformMatrix4fv(uMdlModel,1,GL_FALSE,inst.xf.m);
+                glBindVertexArray(inst.model->vao);
+                glDrawElements(GL_TRIANGLES, inst.model->count, GL_UNSIGNED_INT, 0);
+            }
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        }
         if (terrainCount) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
             glUseProgram(terrainProg);
@@ -203,7 +307,7 @@ public:
             glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
-        if (entCount) {
+        if (showDots && entCount) {
             glUseProgram(entProg);
             glUniformMatrix4fv(uEntMVP,1,GL_FALSE,mvp.m);
             glUniform1i(uEntWhite,0); glUniform1f(uEntSize,0.0f);  // 0 => per-vertex size
@@ -223,6 +327,12 @@ public:
     V3 debugEye(const Camera& c) const { return c.eye(); }
 
 private:
+    std::map<std::string, GLModel> modelCache;
+    std::vector<ModelInst> instances;
+    GLuint modelProg=0;
+    GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1;
+    bool modelsBuilt=false;
+
     GLuint terrainProg=0, entProg=0;
     GLuint terrainVAO=0, terrainVBO=0, terrainEBO=0, entVAO=0, entVBO=0;
     GLint uTerrMVP=-1, uTerrLight=-1, uTerrUseColor=-1, uEntMVP=-1, uEntSize=-1, uEntWhite=-1;

@@ -71,6 +71,8 @@ static bool  g_orbiting = false, g_panning = false;
 static GLFWwindow* g_win = nullptr;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
+static bool  g_showModels = true, g_showDots = true;
+static std::string g_dataRoot;                     // folder holding ProtoDB.bin + models
 static std::string g_srcMap;                       // original .map (empty if .json)
 static std::set<long> g_edited;                    // ids with pending field edits
 static char  g_saveStatus[256] = "";
@@ -111,6 +113,18 @@ static bool endsWithI(const std::string& s, const char* suf) {
 static std::string dirOf(const std::string& p) {
     size_t s = p.find_last_of("/\\");
     return s == std::string::npos ? std::string(".") : p.substr(0, s);
+}
+// walk up from the map's folder to find the data root (contains ProtoDB.bin)
+static std::string findDataRoot(const std::string& mapPath) {
+    std::string d = dirOf(mapPath);
+    for (int i = 0; i < 6; i++) {
+        std::ifstream f(d + "/ProtoDB.bin", std::ios::binary);
+        if (f.good()) return d;
+        std::string up = dirOf(d);
+        if (up == d) break;
+        d = up;
+    }
+    return "";
 }
 static std::string runCapture(const std::string& cmd) {
     std::string out; char buf[4096]; size_t n;
@@ -201,6 +215,7 @@ static bool loadScene(const std::string& path) {
     }
     g_scene = std::move(s); g_selected = -1; g_sceneDirty = true;
     g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
+    g_dataRoot = g_srcMap.empty() ? std::string() : findDataRoot(g_srcMap);
     g_edited.clear(); g_saveStatus[0] = '\0';
     snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
     // frame the camera on the loaded terrain
@@ -286,6 +301,8 @@ static void drawMenuBar() {
         ImGui::MenuItem("Entities", nullptr, &g_showEntities);
         ImGui::MenuItem("Properties", nullptr, &g_showProps);
         ImGui::Separator();
+        ImGui::MenuItem("3D models", nullptr, &g_showModels);
+        ImGui::MenuItem("Entity dots", nullptr, &g_showDots);
         ImGui::MenuItem("Wireframe", "W", &g_wireframe);
         ImGui::EndMenu();
     }
@@ -472,6 +489,7 @@ int main(int argc, char** argv) {
     // headless render-to-BMP: one frame of the 3D scene, full framebuffer, exit.
     if (!shotPath.empty()) {
         g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+        g_vp.buildModels(g_scene, g_dataRoot);
         g_sceneDirty = false;
         int fbw = 1360, fbh = 850;
         // render into an offscreen FBO (reliable regardless of window visibility)
@@ -491,7 +509,8 @@ int main(int argc, char** argv) {
         glEnable(GL_DEPTH_TEST);
         glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        g_vp.render(g_cam, (float)fbw / (float)fbh, g_wireframe, g_selected);
+        g_vp.render(g_cam, (float)fbw / (float)fbh, g_wireframe, g_selected,
+                    g_showModels, g_showDots);
         glFinish();
         std::vector<unsigned char> px((size_t)fbw * fbh * 3);
         glReadPixels(0, 0, fbw, fbh, GL_RGB, GL_UNSIGNED_BYTE, px.data());
@@ -545,6 +564,7 @@ int main(int argc, char** argv) {
 
         if (g_sceneDirty && g_glReady) {
             g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+            g_vp.buildModels(g_scene, g_dataRoot);
             g_sceneDirty = false;
         }
         if (g_entDirty && g_glReady) {
@@ -571,7 +591,8 @@ int main(int argc, char** argv) {
             glViewport(vx, vy, vw, vh);
             glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            g_vp.render(g_cam, (float)vw / (float)vh, g_wireframe, g_selected);
+            g_vp.render(g_cam, (float)vw / (float)vh, g_wireframe, g_selected,
+                        g_showModels, g_showDots);
             glDisable(GL_SCISSOR_TEST);
             glViewport(0, 0, fbw, fbh);
         }
