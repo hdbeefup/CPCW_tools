@@ -26,6 +26,13 @@ FetchContent_Declare(json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
 FetchContent_MakeAvailable(json)
 
+# --- zlib (PAK type-2 decompression) ----------------------------------------
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG v1.3.1)
+FetchContent_MakeAvailable(zlib)
+
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -39,11 +46,13 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC glfw)
 
 # --- editor ------------------------------------------------------------------
-add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp src/protodb.cpp
+add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp src/protodb.cpp src/pak.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src/srm_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src/dds.cpp)
 target_include_directories(cpcw_mapeditor PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src
+    ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+target_link_libraries(cpcw_mapeditor PRIVATE zlibstatic)
 target_link_libraries(cpcw_mapeditor PRIVATE imgui glfw nlohmann_json::nlohmann_json)
 if (WIN32)
     target_link_libraries(cpcw_mapeditor PRIVATE opengl32 comdlg32)

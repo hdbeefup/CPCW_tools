@@ -20,7 +20,9 @@
 #include "viewport3d.h"
 #include "mapfile.h"
 #include "protodb.h"
+#include "pak.h"
 #include <nlohmann/json.hpp>
+#include <iterator>
 
 #include <cstdio>
 #include <cstring>
@@ -496,6 +498,20 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
+        else if (!strcmp(argv[i], "--paktest") && i + 1 < argc) {
+            PakArchive pak;
+            if (!pak.open(argv[i+1])) { printf("pak open FAILED\n"); return 2; }
+            printf("pak entries=%zu\n", pak.count());
+            if (i + 3 < argc) {
+                auto data = pak.read(argv[i+2]);
+                std::ifstream df(argv[i+3], std::ios::binary);
+                std::vector<unsigned char> disk((std::istreambuf_iterator<char>(df)),
+                                                std::istreambuf_iterator<char>());
+                printf("extract '%s': pak=%zu disk=%zu identical=%d\n",
+                       argv[i+2], data.size(), disk.size(), (int)(data == disk));
+            }
+            return 0;
+        }
         else if (!strcmp(argv[i], "--protodbtest") && i + 1 < argc) {
             auto idx = protodb_model_index(argv[i+1]);
             printf("protodb models=%zu\n", idx.size());
