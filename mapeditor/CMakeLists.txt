@@ -46,7 +46,8 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC glfw)
 
 # --- editor ------------------------------------------------------------------
-add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp src/protodb.cpp src/pak.cpp
+add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp src/protodb.cpp
+    src/pak.cpp src/vfs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src/srm_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src/dds.cpp)
 target_include_directories(cpcw_mapeditor PRIVATE

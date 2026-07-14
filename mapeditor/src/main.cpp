@@ -21,8 +21,10 @@
 #include "mapfile.h"
 #include "protodb.h"
 #include "pak.h"
+#include "vfs.h"
 #include <nlohmann/json.hpp>
 #include <iterator>
+#include <algorithm>
 
 #include <cstdio>
 #include <cstring>
@@ -69,6 +71,9 @@ static bool  g_showModes = true, g_showPanel = true, g_showProps = true,
 static char  g_mapPath[512] = "(no map loaded)";
 static char  g_openPath[512] = "";
 static bool  g_openPopup = false;
+static bool  g_pakBrowser = false;
+static std::vector<std::string> g_pakMaps;
+static char  g_pakFilter[128] = "";
 static bool  g_orbiting = false, g_panning = false;
 static GLFWwindow* g_win = nullptr;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
@@ -274,6 +279,48 @@ static void dropCallback(GLFWwindow*, int count, const char** paths) {
     if (count > 0 && paths && paths[0]) loadScene(paths[0]);
 }
 
+// Load a map that lives inside a mounted .pak: extract to a temp cache and load
+// it; models/textures/ProtoDB then resolve from the paks via the VFS.
+static void loadPakMap(const std::string& logical) {
+    std::string tmp = vfs_resolve(logical, "");
+    if (!tmp.empty()) loadScene(tmp);
+}
+// Pick a .pak, mount its folder, and list the maps inside it.
+static void doOpenPak() {
+#ifdef _WIN32
+    char file[1024] = {0};
+    OPENFILENAMEA ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_win ? glfwGetWin32Window(g_win) : nullptr;
+    ofn.lpstrFilter = "CPCW pak\0*.pak\0All files\0*.*\0";
+    ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) && file[0]) {
+        vfs_mount_dir(dirOf(file));
+        g_pakMaps = vfs_list_suffix(".map");
+        std::sort(g_pakMaps.begin(), g_pakMaps.end());
+        g_pakBrowser = true;
+    }
+#endif
+}
+static void drawPakBrowser() {
+    if (g_pakBrowser) { ImGui::OpenPopup("Open map from PAK"); g_pakBrowser = false; }
+    if (ImGui::BeginPopupModal("Open map from PAK", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("%d maps in the mounted pak(s):", (int)g_pakMaps.size());
+        ImGui::SetNextItemWidth(500);
+        ImGui::InputTextWithHint("##flt", "filter", g_pakFilter, sizeof(g_pakFilter));
+        std::string flt = g_pakFilter; for (char& c : flt) c = (char)tolower((unsigned char)c);
+        ImGui::BeginChild("maplist", ImVec2(520, 360), ImGuiChildFlags_None);
+        for (const std::string& m : g_pakMaps) {
+            if (!flt.empty() && m.find(flt) == std::string::npos) continue;
+            if (ImGui::Selectable(m.c_str())) { loadPakMap(m); ImGui::CloseCurrentPopup(); }
+        }
+        ImGui::EndChild();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
 static ImU32 playerColor(int p) {
     static const ImU32 c[] = {
         IM_COL32(200,200,200,255), IM_COL32(220,70,70,255), IM_COL32(70,120,220,255),
@@ -286,6 +333,7 @@ static void drawMenuBar() {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) doOpen();
+        if (ImGui::MenuItem("Open from .pak...")) doOpenPak();
         ImGui::MenuItem("New");
         if (ImGui::MenuItem("Save edits", "Ctrl+S", false, !g_srcMap.empty())) doSave();
         ImGui::Separator(); ImGui::MenuItem("Exit");
@@ -498,6 +546,12 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
+        else if (!strcmp(argv[i], "--pakmap") && i + 2 < argc) {   // mount dir, load a pak map
+            vfs_mount_dir(argv[i+1]);
+            std::string tmp = vfs_resolve(argv[i+2], "");
+            if (!tmp.empty()) loadPath = tmp;
+            i += 2;
+        }
         else if (!strcmp(argv[i], "--paktest") && i + 1 < argc) {
             PakArchive pak;
             if (!pak.open(argv[i+1])) { printf("pak open FAILED\n"); return 2; }
@@ -550,6 +604,10 @@ int main(int argc, char** argv) {
     GLFWwindow* win = glfwCreateWindow(1360, 850, "CPCW Map Editor", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     g_win = win;
+#ifdef _WIN32
+    { char exe[MAX_PATH]; if (GetModuleFileNameA(nullptr, exe, MAX_PATH))
+        vfs_mount_dir(dirOf(exe)); }   // auto-mount paks next to the exe (game folder)
+#endif
     glfwSetDropCallback(win, dropCallback);   // drag-and-drop a .map / .json
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -608,6 +666,7 @@ int main(int argc, char** argv) {
                             ImGuiDockNodeFlags_PassthruCentralNode);
         drawMenuBar();
         drawOpenPopup();
+        drawPakBrowser();
         drawModesPanel();
         drawModePanel();
         drawEntities();

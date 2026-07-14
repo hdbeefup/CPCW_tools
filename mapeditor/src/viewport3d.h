@@ -5,6 +5,7 @@
 #include "glcore.h"
 #include "scene.h"
 #include "protodb.h"
+#include "vfs.h"             // resolve logical paths to disk or extracted-from-pak temp
 #include "srm_model.h"        // viewer's .srm geometry loader (added to the build)
 #include "dds.h"             // viewer's DDS decoder (added to the build)
 #include <cmath>
@@ -150,15 +151,18 @@ public:
     // skin rule (SKIN_FULL). Missing files are skipped.
     void buildModels(const Scene& s, const std::string& dataRoot) {
         instances.clear(); modelsBuilt = true;   // reuse cached models/textures
-        if (dataRoot.empty()) return;
+        if (dataRoot.empty() && !vfs_any_mounted()) return;
         buildTexIndex(dataRoot);
-        auto index = protodb_model_index(dataRoot + "/ProtoDB.bin");
+        std::string protoPath = vfs_resolve("ProtoDB.bin", dataRoot);
+        auto index = protodb_model_index(protoPath);
         if (index.empty()) return;
         for (const Entity& e : s.entities) {
             if (e.proto.empty()) continue;
             std::string g; for (char c : e.proto) g += (char)tolower((unsigned char)c);
             auto it = index.find(g); if (it == index.end()) continue;
-            GLModel* gm = loadModel(dataRoot + "/" + it->second);
+            std::string mp = vfs_resolve(it->second, dataRoot);
+            if (mp.empty()) continue;
+            GLModel* gm = loadModel(mp);
             if (!gm || gm->parts.empty() || gm->vao == 0) continue;
             V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
             float yaw = e.dir * 3.14159265f / 180.0f;
@@ -290,16 +294,24 @@ public:
         if (!texIndex.empty() && texRoot == dataRoot) return;
         texIndex.clear(); texRoot = dataRoot;
         std::error_code ec;
-        for (auto it = std::filesystem::recursive_directory_iterator(dataRoot, ec);
-             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) break;
-            if (!it->is_regular_file(ec)) continue;
-            std::string ext = it->path().extension().string();
-            for (char& c : ext) c = (char)tolower((unsigned char)c);
-            if (ext != ".dds") continue;
-            std::string key = it->path().stem().string();
-            for (char& c : key) c = (char)tolower((unsigned char)c);
-            texIndex.emplace(key, it->path().string());
+        if (!dataRoot.empty()) {                     // disk textures (extracted content)
+            for (auto it = std::filesystem::recursive_directory_iterator(dataRoot, ec);
+                 it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec) break;
+                if (!it->is_regular_file(ec)) continue;
+                std::string ext = it->path().extension().string();
+                for (char& c : ext) c = (char)tolower((unsigned char)c);
+                if (ext != ".dds") continue;
+                std::string key = it->path().stem().string();
+                for (char& c : key) c = (char)tolower((unsigned char)c);
+                texIndex.emplace(key, it->path().string());     // absolute disk path
+            }
+        }
+        for (const std::string& logical : vfs_list_suffix(".dds")) {  // pak textures
+            size_t sl = logical.find_last_of('/');
+            std::string base = (sl == std::string::npos) ? logical : logical.substr(sl + 1);
+            size_t d = base.find_last_of('.'); if (d != std::string::npos) base = base.substr(0, d);
+            texIndex.emplace(base, logical);         // disk added first -> disk wins on dup
         }
     }
     GLuint loadTexture(const std::string& diffuse) {
@@ -311,7 +323,10 @@ public:
         GLuint tex = 0;
         auto pi = texIndex.find(key);
         if (pi != texIndex.end()) {
-            DdsImage img = dds_load(pi->second);
+            std::error_code ec;
+            std::string real = std::filesystem::exists(pi->second, ec)
+                               ? pi->second : vfs_resolve(pi->second, "");
+            DdsImage img = real.empty() ? DdsImage{} : dds_load(real);
             if (img.ok && img.width > 0) {
                 glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0,
