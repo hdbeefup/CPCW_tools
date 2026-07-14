@@ -158,9 +158,13 @@ def parse_schd(data, pos, limit):
 class ObjParser:
     """Stateful parser that reads OBJT/VOBJ/ARRY trees using local schemas."""
 
-    def __init__(self, data, schemas):
+    def __init__(self, data, schemas, record_offsets=False):
         self.data = data
         self.schemas = schemas
+        # When True, each parsed object gets an ``_field_offsets`` dict mapping
+        # field name -> (byte_offset, ftype) so the editor can write fields back
+        # in place. Off by default (zero behaviour change for readers).
+        self.record_offsets = record_offsets
 
     # -- public entry -------------------------------------------------------
 
@@ -181,14 +185,19 @@ class ObjParser:
             s = self.schemas.get(type_id, Schema('?', type_id, 0, []))
             obj = OrderedDict([('_type_id', type_id), ('_type', s.name)])
 
-        # trailing VOBJs (version extensions)
+        # trailing VOBJs (version extensions). Merge their fields -- and, when
+        # recording, their field offsets too, so placement fields carried by a
+        # trailing VOBJ (Pos/Dir/Elevation/Prototype/...) stay editable.
         p = vobj_end
         while p + 10 <= content_end and self.data[p:p + 4] == b'VOBJ':
             trailing, p = self._parse_vobj(p)
             if trailing:
+                t_off = trailing.get('_field_offsets')
                 for k, v in trailing.items():
                     if not k.startswith('_'):
                         obj[k] = v
+                if t_off:
+                    obj.setdefault('_field_offsets', OrderedDict()).update(t_off)
 
         return obj, content_end
 
@@ -211,11 +220,17 @@ class ObjParser:
         _version, p = _u16(self.data, p)
 
         if schema:
+            foff = OrderedDict() if self.record_offsets else None
             for fname, ftype, fsize in schema.fields:
                 if p >= content_end:
                     break
+                fstart = p
                 val, p = self._read_field(p, ftype, fsize, content_end)
                 obj[fname] = val
+                if foff is not None:
+                    foff[fname] = (fstart, ftype)
+            if foff is not None:
+                obj['_field_offsets'] = foff
 
         return obj, content_end
 
@@ -366,7 +381,7 @@ class MapFile:
 
     def __init__(self, filepath):
         with open(filepath, 'rb') as f:
-            self.data = f.read()
+            self.data = bytearray(f.read())   # mutable: supports in-place edits
         self.filepath = filepath
         self.schemas = {}       # merged across all SCHD sections
         self.root = None        # root Chunk
@@ -580,9 +595,9 @@ class MapFile:
             pos += 1
         return None
 
-    def parse_objs_all(self, objs_chunk):
+    def parse_objs_all(self, objs_chunk, with_offsets=False):
         """Parse ALL top-level OBJTs inside an OBJS chunk (flat list)."""
-        parser = ObjParser(self.data, self.schemas)
+        parser = ObjParser(self.data, self.schemas, record_offsets=with_offsets)
         pos = objs_chunk.data_offset + 4  # skip schema_offset
         end = objs_chunk.offset + 8 + objs_chunk.size
         # Use schema_offset as absolute file offset to find data boundary
@@ -615,15 +630,20 @@ class MapFile:
             return None
         return self.parse_objs_tree(objs)
 
-    def get_entities(self):
-        """Parse entities from the UNTS section."""
+    def get_entities(self, with_offsets=False):
+        """Parse entities from the UNTS section.
+
+        ``with_offsets=True`` attaches an ``_field_offsets`` dict to each entity
+        (field -> (byte_offset, ftype)) so :meth:`set_entity_field` can edit
+        fields in place. The editor uses this; readers get the plain values.
+        """
         unts = self.find_chunk('UNTS')
         if not unts:
             return []
         objs = self.find_chunk('OBJS', unts)
         if not objs:
             return []
-        return self.parse_objs_all(objs)
+        return self.parse_objs_all(objs, with_offsets=with_offsets)
 
     def get_heightmap(self):
         """Return (heights, W, H) for the terrain, or None.
@@ -803,6 +823,79 @@ class MapFile:
     def write(self, path):
         with open(path, 'wb') as f:
             f.write(self.pack())
+
+    # -- in-place field editing (size-preserving) ---------------------------
+
+    # Fixed-width field types the editor can rewrite without changing any chunk
+    # size (so the round-trip machinery stays trivial). Variable-width types
+    # (strings, arrays, nested objects) are size-changing -> handled later by
+    # the structural-edit path, not here.
+    _EDIT_PACK = {
+        FT_FLOAT:   ('<f', 1),
+        FT_FLOAT64: ('<d', 1),
+        FT_INT32:   ('<i', 1),
+        FT_INT16:   ('<h', 1),
+        FT_UINT8:   ('<B', 1),
+        FT_BOOL:    ('<B', 1),
+        FT_IID:     ('<I', 1),
+        FT_ENTREF:  ('<I', 1),
+        FT_VEC3:    ('<fff', 3),
+        FT_VEC2F:   ('<ff', 2),
+        FT_VEC2I:   ('<ii', 2),
+    }
+
+    def read_field(self, offset, ftype):
+        """Read a fixed-width field's exact (unrounded) value from the buffer."""
+        fmt = self._EDIT_PACK.get(ftype)
+        if fmt is None:
+            raise ValueError('field type 0x%04x is not fixed-width-editable' % ftype)
+        vals = struct.unpack_from(fmt[0], self.data, offset)
+        return vals[0] if fmt[1] == 1 else list(vals)
+
+    def set_field(self, offset, ftype, value):
+        """Write a fixed-width field in place (same byte length -> round-trip safe).
+
+        Raises ValueError for variable-width / unsupported types. ``value`` is a
+        scalar for scalar types or a sequence for VEC2/VEC3.
+        """
+        fmt, n = self._EDIT_PACK.get(ftype, (None, 0))
+        if fmt is None:
+            raise ValueError('field type 0x%04x is not in-place editable' % ftype)
+        if ftype == FT_BOOL:
+            value = 1 if value else 0
+        if n == 1:
+            struct.pack_into(fmt, self.data, offset, value)
+        else:
+            if len(value) != n:
+                raise ValueError('expected %d components, got %d' % (n, len(value)))
+            struct.pack_into(fmt, self.data, offset, *value)
+
+    def set_entity_field(self, entity, field, value):
+        """Edit one field of an entity parsed with ``get_entities(with_offsets=True)``.
+
+        Returns the (offset, ftype) written. Raises if the entity carries no
+        offset map or the field isn't a fixed-width type.
+        """
+        foff = entity.get('_field_offsets')
+        if not foff:
+            raise ValueError('entity has no _field_offsets '
+                             '(parse with get_entities(with_offsets=True))')
+        if field not in foff:
+            raise KeyError('entity has no field %r' % field)
+        offset, ftype = foff[field]
+        self.set_field(offset, ftype, value)
+        entity[field] = value            # keep the in-memory dict consistent
+        return offset, ftype
+
+    def move_entity(self, entity, dx=0.0, dy=0.0, dz=0.0):
+        """Translate an entity by (dx,dy,dz) using its exact stored Pos."""
+        foff = entity.get('_field_offsets') or {}
+        if 'Pos' not in foff:
+            raise KeyError('entity has no Pos field')
+        offset, ftype = foff['Pos']
+        x, y, z = self.read_field(offset, ftype)
+        self.set_field(offset, ftype, [x + dx, y + dy, z + dz])
+        entity['Pos'] = [round(x + dx, 4), round(y + dy, 4), round(z + dz, 4)]
 
 
 # ---------------------------------------------------------------------------
