@@ -71,12 +71,18 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       `set_heights`). Verified: brush-patch raise persists, size-preserving,
       round-trip intact. (Splat-layer painting still TODO.)
 - [ ] **M3 — structural edits** (add/remove entity; size recompute up the chain).
-- [ ] **M4 — C++ editor scaffold**: GLFW+OpenGL+ImGui window, docking, mode
-      switcher, panels, 3D viewport with orbit/pan/zoom; render terrain + entity
-      markers (reuse the `.srm` viewer's model loader for entity meshes).
-- [ ] **M5 — port parse/write to C++** (drop Python dep) using the Python oracle.
-- [ ] **M6+** — per-mode tools (terrain brushes, placement gizmos), undo/redo,
-      properties panels, test-in-game.
+- [x] **M4 — C++ editor scaffold** (`mapeditor/`): GLFW+OpenGL+ImGui, docking,
+      File/Edit/View/Mode menus, mode switcher, swappable tool/param panel,
+      Properties panel, dockable viewport. Builds (MSVC) and runs.
+- [x] **M4b — scene data bridge**: `cpcw_map.py scene` exports terrain+entities
+      as JSON; the editor loads it (direct `.json`, or a `.map` via python using
+      `CPCW_MAP_PY`) and shows an entity list + top-down markers (player-coloured,
+      click-select) + properties. Verified headlessly (`--selftest`): 779
+      entities / 576x576 terrain load on both paths.
+- [ ] **M5 — port parse/write to C++** (drop the Python bridge) using the Python
+      oracle; real 3D terrain mesh + entity models (reuse the `.srm` loader).
+- [ ] **M6 — GUI editing**: brushes/gizmos drive the edit-ops; write-back through
+      the byte-faithful writer; undo/redo; structural edits (add/remove entity).
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).

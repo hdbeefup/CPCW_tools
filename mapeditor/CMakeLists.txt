@@ -21,6 +21,11 @@ FetchContent_Declare(imgui
     GIT_TAG docking)
 FetchContent_MakeAvailable(imgui)
 
+# --- nlohmann/json (scene bridge; header-only) ------------------------------
+FetchContent_Declare(json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+FetchContent_MakeAvailable(json)
+
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -35,7 +40,7 @@ target_link_libraries(imgui PUBLIC glfw)
 
 # --- editor ------------------------------------------------------------------
 add_executable(cpcw_mapeditor src/main.cpp)
-target_link_libraries(cpcw_mapeditor PRIVATE imgui glfw)
+target_link_libraries(cpcw_mapeditor PRIVATE imgui glfw nlohmann_json::nlohmann_json)
 if (WIN32)
     target_link_libraries(cpcw_mapeditor PRIVATE opengl32)
 elseif (APPLE)

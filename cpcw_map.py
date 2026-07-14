@@ -1392,6 +1392,45 @@ def _print_obj(obj, depth):
 # Main
 # ---------------------------------------------------------------------------
 
+def cmd_scene(mf, output=None):
+    """Export an editor-facing scene as JSON (terrain dims + entity list).
+
+    This is the interim data bridge the C++/ImGui editor loads until the parser
+    is ported to C++ (see docs/MAP_EDITOR.md). '-' or no output prints to stdout.
+    """
+    wrld = mf.find_chunk('WRLD')
+    scene = {
+        'name': os.path.splitext(os.path.basename(mf.filepath))[0],
+        'terrain': {
+            'world_w': (wrld.meta.get('width') if wrld else 0) or 0,
+            'world_h': (wrld.meta.get('height') if wrld else 0) or 0,
+        },
+        'entities': [],
+    }
+    hm = mf.heightmap_info()
+    if hm:
+        scene['terrain']['grid_w'] = hm[1]
+        scene['terrain']['grid_h'] = hm[2]
+    for e in mf.get_entities():
+        pos = e.get('Pos') or [0, 0, 0]
+        scene['entities'].append({
+            'type': e.get('_type', '?'),
+            'proto': e.get('Prototype', ''),
+            'pos': [round(float(pos[0]), 3), round(float(pos[1]), 3),
+                    round(float(pos[2]), 3)] if len(pos) >= 3 else [0, 0, 0],
+            'dir': e.get('Dir', 0.0),
+            'player': e.get('Player', 0),
+            'id': e.get('ID', 0),
+        })
+    text = json.dumps(scene, separators=(',', ':'))
+    if output and output != '-':
+        with open(output, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print('wrote %s (%d entities)' % (output, len(scene['entities'])))
+    else:
+        print(text)
+
+
 def cmd_roundtrip(path, output=None, batch=False):
     """Verify the writer: pack() must reproduce the original bytes exactly.
 
@@ -1443,7 +1482,8 @@ def main():
     )
     parser.add_argument('command',
                         choices=['info', 'structure', 'schemas', 'entities',
-                                 'terrain', 'dump', 'blck', 'gui', 'roundtrip'])
+                                 'terrain', 'dump', 'blck', 'gui', 'roundtrip',
+                                 'scene'])
     parser.add_argument('file', help='Path to .map file (or directory for roundtrip --batch)')
     parser.add_argument('output', nargs='?', help='Output path (blck / roundtrip write)')
     parser.add_argument('--json', action='store_true', help='JSON output (dump)')
@@ -1476,6 +1516,8 @@ def main():
         cmd_blck(mf, args.output)
     elif args.command == 'gui':
         cmd_gui(mf)
+    elif args.command == 'scene':
+        cmd_scene(mf, args.output)
 
 
 if __name__ == '__main__':
