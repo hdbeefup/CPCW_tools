@@ -132,6 +132,15 @@ static bool parseScene(const std::string& txt, const std::string& baseDir, Scene
                     if (!(v == v) || v > 1e30f || v < -1e30f) v = 0.0f;
             }
         }
+        std::string cmName = t.value("colormap", std::string());
+        if (!cmName.empty()) {
+            std::ifstream cf(baseDir + "/" + cmName, std::ios::binary);
+            if (cf) {
+                cf.seekg(0, std::ios::end); std::streamoff n = cf.tellg(); cf.seekg(0);
+                s.colors.resize((size_t)n);
+                cf.read((char*)s.colors.data(), n);
+            }
+        }
         for (auto& e : j.value("entities", nlohmann::json::array())) {
             Entity en;
             en.type = e.value("type", std::string("?"));

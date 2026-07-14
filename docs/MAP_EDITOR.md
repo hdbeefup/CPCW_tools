@@ -89,9 +89,12 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       central node. Compact GL loader (`glcore.h`), no glad/glew. Heightmap via a
       raw-f32 sidecar from `cpcw_map.py scene`; NaN sentinel cells sanitised.
       Verified with `--shot` FBO render-to-BMP (Ring of Fire, Fields of Glory).
-- [ ] **M5b — port parse/write to C++** (drop the Python bridge) using the Python
-      oracle; render real entity **models** (reuse the `.srm` loader) not just point
-      markers; splat/texture the terrain.
+- [~] **M5b — splat-textured terrain** (done): `cpcw_map.py` gains `get_splatmap`
+      (upstreamed from the Blender fork) + a ground-type palette; `scene` bakes a
+      per-vertex RGB colormap sidecar; the editor colours the terrain by it (grass/
+      field/road/water/rock), height-ramp fallback when absent. Still TODO under
+      M5b: **port parse/write to C++** (drop the Python bridge) and render real
+      entity **models** (reuse the `.srm` loader) instead of point markers.
 - [ ] **M6 — GUI editing**: brushes/gizmos drive the edit-ops in the viewport and
       emit the edit list / call the save path; undo/redo; structural edits
       (add/remove entity — needs chunk-size recompute + schema-offset fixups).

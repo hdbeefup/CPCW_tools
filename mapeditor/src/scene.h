@@ -16,6 +16,7 @@ struct Scene {
     int world_w = 0, world_h = 0;    // terrain extent in world units
     int grid_w = 0, grid_h = 0;      // heightmap vertex dims (world_*+1)
     std::vector<Entity> entities;
-    std::vector<float> heights;      // grid_w*grid_h row-major elevations, or empty
+    std::vector<float> heights;         // grid_w*grid_h row-major elevations, or empty
+    std::vector<unsigned char> colors;  // grid_w*grid_h*3 RGB splat colours, or empty
     bool loaded = false;
 };

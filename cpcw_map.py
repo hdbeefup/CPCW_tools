@@ -728,6 +728,34 @@ class MapFile:
         self._heightmap = {'offset': off, 'w': W, 'h': H}
         return heights, W, H
 
+    def get_splatmap(self):
+        """Return (layers, weights, W, H) terrain paint, or None.
+
+        Immediately after the f32 heightmap, GTRD stores one row-major W*H uint8
+        opacity grid per terrain layer (all slots, incl. inactive), then ~4 dense
+        trailing grids (baked normals/AO, ignored). ``weights`` is one ``bytes``
+        of length W*H per layer.
+        """
+        info = self.heightmap_info()
+        if not info:
+            return None
+        off, W, H = info
+        gtrd = self.find_chunk('GTRD')
+        layers = gtrd.meta.get('layers', []) if gtrd else []
+        if not layers:
+            return None
+        need = W * H
+        ge = gtrd.offset + 8 + gtrd.size
+        splat_start = off + need * 4
+        weights = []
+        for i in range(len(layers)):
+            a = splat_start + i * need
+            b = a + need
+            if b > ge:
+                break
+            weights.append(bytes(self.data[a:b]))
+        return (layers, weights, W, H) if weights else None
+
     def heightmap_info(self):
         """(offset, W, H) of the located elevation grid, or None. Locates it on
         first use (see get_heightmap). Enables in-place height edits."""
@@ -1392,6 +1420,55 @@ def _print_obj(obj, depth):
 # Main
 # ---------------------------------------------------------------------------
 
+# Representative ground-type colour by layer-name keyword (sRGB, 0-1). Mirrors
+# blendertools/CPCWMap_Blender/import_map.py so the editor's terrain reads like
+# the game's ground without decoding the layer .dds textures.
+_LAYER_PALETTE = (
+    (('grass', 'foliage', 'long_grass', 'meadow'), (0.27, 0.39, 0.17)),
+    (('tillage', 'ploughland', 'soil', 'muddy', 'mud', 'dirt', 'field'), (0.34, 0.25, 0.16)),
+    (('gritty', 'ground', 'straw', 'sand', 'dry', 'default'), (0.52, 0.44, 0.30)),
+    (('cobble', 'road', 'pavement', 'stone', 'rock', 'ruin', 'gravel', 'mine'), (0.44, 0.43, 0.42)),
+    (('water', 'puddle', 'river', 'sea'), (0.20, 0.29, 0.33)),
+    (('snow', 'winter', 'ice'), (0.80, 0.82, 0.85)),
+    (('bump', 'normal', 'wind'), (0.40, 0.38, 0.33)),
+)
+
+
+def _layer_keyword_color(name):
+    s = (name or '').lower()
+    for keys, col in _LAYER_PALETTE:
+        if any(k in s for k in keys):
+            return col
+    return (0.35, 0.33, 0.28)
+
+
+def _bake_terrain_colormap(mf):
+    """Composite the GTRD paint layers into a row-major W*H RGB byte grid, or None."""
+    sp = mf.get_splatmap()
+    if not sp:
+        return None
+    layers, weights, W, H = sp
+    active = [i for i, l in enumerate(layers) if l.get('active')]
+    if not active:
+        return None
+    cols = [_layer_keyword_color(l.get('name', '')) for l in layers]
+    base, overlays = active[0], active[1:]
+    buf = bytearray(W * H * 3)
+    br, bg, bb = cols[base]
+    for gi in range(W * H):
+        r, g, b = br, bg, bb
+        for li in overlays:
+            w = weights[li][gi] / 255.0
+            if w > 0.0:
+                lr, lg, lb = cols[li]
+                r = r * (1 - w) + lr * w
+                g = g * (1 - w) + lg * w
+                b = b * (1 - w) + lb * w
+        o = gi * 3
+        buf[o] = int(r * 255); buf[o+1] = int(g * 255); buf[o+2] = int(b * 255)
+    return buf, W, H
+
+
 def cmd_scene(mf, output=None):
     """Export an editor-facing scene as JSON (terrain dims + entity list).
 
@@ -1421,6 +1498,15 @@ def cmd_scene(mf, output=None):
             with open(r32, 'wb') as hf:
                 _arr.array('f', heights).tofile(hf)
             scene['terrain']['heightmap'] = os.path.basename(r32)
+            # bake the splat paint into a per-vertex RGB sidecar for the 3D editor
+            cm = _bake_terrain_colormap(mf)
+            if cm is not None:
+                cbuf, cW, cH = cm
+                if cW == W and cH == H:
+                    rgb = os.path.splitext(output)[0] + '.rgb'
+                    with open(rgb, 'wb') as cf:
+                        cf.write(cbuf)
+                    scene['terrain']['colormap'] = os.path.basename(rgb)
     for e in mf.get_entities():
         pos = e.get('Pos') or [0, 0, 0]
         scene['entities'].append({

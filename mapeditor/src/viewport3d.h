@@ -77,18 +77,23 @@ public:
         terrainProg = glProgram(
             "#version 330 core\n"
             "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
-            "uniform mat4 uMVP; out vec3 vN; out float vH;\n"
-            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aN; vH=aPos.y; }\n",
+            "layout(location=2) in vec3 aCol;\n"
+            "uniform mat4 uMVP; out vec3 vN; out float vH; out vec3 vCol;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aN; vH=aPos.y; vCol=aCol; }\n",
             "#version 330 core\n"
-            "in vec3 vN; in float vH; out vec4 F; uniform vec3 uLight;\n"
+            "in vec3 vN; in float vH; in vec3 vCol; out vec4 F;\n"
+            "uniform vec3 uLight; uniform int uUseColor;\n"
             "void main(){ vec3 n=normalize(vN);\n"
             " float d=max(dot(n,normalize(uLight)),0.0)*0.75+0.25;\n"
-            " vec3 col; if(vH<0.0) col=mix(vec3(0.20,0.30,0.50),vec3(0.34,0.44,0.32),clamp(vH/-20.0+1.0,0.0,1.0));\n"
-            " else col=mix(vec3(0.34,0.44,0.30),vec3(0.55,0.50,0.40),clamp(vH/25.0,0.0,1.0));\n"
-            " col=mix(col,vec3(0.9),clamp((vH-18.0)/12.0,0.0,1.0));\n"
+            " vec3 col;\n"
+            " if(uUseColor==1){ col=vCol; }\n"
+            " else if(vH<0.0){ col=mix(vec3(0.20,0.30,0.50),vec3(0.34,0.44,0.32),clamp(vH/-20.0+1.0,0.0,1.0)); }\n"
+            " else { col=mix(vec3(0.34,0.44,0.30),vec3(0.55,0.50,0.40),clamp(vH/25.0,0.0,1.0));\n"
+            "        col=mix(col,vec3(0.9),clamp((vH-18.0)/12.0,0.0,1.0)); }\n"
             " F=vec4(col*d,1.0); }\n");
         uTerrMVP = glGetUniformLocation(terrainProg, "uMVP");
         uTerrLight = glGetUniformLocation(terrainProg, "uLight");
+        uTerrUseColor = glGetUniformLocation(terrainProg, "uUseColor");
 
         entProg = glProgram(
             "#version 330 core\n"
@@ -109,13 +114,20 @@ public:
         if (s.heights.empty() || s.grid_w < 2 || s.grid_h < 2) return;
         int W=s.grid_w, H=s.grid_h;
         const std::vector<float>& h = s.heights;
-        std::vector<float> verts; verts.reserve((size_t)W*H*6);
+        terrainHasColor = (s.colors.size() == (size_t)W * H * 3);
+        std::vector<float> verts; verts.reserve((size_t)W*H*9);
         auto at=[&](int i,int j){ i=i<0?0:(i>=W?W-1:i); j=j<0?0:(j>=H?H-1:j); return h[(size_t)j*W+i]; };
         for (int j=0;j<H;j++) for (int i=0;i<W;i++) {
-            float y=h[(size_t)j*W+i];
+            size_t gi=(size_t)j*W+i;
+            float y=h[gi];
             V3 n=norm(V3{-(at(i+1,j)-at(i-1,j)), 2.0f, -(at(i,j+1)-at(i,j-1))});
             verts.push_back((float)i); verts.push_back(y); verts.push_back((float)j);
             verts.push_back(n.x); verts.push_back(n.y); verts.push_back(n.z);
+            if (terrainHasColor)
+                verts.insert(verts.end(), {s.colors[gi*3]/255.0f,
+                             s.colors[gi*3+1]/255.0f, s.colors[gi*3+2]/255.0f});
+            else
+                verts.insert(verts.end(), {0.5f, 0.5f, 0.5f});
         }
         std::vector<unsigned> idx; idx.reserve((size_t)(W-1)*(H-1)*6);
         for (int j=0;j<H-1;j++) for (int i=0;i<W-1;i++) {
@@ -133,9 +145,11 @@ public:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terrainEBO);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size()*sizeof(unsigned), idx.data(), GL_STATIC_DRAW);
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,9*sizeof(float),(void*)0);
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,9*sizeof(float),(void*)(3*sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2,3,GL_FLOAT,GL_FALSE,9*sizeof(float),(void*)(6*sizeof(float)));
         glBindVertexArray(0);
     }
 
@@ -172,6 +186,7 @@ public:
             glUseProgram(terrainProg);
             glUniformMatrix4fv(uTerrMVP,1,GL_FALSE,mvp.m);
             float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uTerrLight,1,light);
+            glUniform1i(uTerrUseColor, terrainHasColor ? 1 : 0);
             glBindVertexArray(terrainVAO);
             glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
@@ -198,6 +213,7 @@ public:
 private:
     GLuint terrainProg=0, entProg=0;
     GLuint terrainVAO=0, terrainVBO=0, terrainEBO=0, entVAO=0, entVBO=0;
-    GLint uTerrMVP=-1, uTerrLight=-1, uEntMVP=-1, uEntSize=-1, uEntWhite=-1;
+    GLint uTerrMVP=-1, uTerrLight=-1, uTerrUseColor=-1, uEntMVP=-1, uEntSize=-1, uEntWhite=-1;
     int terrainCount=0, entCount=0;
+    bool terrainHasColor=false;
 };
