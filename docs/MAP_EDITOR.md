@@ -81,8 +81,15 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       entities / 576x576 terrain load on both paths.
 - [ ] **M5 — port parse/write to C++** (drop the Python bridge) using the Python
       oracle; real 3D terrain mesh + entity models (reuse the `.srm` loader).
-- [ ] **M6 — GUI editing**: brushes/gizmos drive the edit-ops; write-back through
-      the byte-faithful writer; undo/redo; structural edits (add/remove entity).
+- [x] **M4c — save path**: `cpcw_map.py apply <map> <out> --edits e.json` applies
+      an edit list (entity pos/player/hp/... by ID) through the in-place setters.
+      Verified full round-trip: scene -> edit -> apply -> reload persists, only the
+      edited fields' bytes change (8 bytes on an 8.9 MB map), byte-faithful.
+- [ ] **M5 — port parse/write to C++** (drop the Python bridge) using the Python
+      oracle; real 3D terrain mesh + entity models (reuse the `.srm` loader).
+- [ ] **M6 — GUI editing**: brushes/gizmos drive the edit-ops in the viewport and
+      emit the edit list / call the save path; undo/redo; structural edits
+      (add/remove entity — needs chunk-size recompute + schema-offset fixups).
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).

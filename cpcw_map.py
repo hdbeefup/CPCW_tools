@@ -1431,6 +1431,45 @@ def cmd_scene(mf, output=None):
         print(text)
 
 
+def cmd_apply(mappath, edits_json, output):
+    """Apply an edit list to a .map and write it out (the editor's Save path).
+
+    ``edits_json`` is a JSON file: {"edits":[{"id":N, "pos":[x,y,z], "player":P,
+    "hp":H, "level":L}, ...]} (or a bare list). Each edit targets an entity by
+    its ID; only the given fixed-width fields are changed, in place, so the rest
+    of the file stays byte-identical. Verifies each entity is found.
+    """
+    field_alias = {'pos': 'Pos', 'dir': 'Dir', 'player': 'Player',
+                   'hp': 'HP', 'level': 'Level', 'ammo': 'Ammo',
+                   'elevation': 'Elevation'}
+    with open(edits_json, 'r', encoding='utf-8') as f:
+        doc = json.load(f)
+    edits = doc.get('edits', doc) if isinstance(doc, dict) else doc
+
+    mf = MapFile(mappath)
+    ents = mf.get_entities(with_offsets=True)
+    by_id = {e.get('ID'): e for e in ents if 'ID' in e}
+    applied = 0
+    for ed in edits:
+        eid = ed.get('id')
+        ent = by_id.get(eid)
+        if ent is None:
+            print('  skip: no entity with id %r' % eid)
+            continue
+        for key, val in ed.items():
+            if key == 'id':
+                continue
+            field = field_alias.get(key, key)
+            try:
+                mf.set_entity_field(ent, field, val)
+                applied += 1
+            except (KeyError, ValueError) as e:
+                print('  skip id %r field %r: %s' % (eid, key, e))
+    mf.write(output)
+    print('applied %d field edit(s) across %d edit record(s) -> %s'
+          % (applied, len(edits), output))
+
+
 def cmd_roundtrip(path, output=None, batch=False):
     """Verify the writer: pack() must reproduce the original bytes exactly.
 
@@ -1483,9 +1522,10 @@ def main():
     parser.add_argument('command',
                         choices=['info', 'structure', 'schemas', 'entities',
                                  'terrain', 'dump', 'blck', 'gui', 'roundtrip',
-                                 'scene'])
+                                 'scene', 'apply'])
     parser.add_argument('file', help='Path to .map file (or directory for roundtrip --batch)')
-    parser.add_argument('output', nargs='?', help='Output path (blck / roundtrip write)')
+    parser.add_argument('output', nargs='?', help='Output path (blck / roundtrip / scene / apply)')
+    parser.add_argument('--edits', help='Edit-list JSON (apply command)')
     parser.add_argument('--json', action='store_true', help='JSON output (dump)')
     parser.add_argument('--depth', type=int, default=None, help='Max depth (structure)')
     parser.add_argument('--batch', action='store_true', help='Recurse a directory (roundtrip)')
@@ -1494,6 +1534,11 @@ def main():
 
     if args.command == 'roundtrip':
         cmd_roundtrip(args.file, args.output, args.batch)
+        return
+    if args.command == 'apply':
+        if not args.edits or not args.output:
+            parser.error('apply needs --edits <edits.json> and an output path')
+        cmd_apply(args.file, args.edits, args.output)
         return
 
     mf = MapFile(args.file)
