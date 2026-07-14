@@ -446,6 +446,29 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         if (g_cam.dist < 5.0f) g_cam.dist = 5.0f;
         if (g_cam.dist > 6000.0f) g_cam.dist = 6000.0f;
     }
+    // Left-click picks the nearest entity by screen-space projection.
+    if (over && ImGui::IsMouseClicked(0) && g_scene.loaded) {
+        float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
+        if (W > 1 && H > 1) {
+            M4 vp = g_cam.viewProj(W / H);
+            ImVec2 mp = io.MousePos;
+            float best = 16.0f; int bi = -1;
+            for (int i = 0; i < (int)g_scene.entities.size(); i++) {
+                const Entity& e = g_scene.entities[i];
+                if (g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2] == false) continue;
+                V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
+                float cx = vp.m[0]*wp.x + vp.m[4]*wp.y + vp.m[8]*wp.z + vp.m[12];
+                float cy = vp.m[1]*wp.x + vp.m[5]*wp.y + vp.m[9]*wp.z + vp.m[13];
+                float cw = vp.m[3]*wp.x + vp.m[7]*wp.y + vp.m[11]*wp.z + vp.m[15];
+                if (cw <= 0.001f) continue;
+                float sx = cmin.x + (cx/cw*0.5f + 0.5f) * W;
+                float sy = cmin.y + (1.0f - (cy/cw*0.5f + 0.5f)) * H;
+                float d = fabsf(sx - mp.x) + fabsf(sy - mp.y);
+                if (d < best) { best = d; bi = i; }
+            }
+            if (bi >= 0) g_selected = bi;
+        }
+    }
 }
 
 int main(int argc, char** argv) {
