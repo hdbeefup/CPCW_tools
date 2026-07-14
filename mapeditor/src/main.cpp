@@ -72,6 +72,7 @@ static GLFWwindow* g_win = nullptr;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
+static bool  g_draggingEnt = false, g_modelsDirty = false;
 static std::string g_dataRoot;                     // folder holding ProtoDB.bin + models
 static std::string g_srcMap;                       // original .map (empty if .json)
 static std::set<long> g_edited;                    // ids with pending field edits
@@ -466,9 +467,23 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
                 float d = fabsf(sx - mp.x) + fabsf(sy - mp.y);
                 if (d < best) { best = d; bi = i; }
             }
-            if (bi >= 0) g_selected = bi;
+            if (bi >= 0) { g_selected = bi; g_draggingEnt = true; }
         }
     }
+    // Left-drag moves the selected entity along the ground plane.
+    if (g_draggingEnt && ImGui::IsMouseDown(0) && g_selected >= 0 &&
+        g_selected < (int)g_scene.entities.size()) {
+        if (fabsf(io.MouseDelta.x) > 0 || fabsf(io.MouseDelta.y) > 0) {
+            V3 fwd = norm(g_cam.target - g_cam.eye()); fwd.y = 0; fwd = norm(fwd);
+            V3 right = norm(cross(fwd, V3{0, 1, 0}));
+            float k = g_cam.dist * 0.0016f + 0.02f;
+            Entity& e = g_scene.entities[g_selected];
+            e.pos[0] += right.x * io.MouseDelta.x * k - fwd.x * io.MouseDelta.y * k;  // world X = pos0
+            e.pos[1] += right.z * io.MouseDelta.x * k - fwd.z * io.MouseDelta.y * k;  // world Z = pos1
+            g_edited.insert(e.id); g_entDirty = true;   // live marker; model on release
+        }
+    }
+    if (g_draggingEnt && !ImGui::IsMouseDown(0)) { g_draggingEnt = false; g_modelsDirty = true; }
 }
 
 int main(int argc, char** argv) {
@@ -605,6 +620,9 @@ int main(int argc, char** argv) {
         }
         if (g_entDirty && g_glReady) {
             g_vp.buildEntities(g_scene, g_showKind); g_entDirty = false;
+        }
+        if (g_modelsDirty && g_glReady) {   // after a drag: refresh model instances
+            g_vp.buildModels(g_scene, g_dataRoot); g_modelsDirty = false;
         }
 
         ImGui::Render();

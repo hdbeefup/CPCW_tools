@@ -149,7 +149,7 @@ public:
     // entity's world position + yaw. Models are assembled with the exact engine
     // skin rule (SKIN_FULL). Missing files are skipped.
     void buildModels(const Scene& s, const std::string& dataRoot) {
-        clearModels(); modelsBuilt = true;
+        instances.clear(); modelsBuilt = true;   // reuse cached models/textures
         if (dataRoot.empty()) return;
         buildTexIndex(dataRoot);
         auto index = protodb_model_index(dataRoot + "/ProtoDB.bin");
