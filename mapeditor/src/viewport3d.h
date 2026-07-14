@@ -6,8 +6,11 @@
 #include "scene.h"
 #include "protodb.h"
 #include "srm_model.h"        // viewer's .srm geometry loader (added to the build)
+#include "dds.h"             // viewer's DDS decoder (added to the build)
 #include <cmath>
 #include <cstdio>
+#include <cctype>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -80,7 +83,8 @@ static inline GLuint glProgram(const char* vs, const char* fs) {
 }
 
 class Viewport3D {
-    struct GLModel { GLuint vao=0, vbo=0, ebo=0; int count=0; };
+    struct Part { int off=0, count=0; GLuint tex=0; };   // index range + diffuse tex
+    struct GLModel { GLuint vao=0, vbo=0, ebo=0; std::vector<Part> parts; };
     struct ModelInst { GLModel* model; M4 xf; };
 public:
     void init() {
@@ -123,16 +127,21 @@ public:
         modelProg = glProgram(
             "#version 330 core\n"
             "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
-            "uniform mat4 uMVP; uniform mat4 uModel; out vec3 vN;\n"
-            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aN; }\n",
+            "layout(location=2) in vec2 aUV;\n"
+            "uniform mat4 uMVP; uniform mat4 uModel; out vec3 vN; out vec2 vUV;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aN; vUV=aUV; }\n",
             "#version 330 core\n"
-            "in vec3 vN; out vec4 F; uniform vec3 uLight, uColor;\n"
+            "in vec3 vN; in vec2 vUV; out vec4 F;\n"
+            "uniform vec3 uLight, uColor; uniform sampler2D uTex; uniform int uHasTex;\n"
             "void main(){ float d=max(dot(normalize(vN),normalize(uLight)),0.0)*0.7+0.35;\n"
-            " F=vec4(uColor*d,1.0); }\n");
+            " vec3 base = uHasTex==1 ? texture(uTex, vec2(vUV.x, 1.0-vUV.y)).rgb : uColor;\n"
+            " F=vec4(base*d,1.0); }\n");
         uMdlMVP=glGetUniformLocation(modelProg,"uMVP");
         uMdlModel=glGetUniformLocation(modelProg,"uModel");
         uMdlLight=glGetUniformLocation(modelProg,"uLight");
         uMdlColor=glGetUniformLocation(modelProg,"uColor");
+        uMdlHasTex=glGetUniformLocation(modelProg,"uHasTex");
+        glUseProgram(modelProg); glUniform1i(glGetUniformLocation(modelProg,"uTex"),0);
     }
 
     // Resolve each entity's Prototype (ProtoDB at dataRoot/ProtoDB.bin) to a
@@ -142,6 +151,7 @@ public:
     void buildModels(const Scene& s, const std::string& dataRoot) {
         clearModels(); modelsBuilt = true;
         if (dataRoot.empty()) return;
+        buildTexIndex(dataRoot);
         auto index = protodb_model_index(dataRoot + "/ProtoDB.bin");
         if (index.empty()) return;
         for (const Entity& e : s.entities) {
@@ -149,7 +159,7 @@ public:
             std::string g; for (char c : e.proto) g += (char)tolower((unsigned char)c);
             auto it = index.find(g); if (it == index.end()) continue;
             GLModel* gm = loadModel(dataRoot + "/" + it->second);
-            if (!gm || gm->count == 0) continue;
+            if (!gm || gm->parts.empty() || gm->vao == 0) continue;
             V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
             float yaw = e.dir * 3.14159265f / 180.0f;
             M4 xf = mul(mul(translate(wp), rotY(yaw)), scaleM(-1.0f, 1.0f, 1.0f));
@@ -246,28 +256,74 @@ public:
             std::vector<RenderMesh> rms;
             srm_build_render(m, SKIN_FULL, VAR_ALL, rms);
             std::vector<float> verts; std::vector<unsigned> idx; unsigned base = 0;
-            for (auto& rm : rms) {
+            for (auto& rm : rms) {                      // one Part per RenderMesh (its diffuse tex)
+                Part part; part.off = (int)idx.size();
                 for (auto& v : rm.verts) {
                     verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
                     verts.push_back(v.nx); verts.push_back(v.ny); verts.push_back(v.nz);
+                    verts.push_back(v.u); verts.push_back(v.v);
                 }
                 for (auto i : rm.indices) idx.push_back(base + i);
                 base += (unsigned)rm.verts.size();
+                part.count = (int)rm.indices.size();
+                part.tex = loadTexture(rm.diffuseTex);
+                gm.parts.push_back(part);
             }
             if (!idx.empty()) {
-                gm.count = (int)idx.size();
                 glGenVertexArrays(1,&gm.vao); glGenBuffers(1,&gm.vbo); glGenBuffers(1,&gm.ebo);
                 glBindVertexArray(gm.vao);
                 glBindBuffer(GL_ARRAY_BUFFER,gm.vbo);
                 glBufferData(GL_ARRAY_BUFFER,verts.size()*sizeof(float),verts.data(),GL_STATIC_DRAW);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm.ebo);
                 glBufferData(GL_ELEMENT_ARRAY_BUFFER,idx.size()*sizeof(unsigned),idx.data(),GL_STATIC_DRAW);
-                glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
-                glEnableVertexAttribArray(1); glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+                glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)0);
+                glEnableVertexAttribArray(1); glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)(3*sizeof(float)));
+                glEnableVertexAttribArray(2); glVertexAttribPointer(2,2,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)(6*sizeof(float)));
                 glBindVertexArray(0);
             }
         }
         modelCache[path] = gm; return &modelCache[path];
+    }
+
+    // basename(lower,no ext) -> full .dds path, built once per data root
+    void buildTexIndex(const std::string& dataRoot) {
+        if (!texIndex.empty() && texRoot == dataRoot) return;
+        texIndex.clear(); texRoot = dataRoot;
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(dataRoot, ec);
+             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            if (!it->is_regular_file(ec)) continue;
+            std::string ext = it->path().extension().string();
+            for (char& c : ext) c = (char)tolower((unsigned char)c);
+            if (ext != ".dds") continue;
+            std::string key = it->path().stem().string();
+            for (char& c : key) c = (char)tolower((unsigned char)c);
+            texIndex.emplace(key, it->path().string());
+        }
+    }
+    GLuint loadTexture(const std::string& diffuse) {
+        if (diffuse.empty()) return 0;
+        std::string key = diffuse;
+        size_t dot = key.find_last_of('.'); if (dot != std::string::npos) key = key.substr(0, dot);
+        for (char& c : key) c = (char)tolower((unsigned char)c);
+        auto ci = texCache.find(key); if (ci != texCache.end()) return ci->second;
+        GLuint tex = 0;
+        auto pi = texIndex.find(key);
+        if (pi != texIndex.end()) {
+            DdsImage img = dds_load(pi->second);
+            if (img.ok && img.width > 0) {
+                glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, img.rgba.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                glBindTexture(GL_TEXTURE_2D, 0);
+            }
+        }
+        texCache[key] = tex; return tex;
     }
     void clearModels() {
         for (auto& kv : modelCache) {
@@ -275,7 +331,8 @@ public:
             if (kv.second.vbo) glDeleteBuffers(1,&kv.second.vbo);
             if (kv.second.ebo) glDeleteBuffers(1,&kv.second.ebo);
         }
-        modelCache.clear(); instances.clear(); modelsBuilt = false;
+        for (auto& kv : texCache) if (kv.second) glDeleteTextures(1, &kv.second);
+        modelCache.clear(); instances.clear(); texCache.clear(); modelsBuilt = false;
     }
 
     void render(const Camera& cam, float aspect, bool wireframe, int selected,
@@ -293,7 +350,12 @@ public:
                 glUniformMatrix4fv(uMdlMVP,1,GL_FALSE,mvpM.m);
                 glUniformMatrix4fv(uMdlModel,1,GL_FALSE,inst.xf.m);
                 glBindVertexArray(inst.model->vao);
-                glDrawElements(GL_TRIANGLES, inst.model->count, GL_UNSIGNED_INT, 0);
+                for (auto& part : inst.model->parts) {
+                    glUniform1i(uMdlHasTex, part.tex ? 1 : 0);
+                    if (part.tex) glBindTexture(GL_TEXTURE_2D, part.tex);
+                    glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT,
+                                   (void*)(size_t)(part.off * sizeof(unsigned)));
+                }
             }
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
@@ -330,8 +392,11 @@ private:
     std::map<std::string, GLModel> modelCache;
     std::vector<ModelInst> instances;
     GLuint modelProg=0;
-    GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1;
+    GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1, uMdlHasTex=-1;
     bool modelsBuilt=false;
+    std::map<std::string, GLuint> texCache;    // basename -> GL texture
+    std::map<std::string, std::string> texIndex; // basename -> .dds path
+    std::string texRoot;
 
     GLuint terrainProg=0, entProg=0;
     GLuint terrainVAO=0, terrainVBO=0, terrainEBO=0, entVAO=0, entVBO=0;
