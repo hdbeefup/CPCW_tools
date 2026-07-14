@@ -300,8 +300,9 @@ struct Parser {
                 hi=std::min(hi, r0+row*40);
                 for (size_t o=r0;o<=hi;o+=4){ double v=fit(o); if(v>best){best=v;bestOff=o;} }
             }
-            if (best<0.4) return false;
-            off=bestOff;
+            // editor robustness: if entity calibration is weak, fall back to the
+            // longest height-like run rather than showing no terrain at all.
+            off = (best<0.4) ? runs[0].second : bestOff;
         }
         outW=W; outH_=H; outH.resize(need);
         for (size_t i=0;i<need;i++){ float v=D.f32(off+i*4); if(!(v==v)||v>1e30f||v<-1e30f)v=0; outH[i]=v; }
@@ -389,6 +390,11 @@ bool load_map_native(const std::string& path, Scene& out) {
         if (P.heightmap(WW,WH,ents,out.heights,W,H)) {
             out.grid_w=W; out.grid_h=H;
             P.colormap(out.colors);
+        } else {
+            // no locatable heightmap -> synthesize a flat ground plane so the
+            // map still renders (never just dots in the void).
+            out.grid_w=WW+1; out.grid_h=WH+1;
+            out.heights.assign((size_t)out.grid_w*out.grid_h, 0.0f);
         }
     }
     out.raw = P.buf;          // keep original bytes for native in-place save

@@ -30,6 +30,15 @@
 #include <vector>
 #include <set>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <commdlg.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
+
 // --- editor modes (mirrored from the S.W.I.N.E. editor) ----------------------
 struct Mode { const char* name; const char* focus; const char* tools; };
 static const Mode kModes[] = {
@@ -58,6 +67,7 @@ static char  g_mapPath[512] = "(no map loaded)";
 static char  g_openPath[512] = "";
 static bool  g_openPopup = false;
 static bool  g_orbiting = false, g_panning = false;
+static GLFWwindow* g_win = nullptr;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
 static std::string g_srcMap;                       // original .map (empty if .json)
@@ -225,6 +235,26 @@ static void doSave() {
         snprintf(g_saveStatus, sizeof(g_saveStatus), "Save failed.");
 }
 
+// Open via the OS native file picker (Windows explorer); text-field fallback else.
+static void doOpen() {
+#ifdef _WIN32
+    char file[1024] = {0};
+    OPENFILENAMEA ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_win ? glfwGetWin32Window(g_win) : nullptr;
+    ofn.lpstrFilter = "CPCW map or scene\0*.map;*.json\0All files\0*.*\0";
+    ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) && file[0]) loadScene(file);
+#else
+    g_openPopup = true;
+#endif
+}
+
+static void dropCallback(GLFWwindow*, int count, const char** paths) {
+    if (count > 0 && paths && paths[0]) loadScene(paths[0]);
+}
+
 static ImU32 playerColor(int p) {
     static const ImU32 c[] = {
         IM_COL32(200,200,200,255), IM_COL32(220,70,70,255), IM_COL32(70,120,220,255),
@@ -236,7 +266,7 @@ static ImU32 playerColor(int p) {
 static void drawMenuBar() {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open...", "Ctrl+O")) g_openPopup = true;
+        if (ImGui::MenuItem("Open...", "Ctrl+O")) doOpen();
         ImGui::MenuItem("New");
         if (ImGui::MenuItem("Save edits", "Ctrl+S", false, !g_srcMap.empty())) doSave();
         ImGui::Separator(); ImGui::MenuItem("Exit");
@@ -424,6 +454,8 @@ int main(int argc, char** argv) {
 #endif
     GLFWwindow* win = glfwCreateWindow(1360, 850, "CPCW Map Editor", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
+    g_win = win;
+    glfwSetDropCallback(win, dropCallback);   // drag-and-drop a .map / .json
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
     if (!loadGLCore()) fprintf(stderr, "warning: some GL functions failed to load\n");
@@ -494,7 +526,7 @@ int main(int argc, char** argv) {
 
         ImGuiIO& kio = ImGui::GetIO();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) doSave();
-        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_openPopup = true;
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) doOpen();
 
         ImGui::SetNextWindowBgAlpha(0.35f);
         if (ImGui::Begin("##status", nullptr,
