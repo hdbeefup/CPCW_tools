@@ -16,8 +16,10 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import math
+import os
 import struct
 import sys
 from collections import OrderedDict
@@ -760,6 +762,48 @@ class MapFile:
             grid.append(row)
         return grid, w, h
 
+    # -- lossless re-serialization (writer foundation) ----------------------
+
+    def _serialize_chunk(self, chunk):
+        """Emit a chunk (and its subtree) back to bytes.
+
+        Reconstructs from the parsed chunk boundaries rather than copying the
+        whole span, so edits to a nested chunk re-serialize correctly while an
+        untouched tree is byte-identical: for a leaf (no children) the original
+        [tag..content-end] span is emitted verbatim; for a container we emit its
+        8-byte tag+size header, then the bytes between ``data_offset`` and the
+        first child (the version/count sub-header), then each child recursively
+        with any inter-child gap bytes preserved, then the trailing bytes up to
+        the chunk end. This keeps *every* byte accounted for -- header padding,
+        gaps and unknown tails included -- which is what makes the round-trip
+        exact and safe to edit on top of.
+        """
+        d = self.data
+        start = chunk.offset
+        end = start + 8 + chunk.size
+        if not chunk.children:
+            return d[start:end]
+        out = bytearray()
+        out += d[start:chunk.children[0].offset]   # tag+size + sub-header
+        for i, ch in enumerate(chunk.children):
+            out += self._serialize_chunk(ch)
+            nxt = (chunk.children[i + 1].offset if i + 1 < len(chunk.children)
+                   else end)
+            out += d[ch.offset + 8 + ch.size:nxt]  # gap / tail after child
+        return bytes(out)
+
+    def pack(self):
+        """Re-serialize the whole map to bytes. Identity for an unedited file."""
+        out = bytearray(self._serialize_chunk(self.root))
+        root_end = self.root.offset + 8 + self.root.size
+        if root_end < len(self.data):
+            out += self.data[root_end:]            # preserve any file trailer
+        return bytes(out)
+
+    def write(self, path):
+        with open(path, 'wb') as f:
+            f.write(self.pack())
+
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -1224,6 +1268,49 @@ def _print_obj(obj, depth):
 # Main
 # ---------------------------------------------------------------------------
 
+def cmd_roundtrip(path, output=None, batch=False):
+    """Verify the writer: pack() must reproduce the original bytes exactly.
+
+    This is the foundation the editor stands on -- until parse->pack is identity
+    across every shipped map, no edit can be saved safely. --batch scans a dir.
+    """
+    if batch:
+        files = glob.glob(os.path.join(path, '**', '*.map'), recursive=True)
+        ok = bad = err = skip = 0
+        notes = []
+        for f in files:
+            try:
+                with open(f, 'rb') as fh:
+                    magic = fh.read(4)
+                if magic != b'SCEN':          # foreign .map (WASM/JSON/older engine)
+                    skip += 1
+                    continue
+                mf = MapFile(f)
+                if mf.pack() == mf.data:
+                    ok += 1
+                else:
+                    bad += 1
+                    if len(notes) < 12:
+                        notes.append('MISMATCH %s' % os.path.basename(f))
+            except Exception as e:
+                err += 1
+                if len(notes) < 12:
+                    notes.append('ERROR %s: %s' % (os.path.basename(f), e))
+        print('roundtrip: %d CPCW maps, exact=%d mismatch=%d error=%d '
+              '(skipped %d non-SCEN .map)' % (ok + bad + err, ok, bad, err, skip))
+        for n in notes:
+            print('  ', n)
+        return
+
+    mf = MapFile(path)
+    out = mf.pack()
+    print('%s: %d bytes, re-write %s' % (path, len(mf.data),
+          'IDENTICAL' if out == mf.data else 'DIFFERS (%d bytes)' % len(out)))
+    if output:
+        mf.write(output)
+        print('wrote', output)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Codename: Panzers Cold War .map file parser',
@@ -1232,13 +1319,19 @@ def main():
     )
     parser.add_argument('command',
                         choices=['info', 'structure', 'schemas', 'entities',
-                                 'terrain', 'dump', 'blck', 'gui'])
-    parser.add_argument('file', help='Path to .map file')
-    parser.add_argument('output', nargs='?', help='Output path (for blck command)')
+                                 'terrain', 'dump', 'blck', 'gui', 'roundtrip'])
+    parser.add_argument('file', help='Path to .map file (or directory for roundtrip --batch)')
+    parser.add_argument('output', nargs='?', help='Output path (blck / roundtrip write)')
     parser.add_argument('--json', action='store_true', help='JSON output (dump)')
     parser.add_argument('--depth', type=int, default=None, help='Max depth (structure)')
+    parser.add_argument('--batch', action='store_true', help='Recurse a directory (roundtrip)')
 
     args = parser.parse_args()
+
+    if args.command == 'roundtrip':
+        cmd_roundtrip(args.file, args.output, args.batch)
+        return
+
     mf = MapFile(args.file)
 
     if args.command == 'info':
