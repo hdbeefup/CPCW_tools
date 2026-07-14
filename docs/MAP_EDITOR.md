@@ -105,13 +105,23 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       Python). Native Windows Open dialog + drag-and-drop. WASD/arrow camera with a
       speed floor. 3D click-select, drag-to-move, `[`/`]` rotate, editable Pos/Dir/
       Player in Properties, Ctrl+S native byte-faithful save.
-- [~] **M6 — GUI editing** (started): the Properties panel edits a selected
-      entity's Player/Pos; File > Save edits (Ctrl+S) writes the changes back
-      through `cpcw_map.py apply` to `<map>_edited.map` (never overwrites the
-      original). Verified end-to-end (edit -> apply -> reload, byte-faithful).
-      Still TODO: viewport gizmos/terrain brushes driving the edit-ops, undo/redo,
-      structural edits (add/remove entity — needs chunk-size recompute + the OBJS
-      `schema_offset` absolute-pointer fixups), 3D click-select.
+- [x] **M6 — full interactive editing** (all native, byte-faithful):
+      - Textured DDS models on the terrain; WASD/arrow + orbit/pan/zoom camera.
+      - Entities: 3D click-select, drag-to-move, `[`/`]` rotate, editable Pos/Dir/
+        Player; **delete** (Delete), **duplicate/place** (Ctrl+D + prototype browser).
+        Structural add/delete patch every ancestor container size + OBJS
+        `schema_offset` + UNTS `entity_count` (WRLD is a container to EOF holding
+        UNTS — must shrink/grow too).
+      - Terrain: Raise/Lower/Smooth brushes (camera-ray → grid, radial falloff),
+        per-cell dirty mask so save changes only brushed cells.
+      - **Undo/redo** (Ctrl+Z/Y); **Ctrl+S** native save (`<map>_edited.map`).
+- [x] **M7 — PAK reading**: native `.pak` reader (decrypt + zlib) + VFS; the exe
+      auto-mounts main1/main2/enUS.pak next to it and reads maps/models/textures/
+      ProtoDB straight from them (single-exe in the game folder). File > "Open from
+      .pak" browses maps. Verified: a full scene renders from the Steam paks alone.
+- [ ] **Remaining**: model **thumbnails** for the prototype browser (THMB codec
+      undecoded; render-based previews deferred); placing prototypes not already on
+      the map (needs OBJT construction); confirm the model handedness axis vs the game.
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).
