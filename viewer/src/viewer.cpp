@@ -37,6 +37,10 @@ static IDirect3D9*        g_d3d = nullptr;
 static IDirect3DDevice9*  g_dev = nullptr;
 static IDirect3D9Ex*      g_d3dEx = nullptr;   // non-null when running the Ex path (e.g. under RDP)
 static HWND               g_hwnd = nullptr;
+// D3D9Ex forbids D3DPOOL_MANAGED, so pick pools/usage per device type.
+static D3DPOOL            g_bufPool = D3DPOOL_MANAGED;   // VB/IB pool
+static D3DPOOL            g_texPool = D3DPOOL_MANAGED;   // texture pool
+static DWORD              g_texUsage = 0;                // D3DUSAGE_DYNAMIC on Ex (so DEFAULT is lockable)
 static int                g_w = 1280, g_h = 960;
 
 struct GpuMesh {
@@ -143,8 +147,8 @@ static IDirect3DTexture9* loadTexture(const std::string& basename) {
     if (it != g_texIndex.end()) {
         DdsImage img = dds_load(it->second);
         if (img.ok) {
-            if (SUCCEEDED(g_dev->CreateTexture(img.width, img.height, 1, 0,
-                    D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr))) {
+            if (SUCCEEDED(g_dev->CreateTexture(img.width, img.height, 1, g_texUsage,
+                    D3DFMT_A8R8G8B8, g_texPool, &tex, nullptr))) {
                 D3DLOCKED_RECT lr;
                 if (SUCCEEDED(tex->LockRect(0, &lr, nullptr, 0))) {
                     for (int y = 0; y < img.height; y++) {
@@ -202,13 +206,13 @@ static void buildGpu() {
         gm.numTris = (int)rm.indices.size() / 3;
         int vbSize = gm.numVerts * (int)sizeof(RVertex);
         if (FAILED(g_dev->CreateVertexBuffer(vbSize, D3DUSAGE_WRITEONLY, FVF_MODEL,
-                D3DPOOL_MANAGED, &gm.vb, nullptr))) continue;
+                g_bufPool, &gm.vb, nullptr))) continue;
         void* pv = nullptr; gm.vb->Lock(0, 0, &pv, 0);
         memcpy(pv, rm.verts.data(), vbSize); gm.vb->Unlock();
 
         int ibSize = (int)rm.indices.size() * (int)sizeof(uint32_t);
         if (FAILED(g_dev->CreateIndexBuffer(ibSize, D3DUSAGE_WRITEONLY, D3DFMT_INDEX32,
-                D3DPOOL_MANAGED, &gm.ib, nullptr))) { gm.vb->Release(); continue; }
+                g_bufPool, &gm.ib, nullptr))) { gm.vb->Release(); continue; }
         void* pi = nullptr; gm.ib->Lock(0, 0, &pi, 0);
         memcpy(pi, rm.indices.data(), ibSize); gm.ib->Unlock();
 
@@ -507,7 +511,15 @@ static bool initD3D(bool visible) {
         } else {
             hr = g_d3d->CreateDevice(D3DADAPTER_DEFAULT, a.type, g_hwnd, a.vp, &pp, &g_dev);
         }
-        if (SUCCEEDED(hr)) { printf("D3D device: %s (%s)\n", a.name, g_d3dEx ? "D3D9Ex" : "D3D9"); return true; }
+        if (SUCCEEDED(hr)) {
+            if (g_d3dEx) {   // Ex disallows MANAGED; use DEFAULT (+ dynamic textures so they lock)
+                g_bufPool = D3DPOOL_DEFAULT; g_texPool = D3DPOOL_DEFAULT; g_texUsage = D3DUSAGE_DYNAMIC;
+            } else {
+                g_bufPool = D3DPOOL_MANAGED; g_texPool = D3DPOOL_MANAGED; g_texUsage = 0;
+            }
+            printf("D3D device: %s (%s)\n", a.name, g_d3dEx ? "D3D9Ex" : "D3D9");
+            return true;
+        }
     }
     printf("D3D device creation failed. adapters=%u exHr=0x%08lX\n",
            adapters, (unsigned long)hrEx);

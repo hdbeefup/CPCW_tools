@@ -18,10 +18,17 @@ own conventions, which is exactly what a `reccmp`-style effort matches against
 - Parses `.srm` directly (port of `blendertools/SRM_Blender/srm_format.py`):
   MAIN → PMOD node headers + MESH block; BONE palette, INDS indices, VERS
   streams keyed by **D3DDECLUSAGE**.
-- **Skinning — the proven game rule** (no inverse-bind, verified in Ghidra):
-  `v_world = boneWorld[ BONE_palette[boneIdx] ] · v_stored`.
-  - *Rigid*: bone-palette index = **byte 3 of the NORMAL stream**.
-  - *Smooth*: `BLENDINDICES` + `BLENDWEIGHT` streams, up to 4 influences.
+- **Skinning** — two cases, distinguished by how the vertices are stored:
+  - *Rigid* (vehicles): no `BLENDINDICES` stream; each vertex's bone-palette
+    index is **byte 3 of the NORMAL stream** and its position is in that bone's
+    **local** space, so the proven rule `v_world = boneWorld[palette[idx]] · v`
+    assembles it (verified in Ghidra: no inverse-bind).
+  - *Smooth* (characters): has `BLENDINDICES` + `BLENDWEIGHT` streams and the
+    vertices are in **model** space. The engine's per-bone skin matrix is
+    `boneWorld · inverseBind`, which at the static rest pose is **identity** —
+    so a static viewer must render the **bind pose** (applying `boneWorld`
+    alone would double-transform and mangle the mesh). We therefore leave
+    smooth meshes in bind pose; they'd only move once animation is evaluated.
   - *Unskinned* meshes (most buildings/props): placed by the owning node's
     world matrix (`T·R·S`, `R = Rx·Ry·Rz`, composed up the parent chain).
 - Native **left-handed** rendering: no LH→RH reflection, no winding reversal —

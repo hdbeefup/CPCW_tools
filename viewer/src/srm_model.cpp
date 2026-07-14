@@ -245,8 +245,13 @@ void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
 
         int vcount = pos->vertexCount;
         bool haveBones = !mesh.bones.empty();
-        bool rigid = haveBones && nrm && nrm->stride == 4;
+        // A BLENDINDICES stream = smooth skinning: verts are in MODEL space and
+        // the game's skin matrix is boneWorld*inverseBind, which at the static
+        // rest pose is identity -> render the bind pose (do NOT apply boneWorld,
+        // which would double-transform, mangling characters). Rigid meshes have
+        // no BLENDINDICES: their verts are in bone-LOCAL space -> skin normally.
         bool smooth = haveBones && bi && bi->stride == 4;
+        bool rigid = haveBones && !smooth && nrm && nrm->stride == 4;
 
         RenderMesh rm;
         rm.nodeIndex = (int)ni;
@@ -272,20 +277,8 @@ void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
                 int best = 0; for (int k = 1; k < 4; k++) if (w[k] > w[best]) best = k;
                 int bl = bid[best];
                 if (bl < (int)mesh.bones.size()) boneNode = mesh.bones[bl];
-                if (skinned) {
-                    wp = Vec3(0,0,0); wn = Vec3(0,0,0);
-                    float wsum = 0;
-                    for (int k = 0; k < 4; k++) {
-                        if (w[k] <= 0) continue;
-                        int local = bid[k];
-                        int bn = (local < (int)mesh.bones.size()) ? mesh.bones[local] : -1;
-                        if (bn < 0 || bn >= (int)world.size()) continue;
-                        wp = wp + world[bn].point(p) * w[k];
-                        wn = wn + rot[bn].dir(nrmv) * w[k];
-                        wsum += w[k];
-                    }
-                    if (wsum <= 1e-6f) { wp = p; wn = nrmv; }
-                } else { wp = world[ni].point(p); wn = rot[ni].dir(nrmv); }
+                // Smooth: always bind pose (static skin matrix == identity).
+                wp = world[ni].point(p); wn = rot[ni].dir(nrmv);
             } else if (haveBones && rigid) {
                 const uint8_t* nd = nrm->data.data() + (size_t)vi * nrm->stride;
                 int local = nd[3];
