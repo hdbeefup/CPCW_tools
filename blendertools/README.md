@@ -38,14 +38,18 @@ ProtoDB.bin                                       # prototype DB (for future mod
   The left-handed→right-handed conversion is baked into geometry (models import
   upright and un-mirrored); the root Empty carries only the uniform scale.
   - **Assemble** modes:
-    - **Auto** — *default*. Skins bone-local parts (wheels, turret, tracks,
-      rotors, panels, hulls) into place and leaves already-posed model-space
-      bodies (a civilian car body/speaker) where they are — one setting for
-      tanks, cars, aircraft and buildings. (An inferred proxy for the engine's
-      unstored inverse-bind, not a decoded flag; if a model looks wrong, try the
-      overrides below.)
-    - **Full (debug)** — skins *every* group by its bone. Same as Auto for
-      fully-articulated models; shifts a civilian car body off-centre.
+    - **Auto** — *default*. Decides **per bone-group**: skins a group only if its
+      bone's world matrix moves the group centroid a *small* amount relative to
+      the mesh size, and leaves groups that would fly far — model-space building
+      parts (whole walls/beams) and animated-bone floaters (tank road wheels) —
+      in bind pose. One setting for tanks, cars, aircraft *and* buildings.
+      (Smooth-skinned meshes — characters/animals, with a BLENDINDICES stream —
+      are always bind pose; see the format notes.) An inferred proxy for the
+      engine's unstored inverse-bind, not a decoded flag; if a model looks wrong,
+      try the overrides below. Matches the standalone `viewer/` AUTO mode.
+    - **Full (debug)** — skins *every* rigid group by its bone (the exact engine
+      rule): assembles fully-articulated vehicles, but *scatters* model-space
+      buildings and floats animated bones.
     - **Off (raw bind pose)** — no skinning; each mesh placed by its node matrix.
   - **Variant** — vehicles pack every upgrade loadout into one file; the part's
     variant is read from the bone it is skinned to (`_std` / `_upg` / `camo`).
@@ -118,11 +122,13 @@ converter got wrong:
 - **Rigid skinning + AUTO assembly.** Each vertex stores a **bone-palette index
   in byte 3 of the NORMAL stream** (`Usage == 3`; corpus-verified
   `max(byte3) <= bone_count-1`). The game renders `BoneWorld[b] @ InvBind[b] @ v`
-  but stores no InvBind, so **Auto** mode uses a geometric proxy: skin bone-local
-  parts (wheels/turret/tracks/rotors/panels/hulls) by their bone matrix, leave
-  already-posed model-space bodies in place. It matches every tested model but is
-  an inferred heuristic, not a decoded flag — `Full`/`Off` remain as overrides.
-  Rotations compose `Rx @ Ry @ Rz`.
+  but stores no InvBind, so **Auto** mode uses a per-group proxy: for each
+  bone-group, skin it by its bone matrix only if that moves the group's centroid
+  a small amount relative to the mesh size, else leave it in bind pose. This skins
+  bone-local vehicle parts (hull/turret/tracks) while leaving model-space building
+  parts and animated-bone floaters where they belong. It matches every tested
+  model (and the standalone `viewer/`) but is an inferred heuristic, not a decoded
+  flag — `Full`/`Off` remain as overrides. Rotations compose `Rx @ Ry @ Rz`.
 - **Smooth-skinned meshes (characters/animals) render in bind pose.** These carry
   explicit BLENDINDICES (`Usage == 2`) + BLENDWEIGHT (`Usage == 1`) streams and
   store their vertices in **model space**. The engine's per-bone skin matrix is

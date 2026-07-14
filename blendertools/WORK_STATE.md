@@ -291,3 +291,15 @@ User-reported via live testing; all in viewer/src/srm_model.cpp:
   or faithful; not fixable from static data without guessing.
 - Blender importer has the SAME smooth-mesh gap (doesn't read blend_indices);
   fix drafted+reverted (needs owning-node placement) -- documented follow-up.
+
+### importer AUTO now uses the per-group rule (matches viewer)
+Ported the viewer's per-group displacement rule into the Blender importer's AUTO:
+_skin_decisions (import_srm.py) now skins a bone-group iff its bone's world
+matrix moves the group centroid < 1.0x mesh extent, else leaves it in bind pose
+(replaces the old dominant-body/off-centre proxy that EXPLODED model-space rigid
+buildings). Mesh-owning nodes are identity in the corpus, so a left group's
+stored coords already are its bind-pose world position (no leave-placement change
+needed). Verified headless (Blender 5.0): guardtower imports INTACT; moskvitch/
+Patton/bulldozer/british_barrack still assemble; character stays bind pose (smooth
+path). Importer AUTO == standalone viewer AUTO. Also: smooth-skinned meshes
+(BLENDINDICES) now import in bind pose in BOTH tools (_mesh_is_smooth).
