@@ -268,3 +268,26 @@ future CPCW decompile.
   session CONNECTED; earlier in-session renders worked, then failed after the
   session disconnected. Not a bug — clear on-screen message added; `--info`
   is the display-free fallback.
+
+### viewer skinning fixes (characters, buildings, AUTO mode)
+User-reported via live testing; all in viewer/src/srm_model.cpp:
+- **Smooth-skinned meshes (characters/animals)** were mangled in FULL. Root
+  cause: BLENDINDICES meshes store verts in MODEL space; skin matrix =
+  boneWorld*inverseBind = identity at rest -> must render BIND POSE. Fix: a mesh
+  with a BLENDINDICES stream is never skinned (bind pose). cn-combat-engineer /
+  su-civil-female / Horse now correct.
+- **Model-space rigid buildings** (guardtower) EXPLODED under FULL: their rigid
+  mesh is model-space, not bone-local. The .srm can't flag skin-vs-static (the
+  game decides by object type). Added **AUTO mode (new default)**: per bone-GROUP,
+  skin only if boneWorld moves the group's centroid < ~1.0x mesh extent; leave
+  far-flying groups (building beams, animated wheels) in bind pose. Guardtower now
+  intact; Patton/moskvitch still assemble. F now cycles AUTO/FULL/NONE; --skin
+  auto|full|none.
+- **RDP fix (required for rendering at all):** D3D9Ex device + DEFAULT pools +
+  dynamic textures (Ex forbids MANAGED). Live render needs the RDP session
+  CONNECTED (0 adapters when disconnected).
+- Open edge case: th_mainhall_news display board shows a tilted rest pose (FULL==
+  AUTO; NONE splays the walls so walls DO need skinning) -- likely animated bone
+  or faithful; not fixable from static data without guessing.
+- Blender importer has the SAME smooth-mesh gap (doesn't read blend_indices);
+  fix drafted+reverted (needs owning-node placement) -- documented follow-up.
