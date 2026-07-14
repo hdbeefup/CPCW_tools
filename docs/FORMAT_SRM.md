@@ -343,3 +343,101 @@ read per-vertex from each vertex's bone tag. Only 18 of 2087 models carry these
 tags; the rest are entirely untagged (base) so the filter is a no-op. Note the
 match is on the `_std`/`_upg` **suffix**, not a bare `camo` substring — otherwise
 a model whose own name contains "camo" (e.g. `camo_tent`) would be wrongly hidden.
+
+## MOTS Chunk — Node Animation
+
+A top-level chunk that follows `PMOD` in **95 of the 2087** models. It stores
+keyframed **node** animation — the ambient/scripted motions the engine plays:
+machinery loops (lighthouse beam, radar dish, windmill sails, oil derrick,
+helicopter rotor), construction rise, open/close, and destruction. Reader:
+`cpcw_mots.py` (`parse_mots(path) -> [Motion]`).
+
+**This is not the runtime "settle" of animated bones** (tank road wheels /
+suspension). That pose is terrain-contact IK computed at runtime and is *not*
+stored anywhere in the file — MOTS does not contain it.
+
+**How the animation reaches geometry — scene graph, not skinning.** A MOTS
+channel animates a *node's local transform*. Child **mesh nodes** inherit it
+through the parent chain (`world = parent · local`), the ordinary node
+hierarchy. Example — `SU_Mi-4_M15.srm`: node `anim_rotorcsucs1` (the rotor hub)
+is animated, and mesh node `anim_rotor1` is its child, so animating the hub spins
+the rotor. The animated nodes are **not** entries in any mesh bone palette, so the
+rigid-skinning path is unrelated. (A few models — lighthouse, windmill — animate
+nodes that carry only a light *effect*, not mesh, so nothing visibly moves in the
+model file itself.) Animated nodes are conventionally named `anim_*`.
+
+### Layout (little-endian; offsets are chunk-body-relative)
+
+```
+MOTS body:
+  "v004"                                   version
+  MOTI chunk ...                           one per motion
+
+MOTI (tag + u32 size):
+  u16 name_len, name                       e.g. "object_meshloopplaying_idx1"
+  i32 target_obj                           object/LOD index (0 = base)
+  f32 weight                               1.0 in every shipped file
+  i32 0
+  i32 node_count                           == the model's node count
+  i32 node_channel[node_count]             per-node channel index, -1 = static
+  ANIM chunk
+
+ANIM (tag + u32 size):
+  "v002"                                   version
+  f32 duration                             seconds
+  i32 0, i32 0, i32 1
+  i32 channel_count
+  i32 28 (header_size)  + pad to 32
+  channel_record[channel_count]            68 bytes each
+  keyframe pool                            68-byte records, packed per channel
+
+channel_record (68 bytes):
+  f32 base[10]                             rest/summary floats (echo first key)
+  i32 key_count
+  i32 unk
+  i32 key_offset                           byte offset (rel. to byte after
+                                           ANIM's "v002") of this channel's keys
+  i32 pad[4]
+
+keyframe (68 bytes) — VERIFIED fields carry the animated value:
+  i32 link_in                              chains prev key's link_out
+  i32 0, i32 0
+  i32 4, i32 2, i32 0                      (provisional: type/count tags)
+  f32 t_or_dur                             == ANIM.duration in every key (NOT
+                                           a per-key time)
+  f32 value0                               the animated scalar
+  f32 value1                               == value0 for interpolated keys
+  f32 0[4]
+  i32 201, i32 2                           (provisional)
+  i32 pool_offset                          cumulative, +~402 per key
+  i32 link_out                             chains next key's link_in
+```
+
+### Motion name vocabulary (`object_<kind>_idx<n>`)
+
+| kind                | count | meaning |
+|---------------------|-------|---------|
+| `dest`              | 158   | destruction (parts fly / collapse) — value pairs look physics-like, not sampled poses |
+| `animon`            | 48    | start/continuous machinery motion (rotor, dish, sails) |
+| `const`             | 22    | construction (structure rises into place) |
+| `animoff`           | 17    | stop / reverse motion |
+| `meshloopplaying`   | 12    | looping motion (lighthouse beam, factory belt) |
+| `pawup` / `pawdown` | 1 ea. | animal foot |
+
+### What is proven vs. provisional
+
+**Proven (self-consistent across the corpus, `cpcw_mots.py` parses all 95):** the
+container/MOTI/ANIM/channel/keyframe structure; the `node_channel` map (it lands
+exactly on the `anim_*` nodes); and that **`value0` is a rotation angle in
+radians** — machinery loops read clean multiples of `2π` (lighthouse lamp
+`-6.283 = -2π`, one turn; Mi-4 rotor `-62.832 = -20π`, ten turns; windmill/derrick
+multi-turn).
+
+**Provisional (wants a Ghidra pass on the engine's motion evaluator before
+playback is treated as ground-truth):** the per-key **time** (the `t_or_dur`
+field is constant `= duration`, so keys currently must be assumed uniformly
+spaced), the **interpolation** curve, and exactly **which transform component /
+axis** `value0` drives per node (rotation is clear for the loop cases; position
+and scale channels — e.g. construction rise — are not yet disambiguated). The
+`link_in/out` chain and `pool_offset` are decoded positionally but their runtime
+role is unconfirmed.
