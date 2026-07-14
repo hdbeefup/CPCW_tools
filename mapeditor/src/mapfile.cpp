@@ -54,7 +54,8 @@ struct Chunk {
 };
 
 // ---- parsed object value (only what the Scene needs is interpreted) --------
-struct Value { int kind=0; double f=0, v3[3]={0,0,0}; long i=0; std::string s; };
+struct Value { int kind=0; double f=0, v3[3]={0,0,0}; long i=0; std::string s;
+               long off=-1; uint32_t ftype=0; };
 enum { V_NONE, V_INT, V_FLOAT, V_VEC3, V_STR };
 typedef std::map<std::string, Value> Obj;
 
@@ -188,7 +189,9 @@ struct Parser {
         if (it!=schemas.end()) {
             for (auto& fl : it->second.fields) {
                 if (p>=contentEnd) break;
+                size_t fstart=p;
                 Value val; p = readField(p, fl.type, fl.size, contentEnd, val);
+                val.off=(long)fstart; val.ftype=fl.type;
                 if (val.kind!=V_NONE) obj[fl.name]=val;
             }
         }
@@ -373,9 +376,9 @@ bool load_map_native(const std::string& path, Scene& out) {
         Entity e;
         auto it=o.find("_type"); e.type = (it!=o.end()&&it->second.kind==V_STR)?it->second.s:"?";
         auto pr=o.find("Prototype"); if(pr!=o.end()&&pr->second.kind==V_STR) e.proto=pr->second.s;
-        auto ps=o.find("Pos"); if(ps!=o.end()&&ps->second.kind==V_VEC3){ e.pos[0]=(float)ps->second.v3[0]; e.pos[1]=(float)ps->second.v3[1]; e.pos[2]=(float)ps->second.v3[2]; }
+        auto ps=o.find("Pos"); if(ps!=o.end()&&ps->second.kind==V_VEC3){ e.pos[0]=(float)ps->second.v3[0]; e.pos[1]=(float)ps->second.v3[1]; e.pos[2]=(float)ps->second.v3[2]; e.posOff=ps->second.off; }
         auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; }
-        auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT) e.player=(int)pl->second.i;
+        auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT){ e.player=(int)pl->second.i; e.playerOff=pl->second.off; e.playerFtype=pl->second.ftype; }
         auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT) e.id=id->second.i;
         e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
         out.entities.push_back(std::move(e));
@@ -388,6 +391,38 @@ bool load_map_native(const std::string& path, Scene& out) {
             P.colormap(out.colors);
         }
     }
+    out.raw = P.buf;          // keep original bytes for native in-place save
+    out.srcPath = path;
     out.loaded = true;
+    return true;
+}
+
+// FT ids needed by the saver (must match the enum above)
+enum { SAVE_FT_INT32=0x0001, SAVE_FT_UINT8=0x0017, SAVE_FT_INT16=0x0019,
+       SAVE_FT_IID=0x0013, SAVE_FT_ENTREF=0x0014 };
+
+bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
+                     const std::string& outPath) {
+    if (s.raw.empty()) return false;
+    std::vector<unsigned char> b = s.raw;   // copy; overwrite only edited fields
+    auto put32=[&](long off, uint32_t v){ if(off<0||off+4>(long)b.size())return; b[off]=v&0xff; b[off+1]=(v>>8)&0xff; b[off+2]=(v>>16)&0xff; b[off+3]=(v>>24)&0xff; };
+    auto putf =[&](long off, float f){ uint32_t v; std::memcpy(&v,&f,4); put32(off,v); };
+    for (long id : editedIds) {
+        const Entity* e=nullptr;
+        for (const auto& en : s.entities) if (en.id==id) { e=&en; break; }
+        if (!e) continue;
+        if (e->posOff>=0) { putf(e->posOff,e->pos[0]); putf(e->posOff+4,e->pos[1]); putf(e->posOff+8,e->pos[2]); }
+        if (e->playerOff>=0) {
+            long o=e->playerOff; uint32_t v=(uint32_t)e->player;
+            switch (e->playerFtype) {
+                case SAVE_FT_UINT8: if(o<(long)b.size()) b[o]=v&0xff; break;
+                case SAVE_FT_INT16: if(o+2<=(long)b.size()){ b[o]=v&0xff; b[o+1]=(v>>8)&0xff; } break;
+                default: put32(o,v); break;   // INT32 / IID / ENTREF
+            }
+        }
+    }
+    std::ofstream f(outPath, std::ios::binary);
+    if (!f) return false;
+    f.write((const char*)b.data(), b.size());
     return true;
 }

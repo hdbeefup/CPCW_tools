@@ -206,34 +206,23 @@ static bool loadScene(const std::string& path) {
     return true;
 }
 
-// Save edited entity fields back to a .map through cpcw_map.py's verified `apply`
-// path (writes <map>_edited.map next to the source; never overwrites originals).
+// Save edited entity fields natively (no Python): overwrite Pos/Player in place
+// in a copy of the loaded bytes and write <map>_edited.map (byte-faithful).
 static void doSave() {
-    if (g_srcMap.empty()) {
+    if (g_scene.raw.empty() || g_srcMap.empty()) {
         snprintf(g_saveStatus, sizeof(g_saveStatus),
                  "Save needs a .map source (open a .map, not a .json)."); return;
     }
     if (g_edited.empty()) {
         snprintf(g_saveStatus, sizeof(g_saveStatus), "No edits to save."); return;
     }
-    nlohmann::json edits = nlohmann::json::array();
-    for (const Entity& e : g_scene.entities)
-        if (g_edited.count(e.id))
-            edits.push_back({{"id", e.id}, {"player", e.player},
-                             {"pos", {e.pos[0], e.pos[1], e.pos[2]}}});
-    nlohmann::json doc; doc["edits"] = edits;
-    const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
-    std::string ej = std::string(tmp) + "/cpcw_mapedit_edits.json";
-    { std::ofstream f(ej); f << doc.dump(); }
+    std::vector<long> ids(g_edited.begin(), g_edited.end());
     std::string out = g_srcMap.substr(0, g_srcMap.size() - 4) + "_edited.map";
-    const char* env = getenv("CPCW_MAP_PY");
-    std::string script = env ? env : "cpcw_map.py";
-    std::string cmd = "python \"" + script + "\" apply \"" + g_srcMap + "\" \"" +
-                      out + "\" --edits \"" + ej + "\"";
-    std::string res = runCapture(cmd);
-    snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved %d edit(s) -> %s",
-             (int)g_edited.size(), out.c_str());
-    (void)res;
+    if (save_map_native(g_scene, ids, out))
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved %d edit(s) -> %s",
+                 (int)g_edited.size(), out.c_str());
+    else
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "Save failed.");
 }
 
 static ImU32 playerColor(int p) {
@@ -404,6 +393,17 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
+        else if (!strcmp(argv[i], "--applytest") && i + 7 < argc) {
+            // dev: --applytest <map> <id> <px> <py> <pz> <player> <out>
+            Scene s; if (!load_map_native(argv[i+1], s)) return 2;
+            long id = atol(argv[i+2]);
+            for (auto& e : s.entities) if (e.id == id) {
+                e.pos[0]=(float)atof(argv[i+3]); e.pos[1]=(float)atof(argv[i+4]);
+                e.pos[2]=(float)atof(argv[i+5]); e.player=atoi(argv[i+6]);
+            }
+            bool ok = save_map_native(s, {id}, argv[i+7]);
+            printf("applytest %s\n", ok ? "ok" : "fail"); return ok ? 0 : 3;
+        }
     }
     if (!loadPath.empty()) loadScene(loadPath);
     if (selftest) {

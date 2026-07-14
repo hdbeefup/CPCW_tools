@@ -37,7 +37,8 @@ Or just launch it and use **File > Open** (or drag none — type a path in the p
 ## Data flow
 `.map` files are parsed **natively** by `mapfile.cpp` (a faithful C++ port of
 `../cpcw_map.py`: chunk tree, SCHD schemas, OBJT/VOBJ entities, heightmap locator,
-splatmap colormap) straight into the in-memory scene — the editor is
-self-contained, no Python at runtime. `cpcw_map.py` remains the *oracle* the port
-is verified against (native entity counts / grid dims / render match it exactly),
-and it still handles the byte-faithful **save** (`apply`) path used by File > Save.
+splatmap colormap) straight into the in-memory scene, and **saved natively** too
+(edited entity fields written in place into a copy of the original bytes — byte-
+faithful). **No Python at runtime.** `cpcw_map.py` remains the *oracle* the port is
+verified against: native entity counts / grid dims / render match it exactly over
+all 45 maps, and native save is byte-identical to `cpcw_map.py apply`.
