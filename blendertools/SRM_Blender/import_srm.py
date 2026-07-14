@@ -260,63 +260,45 @@ def _build_world_matrices(nodes):
     return [world(i) for i in range(len(nodes))]
 
 
-def _skin_decisions(verts, bone_idx, palette, world_mats,
-                    dom_ratio=0.6, offcenter_frac=0.15):
-    """Decide, per bone-palette group, whether to SKIN it (apply the bone's
-    world matrix) or LEAVE it in place (model space).
+def _skin_decisions(verts, bone_idx, palette, world_mats, fly=1.0):
+    """Decide, per bone-palette group, whether to SKIN it or LEAVE it (bind pose).
 
-    NOTE: this is a practical HEURISTIC, not the game's rule. Ghidra PROVED the
-    game's exact rule is simply ``world_v = BoneWorld[b] @ v`` (a stored node
-    world matrix per bone, NO inverse-bind — see docs/FORMAT_SRM.md and
-    SKINNING_RESULT.md). That rule is what ``apply_skin='FULL'`` does and it is
-    EXACT for non-animated bones. The catch is animated bones (tank road wheels,
-    suspension travel): the engine recomputes their world matrix per frame, so
-    their settled rest pose is not in the static file, and skinning a body/part
-    bound to one by the *static* hierarchy value misplaces it. AUTO papers over
-    that by LEAVING such a group in model space (equivalent to treating its bone's
-    effective rest transform as identity):
+    Ports the standalone viewer's per-group rule (``auto_bind_groups`` in
+    ``viewer/src/srm_model.cpp``). A rigid mesh mixes bone-local parts (which
+    assemble under ``BoneWorld[b] @ v``) with model-space parts (whole buildings)
+    and animated bones whose static pose is wrong (tank road wheels). For each
+    group we skin its centroid by its bone's world matrix and measure how far it
+    MOVES relative to the mesh size: a group that flies far (> ``fly`` x extent)
+    is model-space or an animated floater, so we LEAVE it in bind pose; groups
+    that assemble with small displacement (vehicle hull/turret/tracks) are
+    skinned. (Mesh-owning nodes are identity in the corpus, so a left group's
+    stored coords already ARE its bind-pose world position.)
 
-    * **bone-local** parts (wheels, gun barrels, turret, tracks, rotor blades,
-      building panels, and even whole hulls like the Patton's) are authored at
-      their bone's origin, so ``BoneWorld[b] @ v`` places them -> **SKIN**.
-    * a large body merely *anchored* to an animated side node (a civilian car
-      body on ``suspension0l``) would be shoved off-centre by that node's static
-      world matrix, so AUTO -> **LEAVE** (matches the settled look better).
-
-    The two are told apart by a robust, vehicle-agnostic proxy for that InvBind:
-    a group is model-space (LEAVE) only when it BOTH (a) spans most of the mesh
-    (a whole body, ``gdiag >= dom_ratio * mesh_diag``) AND (b) skinning it would
-    shove that body OFF the x=0 longitudinal centre-line that every vehicle body
-    is authored symmetric about (``|skin_cx| - |stored_cx| > offcenter_frac *
-    x_extent``).  A bone-local body sits on a central bone (Patton ``body0``,
-    world Tx~0) so skinning keeps it centred -> SKIN; a model-space body is
-    anchored to a lateral bone (``suspension0l``, world Tx~-0.6) so skinning
-    shoves it sideways -> LEAVE.  Small parts never meet (a) and always SKIN.
+    This replaces the earlier dominant-body / off-centre proxy, which mis-skinned
+    model-space rigid *buildings* (e.g. the guardtower exploded). Still a
+    heuristic — the .srm does not flag skin-vs-static, the game decides by object
+    type — so ``FULL`` / ``OFF`` remain as overrides.
 
     Returns ``{palette_index: skin_bool}``.
     """
+    xs = [p[0] for p in verts]; ys = [p[1] for p in verts]; zs = [p[2] for p in verts]
+    ext = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1.0
     groups = {}
     for vi, bi in enumerate(bone_idx):
         groups.setdefault(bi, []).append(verts[vi])
-    xs = [p[0] for p in verts]; ys = [p[1] for p in verts]; zs = [p[2] for p in verts]
-    mesh_diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 +
-                 (max(zs) - min(zs)) ** 2) ** 0.5 or 1.0
-    x_extent = (max(xs) - min(xs)) or 1.0
     out = {}
     for bi, pts in groups.items():
-        gx = [p[0] for p in pts]; gy = [p[1] for p in pts]; gz = [p[2] for p in pts]
-        gdiag = ((max(gx) - min(gx)) ** 2 + (max(gy) - min(gy)) ** 2 +
-                 (max(gz) - min(gz)) ** 2) ** 0.5
-        cx = sum(gx) / len(pts); cy = sum(gy) / len(pts); cz = sum(gz) / len(pts)
-        skin = True
+        n = len(pts)
+        cx = sum(p[0] for p in pts) / n
+        cy = sum(p[1] for p in pts) / n
+        cz = sum(p[2] for p in pts) / n
         bn = palette[bi] if 0 <= bi < len(palette) else -1
         if 0 <= bn < len(world_mats):
             sc = world_mats[bn] @ Vector((cx, cy, cz))
-            dominant = gdiag >= dom_ratio * mesh_diag
-            off_center = abs(sc.x) - abs(cx) > offcenter_frac * x_extent
-            if dominant and off_center:
-                skin = False
-        out[bi] = skin
+            disp = ((sc.x - cx) ** 2 + (sc.y - cy) ** 2 + (sc.z - cz) ** 2) ** 0.5
+            out[bi] = (disp / ext) <= fly
+        else:
+            out[bi] = False
     return out
 
 
