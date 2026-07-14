@@ -62,6 +62,11 @@ bool srm_parse(const std::string& path, SrmModel& out, std::string* err = nullpt
 
 enum SkinMode { SKIN_FULL, SKIN_NONE };   // FULL = exact game rule; NONE = raw bind pose
 
+// Upgrade-variant filter. Vehicles pack every loadout in one .srm; a part's
+// variant is read from the SUFFIX of the bone it is skinned to (_std / _upg;
+// camo-net parts always carry _upg). Matches import_srm.py's convention.
+enum Variant { VAR_ALL, VAR_STANDARD, VAR_UPGRADED };
+
 struct RVertex { float x, y, z, nx, ny, nz, u, v; };
 
 struct RenderMesh {
@@ -74,5 +79,6 @@ struct RenderMesh {
 // Build world matrices per node (parent chain, T*R*S, R=Rx*Ry*Rz).
 std::vector<Mat4> srm_world_matrices(const SrmModel& m);
 
-// Produce world-space render meshes (skinned per `mode`).
-void srm_build_render(const SrmModel& m, SkinMode mode, std::vector<RenderMesh>& out);
+// Produce world-space render meshes (skinned per `mode`, filtered per `variant`).
+void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
+                      std::vector<RenderMesh>& out);

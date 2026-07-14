@@ -247,3 +247,24 @@ future CPCW decompile.
 - Faithful limits (not bugs): animated bones float without animation eval
   (future phase); diffuse alpha is spec/team mask -> no alpha blend (rotor disc
   draws opaque); no variant filter yet.
+
+### viewer follow-ups (drag-drop, variants, RDP robustness)
+- **Drag-and-drop**: drop a `.srm` onto the window to load/reload (WM_DROPFILES +
+  DragAcceptFiles); load path refactored into `loadModel()`. Can launch with no
+  model (empty window) and drag one in.
+- **Upgrade-variant filter** (matches import_srm.py): `V` cycles all/standard/
+  upgraded; `--variant`. Drops faces whose bone-node name suffix (_std/_upg) is
+  excluded. Verified headless via `--info`: Patton ALL 5215 tris -> STANDARD 4393
+  (camo-net mesh dropped) / UPGRADED 4713; train identical across all (no _std/
+  _upg bones -> no-op). Per-vertex tag from dominant bone; framing bounds now
+  computed over referenced verts only.
+- New keys: `V` variant, `P` screenshot (cpcw_shot_NNN.bmp). Title shows filename+variant.
+- **`--info`**: headless CPU-only mode (parse + per-variant tri/vert counts, no
+  D3D device) — works with NO display. Use to verify logic when rendering can't run.
+- **RDP robustness**: prefer `Direct3DCreate9Ex` + match backbuffer to desktop
+  format + REF/SW fallbacks. IMPORTANT ENV FACT: plain D3D9 (and Ex) return 0
+  adapters / D3DERR_NOTAVAILABLE when the user's RDP session is DISCONNECTED
+  (`query session` showed session 2 = swine = Disc). Live rendering needs the
+  session CONNECTED; earlier in-session renders worked, then failed after the
+  session disconnected. Not a bug — clear on-screen message added; `--info`
+  is the display-free fallback.

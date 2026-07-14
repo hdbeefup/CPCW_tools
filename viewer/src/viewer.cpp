@@ -13,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <d3d9.h>
 #include <cstdio>
 #include <cstdint>
@@ -25,6 +26,7 @@
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define FVF_MODEL (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1)
 
@@ -33,6 +35,7 @@
 // ---------------------------------------------------------------------------
 static IDirect3D9*        g_d3d = nullptr;
 static IDirect3DDevice9*  g_dev = nullptr;
+static IDirect3D9Ex*      g_d3dEx = nullptr;   // non-null when running the Ex path (e.g. under RDP)
 static HWND               g_hwnd = nullptr;
 static int                g_w = 1280, g_h = 960;
 
@@ -48,6 +51,8 @@ static std::vector<GpuMesh> g_gpu;
 static std::map<std::string, IDirect3DTexture9*> g_texCache;
 static std::map<std::string, std::string> g_texIndex;   // basename(lower,no ext) -> full path
 static std::string         g_dataRoot;
+static std::string         g_srmPath;
+static bool                g_explicitRoot = false;   // dataRoot came from the command line
 
 // camera / state
 static float g_yaw = 35, g_pitch = 22, g_dist = 10;
@@ -55,6 +60,7 @@ static Vec3  g_center;
 static float g_radius = 5;
 static bool  g_wire = false, g_useTex = true;
 static SkinMode g_skin = SKIN_FULL;
+static Variant g_variant = VAR_ALL;
 static int   g_cull = 1;   // 0=none 1=CCW 2=CW
 static bool  g_dragL = false, g_dragR = false;
 static POINT g_lastMouse;
@@ -96,6 +102,12 @@ static std::string parentDir(const std::string& p) {
     size_t slash = p.find_last_of("/\\");
     return (slash == std::string::npos) ? "" : p.substr(0, slash);
 }
+static std::string baseName(const std::string& p) {
+    size_t slash = p.find_last_of("/\\");
+    return (slash == std::string::npos) ? p : p.substr(slash + 1);
+}
+
+static void updateTitle();   // forward decl
 
 // ---------------------------------------------------------------------------
 // Matrices (D3D row-vector, left-handed)
@@ -163,13 +175,15 @@ static void releaseGpu() {
 static void buildGpu() {
     releaseGpu();
     std::vector<RenderMesh> meshes;
-    srm_build_render(g_model, g_skin, meshes);
+    srm_build_render(g_model, g_skin, g_variant, meshes);
 
-    // bounds
+    // bounds over *referenced* verts (so filtered-out floaters don't skew framing)
     bool first = true;
     Vec3 lo, hi;
     for (auto& rm : meshes)
-        for (auto& v : rm.verts) {
+        for (uint32_t idx : rm.indices) {
+            if (idx >= rm.verts.size()) continue;
+            const RVertex& v = rm.verts[idx];
             Vec3 p(v.x, v.y, v.z);
             if (first) { lo = hi = p; first = false; }
             lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
@@ -202,6 +216,37 @@ static void buildGpu() {
         g_gpu.push_back(gm);
     }
     printf("built %d gpu meshes (skin=%s)\n", (int)g_gpu.size(), g_skin==SKIN_FULL?"FULL":"NONE");
+}
+
+static void resetCamera() {
+    g_yaw = 35; g_pitch = 22; g_dist = g_radius * 3;
+}
+
+// Load (or reload) a model + its textures and rebuild GPU buffers. Used at
+// startup and on drag-and-drop.
+static bool loadModel(const std::string& path) {
+    // drop old GPU + textures
+    releaseGpu();
+    for (auto& kv : g_texCache) if (kv.second) kv.second->Release();
+    g_texCache.clear();
+    g_texIndex.clear();
+
+    SrmModel m; std::string err;
+    if (!srm_parse(path, m, &err)) { printf("parse failed: %s\n", err.c_str()); return false; }
+    g_model = std::move(m);
+    g_srmPath = path;
+    printf("parsed %s: %d nodes, %d meshes\n", path.c_str(),
+           (int)g_model.nodes.size(), (int)g_model.meshes.size());
+
+    if (!g_explicitRoot) g_dataRoot = parentDir(path);
+    { int budget = 60000; indexDir(g_dataRoot, budget); }
+    { int budget = 60000; indexDir(parentDir(path), budget); }   // local textures win
+    printf("texture index: %d dds under %s\n", (int)g_texIndex.size(), g_dataRoot.c_str());
+
+    buildGpu();
+    resetCamera();
+    if (g_hwnd) updateTitle();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,9 +371,11 @@ static bool saveShot(const std::string& path) {
 // Win32
 // ---------------------------------------------------------------------------
 static void updateTitle() {
-    char buf[256];
-    snprintf(buf, sizeof(buf), "CPCW Viewer  |  skin=%s  tex=%s  cull=%s  %s",
-             g_skin==SKIN_FULL?"FULL":"NONE", g_useTex?"on":"off",
+    const char* var = g_variant==VAR_ALL?"all":(g_variant==VAR_STANDARD?"standard":"upgraded");
+    char buf[400];
+    snprintf(buf, sizeof(buf), "CPCW Viewer  -  %s  |  skin=%s  variant=%s  tex=%s  cull=%s  %s",
+             g_srmPath.empty() ? "(no model)" : baseName(g_srmPath).c_str(),
+             g_skin==SKIN_FULL?"FULL":"NONE", var, g_useTex?"on":"off",
              g_cull==0?"none":(g_cull==1?"CCW":"CW"), g_wire?"[wire]":"");
     SetWindowTextA(g_hwnd, buf);
 }
@@ -336,6 +383,13 @@ static void updateTitle() {
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DROPFILES: {
+        HDROP drop = (HDROP)w;
+        char path[MAX_PATH] = {0};
+        if (DragQueryFileA(drop, 0, path, MAX_PATH)) loadModel(path);
+        DragFinish(drop);
+        return 0;
+    }
     case WM_LBUTTONDOWN: g_dragL = true; SetCapture(h); GetCursorPos(&g_lastMouse); return 0;
     case WM_RBUTTONDOWN: g_dragR = true; SetCapture(h); GetCursorPos(&g_lastMouse); return 0;
     case WM_LBUTTONUP: g_dragL = false; ReleaseCapture(); return 0;
@@ -363,8 +417,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case 'W': g_wire = !g_wire; updateTitle(); break;
         case 'T': g_useTex = !g_useTex; updateTitle(); break;
         case 'C': g_cull = (g_cull + 1) % 3; updateTitle(); break;
-        case 'R': g_yaw = 35; g_pitch = 22; g_dist = g_radius * 3; break;
+        case 'R': resetCamera(); break;
         case 'F': g_skin = (g_skin == SKIN_FULL) ? SKIN_NONE : SKIN_FULL; buildGpu(); updateTitle(); break;
+        case 'V': g_variant = (Variant)((g_variant + 1) % 3); buildGpu(); updateTitle(); break;
+        case 'P': {
+            static int n = 0;
+            char name[64]; snprintf(name, sizeof(name), "cpcw_shot_%03d.bmp", n++);
+            render(); saveShot(name);
+            break;
+        }
         }
         return 0;
     }
@@ -383,24 +444,78 @@ static bool initD3D(bool visible) {
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) return false;
     ShowWindow(g_hwnd, visible ? SW_SHOW : SW_HIDE);
+    DragAcceptFiles(g_hwnd, TRUE);
 
-    g_d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    // Prefer Direct3D9Ex: plain D3D9 enumerates ZERO adapters inside a Remote
+    // Desktop session (D3DERR_INVALIDCALL on CreateDevice); the Ex interface
+    // works against the RDP WDDM display. Fall back to legacy D3D9 otherwise.
+    typedef HRESULT (WINAPI *PFN_D3D9EX)(UINT, IDirect3D9Ex**);
+    HMODULE d3d9mod = GetModuleHandleA("d3d9.dll");
+    if (!d3d9mod) d3d9mod = LoadLibraryA("d3d9.dll");
+    PFN_D3D9EX pCreate9Ex = d3d9mod ? (PFN_D3D9EX)GetProcAddress(d3d9mod, "Direct3DCreate9Ex") : nullptr;
+    HRESULT hrEx = pCreate9Ex ? pCreate9Ex(D3D_SDK_VERSION, &g_d3dEx) : E_NOTIMPL;
+    if (SUCCEEDED(hrEx) && g_d3dEx) {
+        g_d3d = g_d3dEx;   // IDirect3D9Ex derives IDirect3D9
+    } else {
+        g_d3dEx = nullptr;
+        g_d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    }
     if (!g_d3d) return false;
+
+    // In windowed mode the backbuffer format must match the current desktop
+    // display mode (hardcoding X8R8G8B8 gives D3DERR_INVALIDCALL when the
+    // desktop — e.g. an RDP session — is a different depth).
+    UINT adapters = g_d3d->GetAdapterCount();
+    D3DDISPLAYMODE mode = {};
+    HRESULT hrMode = g_d3d->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &mode);
+    D3DFORMAT bbFmt = D3DFMT_X8R8G8B8;
+    if (SUCCEEDED(hrMode) && mode.Format != D3DFMT_UNKNOWN)
+        bbFmt = mode.Format;
+
+    // Pick a supported depth format for that backbuffer.
+    D3DFORMAT depthFmt = D3DFMT_D24S8;
+    const D3DFORMAT depthCandidates[] = { D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D16 };
+    for (D3DFORMAT df : depthCandidates) {
+        if (SUCCEEDED(g_d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, bbFmt,
+                D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, df))) { depthFmt = df; break; }
+    }
+
     D3DPRESENT_PARAMETERS pp = {};
     pp.Windowed = TRUE;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.BackBufferFormat = bbFmt;
     pp.BackBufferWidth = g_w; pp.BackBufferHeight = g_h;
     pp.EnableAutoDepthStencil = TRUE;
-    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+    pp.AutoDepthStencilFormat = depthFmt;
     pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-    if (FAILED(g_d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, g_hwnd,
-            D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_dev))) {
-        if (FAILED(g_d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, g_hwnd,
-                D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &g_dev)))
-            return false;
+    // Try HAL (hardware, then software VP); fall back to the REF rasterizer.
+    // The REF path matters under Remote Desktop, where the physical GPU / HAL
+    // is often unavailable to the session (headless --shot still works).
+    struct Attempt { D3DDEVTYPE type; DWORD vp; const char* name; };
+    const Attempt attempts[] = {
+        { D3DDEVTYPE_HAL, D3DCREATE_HARDWARE_VERTEXPROCESSING, "HAL/hw" },
+        { D3DDEVTYPE_HAL, D3DCREATE_SOFTWARE_VERTEXPROCESSING, "HAL/sw" },
+        { D3DDEVTYPE_REF, D3DCREATE_SOFTWARE_VERTEXPROCESSING, "REF" },
+        { D3DDEVTYPE_SW,  D3DCREATE_SOFTWARE_VERTEXPROCESSING, "SW"  },
+    };
+    for (const auto& a : attempts) {
+        HRESULT hr;
+        if (g_d3dEx) {
+            IDirect3DDevice9Ex* devEx = nullptr;
+            hr = g_d3dEx->CreateDeviceEx(D3DADAPTER_DEFAULT, a.type, g_hwnd, a.vp, &pp, nullptr, &devEx);
+            if (SUCCEEDED(hr)) g_dev = devEx;   // IDirect3DDevice9Ex derives IDirect3DDevice9
+        } else {
+            hr = g_d3d->CreateDevice(D3DADAPTER_DEFAULT, a.type, g_hwnd, a.vp, &pp, &g_dev);
+        }
+        if (SUCCEEDED(hr)) { printf("D3D device: %s (%s)\n", a.name, g_d3dEx ? "D3D9Ex" : "D3D9"); return true; }
     }
-    return true;
+    printf("D3D device creation failed. adapters=%u exHr=0x%08lX\n",
+           adapters, (unsigned long)hrEx);
+    if (adapters == 0)
+        printf("  No display available to Direct3D. If you are on Remote Desktop,\n"
+               "  the session must be CONNECTED (not disconnected) for D3D9 to work.\n"
+               "  (Use --info for headless model inspection without a display.)\n");
+    return false;
 }
 
 int main(int argc, char** argv) {
@@ -409,39 +524,58 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
         else if (a == "--skin" && i + 1 < argc) { std::string s = argv[++i]; g_skin = (s=="none")?SKIN_NONE:SKIN_FULL; }
+        else if (a == "--variant" && i + 1 < argc) { std::string s = argv[++i];
+            g_variant = (s=="standard")?VAR_STANDARD:(s=="upgraded")?VAR_UPGRADED:VAR_ALL; }
         else if (srmPath.empty()) srmPath = a;
         else if (g_dataRoot.empty()) g_dataRoot = a;
     }
+    g_explicitRoot = !g_dataRoot.empty();
 
+    // Headless info mode: no D3D device needed. Verifies parse + skinning +
+    // variant filtering (usable even when no display is available, e.g. a
+    // disconnected RDP session).
+    bool infoMode = false;
+    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--info") infoMode = true;
+    if (infoMode) {
+        if (srmPath.empty()) { printf("--info needs a model path\n"); return 1; }
+        SrmModel m; std::string err;
+        if (!srm_parse(srmPath, m, &err)) { printf("parse failed: %s\n", err.c_str()); return 1; }
+        printf("model: %s\n  nodes=%d meshes=%d\n", srmPath.c_str(),
+               (int)m.nodes.size(), (int)m.meshes.size());
+        struct { const char* n; Variant v; } vs[] = {
+            {"ALL", VAR_ALL}, {"STANDARD", VAR_STANDARD}, {"UPGRADED", VAR_UPGRADED} };
+        for (auto& e : vs) {
+            std::vector<RenderMesh> rm;
+            srm_build_render(m, SKIN_FULL, e.v, rm);
+            long tris = 0, verts = 0; int textured = 0;
+            for (auto& r : rm) { tris += (long)r.indices.size()/3; verts += (long)r.verts.size();
+                                 if (!r.diffuseTex.empty()) textured++; }
+            printf("  variant %-9s: %2d meshes, %6ld tris, %6ld verts, %d textured\n",
+                   e.n, (int)rm.size(), tris, verts, textured);
+        }
+        return 0;
+    }
+
+    if (srmPath.empty() && !shotPath.empty()) { printf("--shot needs a model path\n"); return 1; }
     if (srmPath.empty()) {
         char file[MAX_PATH] = {0};
         OPENFILENAMEA ofn = {}; ofn.lStructSize = sizeof(ofn);
         ofn.lpstrFilter = "SRM models\0*.srm\0All\0*.*\0"; ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
-        if (!GetOpenFileNameA(&ofn)) { printf("no file\n"); return 1; }
-        srmPath = file;
+        if (GetOpenFileNameA(&ofn)) srmPath = file;   // empty is OK: open with no model, drag one in
     }
-
-    std::string err;
-    if (!srm_parse(srmPath, g_model, &err)) { printf("parse failed: %s\n", err.c_str()); return 1; }
-    printf("parsed %s: %d nodes, %d meshes\n", srmPath.c_str(),
-           (int)g_model.nodes.size(), (int)g_model.meshes.size());
-
-    if (g_dataRoot.empty()) g_dataRoot = parentDir(srmPath);
-    { int budget = 60000; indexDir(g_dataRoot, budget); }
-    // also index the model's own directory (cheap, ensures local textures win)
-    { int budget = 60000; indexDir(parentDir(srmPath), budget); }
-    printf("texture index: %d dds files under %s\n", (int)g_texIndex.size(), g_dataRoot.c_str());
 
     bool interactive = shotPath.empty();
     if (!initD3D(interactive)) { printf("D3D init failed\n"); return 1; }
-    buildGpu();
-    g_dist = g_radius * 3;
+
+    if (!srmPath.empty() && !loadModel(srmPath) && !interactive) {
+        if (g_dev) g_dev->Release(); if (g_d3d) g_d3d->Release();
+        return 1;
+    }
     updateTitle();
 
     if (!shotPath.empty()) {
-        // a couple of frames to settle, then capture
-        render(); render();
+        render(); render();   // a couple of frames to settle, then capture
         bool ok = saveShot(shotPath);
         if (g_dev) g_dev->Release(); if (g_d3d) g_d3d->Release();
         return ok ? 0 : 2;

@@ -46,19 +46,44 @@ cmake --build build --config Release
 ## Usage
 
 ```sh
-cpcw_viewer <model.srm> [dataRoot] [--shot out.bmp] [--skin full|none]
+cpcw_viewer [model.srm] [dataRoot] [--shot out.bmp] [--skin full|none]
+            [--variant all|standard|upgraded] [--info]
 ```
 
+- `model.srm` — optional; omit it to open with a file dialog (or an empty
+  window you can **drag-and-drop** a `.srm` onto). Dropping a new file reloads.
 - `dataRoot` — folder scanned recursively for `.dds` textures (default: the
   model's own directory). Point it at the extracted `CPCWPak` (or a subtree
   like `Vehicles`) for full texture coverage.
 - `--shot out.bmp` — render one frame offscreen, write a 24-bit BMP, exit
   (headless; used for the render gallery / CI-style checks).
-- `--skin full` (default) = the exact game rule; `--skin none` = raw bind pose
-  (each mesh at its node matrix, unskinned).
+- `--skin full` (default) = the exact game rule; `--skin none` = raw bind pose.
+- `--variant standard|upgraded` — show only that upgrade loadout (default
+  `all` shows every variant merged; see below).
+- `--info` — **no display needed**: parse the model and print node/mesh counts
+  and per-variant triangle/vertex totals, then exit. Works even with no GPU /
+  a disconnected Remote Desktop session.
 
-Interactive: **LMB** orbit · **RMB** pan · **wheel** zoom · **W** wireframe ·
-**T** textures · **F** skin FULL/NONE · **C** cull cycle · **R** reset · **Esc**.
+Interactive: **LMB** orbit · **RMB** pan · **wheel** zoom · **drag-drop** a
+`.srm` to load · **W** wireframe · **T** textures · **F** skin FULL/NONE ·
+**V** variant cycle · **C** cull cycle · **P** screenshot · **R** reset · **Esc**.
+
+## Upgrade variants
+
+Vehicles pack every loadout into one `.srm`; a part's variant is read from the
+**suffix of the bone it's skinned to** (`_std` / `_upg`; camo-net parts always
+carry `_upg`) — matching `import_srm.py`. `V` cycles **all → standard →
+upgraded**, filtering out the other loadout's geometry (e.g. a Patton's camo
+net and upgraded gun only appear under *upgraded*). Non-variant models
+(the train, buildings) are unaffected.
+
+## Remote Desktop note
+
+Direct3D 9 needs a live display. Inside an RDP session the session must be
+**connected** (not disconnected) or `Direct3DCreate9`/`Ex` reports zero adapters
+and device creation fails with a clear message. The viewer already prefers
+**Direct3D9Ex** and matches the backbuffer to the desktop format for the
+connected-RDP case. For inspection without any display, use `--info`.
 
 ## Known limits (faithful, not bugs)
 
@@ -73,7 +98,8 @@ Interactive: **LMB** orbit · **RMB** pan · **wheel** zoom · **W** wireframe �
 - **Diffuse alpha is a specular/team mask, not opacity** (per the format notes),
   so it's intentionally left unwired — no alpha blending. The ka_15 rotor-blur
   disc therefore draws opaque/dark rather than as a translucent disc.
-- No variant filtering yet (an upgraded tank shows base + upgrade parts merged).
+- Under `--variant all` an upgraded tank shows base + upgrade parts merged
+  (overlapping at attach points); cycle to `standard`/`upgraded` to separate.
 
 ## Files
 

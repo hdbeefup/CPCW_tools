@@ -212,7 +212,22 @@ static std::string pickDiffuse(const SrmMesh& mesh) {
     return "";
 }
 
-void srm_build_render(const SrmModel& m, SkinMode mode, std::vector<RenderMesh>& out) {
+// 0 = BASE, 1 = STD, 2 = UPG  (from a bone/node name's suffix).
+static int variantTag(const std::string& name) {
+    std::string n; n.reserve(name.size());
+    for (char c : name) n += (char)tolower((unsigned char)c);
+    if (n.find("_upg") != std::string::npos) return 2;
+    if (n.find("_std") != std::string::npos) return 1;
+    return 0;
+}
+static bool variantKeep(int tag, Variant v) {
+    if (v == VAR_ALL) return true;
+    if (v == VAR_STANDARD) return tag == 0 || tag == 1;
+    return tag == 0 || tag == 2;   // VAR_UPGRADED
+}
+
+void srm_build_render(const SrmModel& m, SkinMode mode, Variant variant,
+                      std::vector<RenderMesh>& out) {
     std::vector<Mat4> world = srm_world_matrices(m);
     std::vector<Mat4> rot(world.size());
     for (size_t i = 0; i < world.size(); i++) { rot[i] = world[i]; for (int r=0;r<3;r++){ rot[i].m[r][3]=0; } rot[i].m[3][0]=rot[i].m[3][1]=rot[i].m[3][2]=0; }
@@ -237,43 +252,57 @@ void srm_build_render(const SrmModel& m, SkinMode mode, std::vector<RenderMesh>&
         rm.nodeIndex = (int)ni;
         rm.diffuseTex = pickDiffuse(mesh);
         rm.verts.resize(vcount);
+        std::vector<int> vtag(vcount, 0);   // per-vertex variant tag (bone node suffix)
 
         for (int vi = 0; vi < vcount; vi++) {
             Vec3 p = readPos(*pos, vi);
             Vec3 nrmv = nrm ? readNormal(*nrm, vi) : Vec3(0, 0, 1);
             Vec3 wp, wn;
+            int boneNode = (int)ni;   // for variant tagging
 
             bool skinned = (mode == SKIN_FULL) && haveBones;
-            if (skinned && smooth) {
+            if (haveBones && smooth) {
                 const uint8_t* bid = bi->data.data() + (size_t)vi * bi->stride;
                 float w[4] = {1,0,0,0};
                 if (bw && bw->stride == 4) {
                     const uint8_t* bwd = bw->data.data() + (size_t)vi * bw->stride;
                     for (int k = 0; k < 4; k++) w[k] = bwd[k] / 255.0f;
                 }
-                wp = Vec3(0,0,0); wn = Vec3(0,0,0);
-                float wsum = 0;
-                for (int k = 0; k < 4; k++) {
-                    if (w[k] <= 0) continue;
-                    int local = bid[k];
-                    int bn = (local < (int)mesh.bones.size()) ? mesh.bones[local] : -1;
-                    if (bn < 0 || bn >= (int)world.size()) continue;
-                    wp = wp + world[bn].point(p) * w[k];
-                    wn = wn + rot[bn].dir(nrmv) * w[k];
-                    wsum += w[k];
-                }
-                if (wsum <= 1e-6f) { wp = p; wn = nrmv; }
-            } else if (skinned && rigid) {
+                // dominant influence -> variant tag
+                int best = 0; for (int k = 1; k < 4; k++) if (w[k] > w[best]) best = k;
+                int bl = bid[best];
+                if (bl < (int)mesh.bones.size()) boneNode = mesh.bones[bl];
+                if (skinned) {
+                    wp = Vec3(0,0,0); wn = Vec3(0,0,0);
+                    float wsum = 0;
+                    for (int k = 0; k < 4; k++) {
+                        if (w[k] <= 0) continue;
+                        int local = bid[k];
+                        int bn = (local < (int)mesh.bones.size()) ? mesh.bones[local] : -1;
+                        if (bn < 0 || bn >= (int)world.size()) continue;
+                        wp = wp + world[bn].point(p) * w[k];
+                        wn = wn + rot[bn].dir(nrmv) * w[k];
+                        wsum += w[k];
+                    }
+                    if (wsum <= 1e-6f) { wp = p; wn = nrmv; }
+                } else { wp = world[ni].point(p); wn = rot[ni].dir(nrmv); }
+            } else if (haveBones && rigid) {
                 const uint8_t* nd = nrm->data.data() + (size_t)vi * nrm->stride;
                 int local = nd[3];
                 int bn = (local < (int)mesh.bones.size()) ? mesh.bones[local] : -1;
-                if (bn >= 0 && bn < (int)world.size()) { wp = world[bn].point(p); wn = rot[bn].dir(nrmv); }
-                else { wp = p; wn = nrmv; }
+                if (bn >= 0 && bn < (int)world.size()) boneNode = bn;
+                if (skinned) {
+                    if (bn >= 0 && bn < (int)world.size()) { wp = world[bn].point(p); wn = rot[bn].dir(nrmv); }
+                    else { wp = p; wn = nrmv; }
+                } else { wp = world[ni].point(p); wn = rot[ni].dir(nrmv); }
             } else {
                 // unskinned mesh, or NONE mode: place by owning node's world matrix
                 wp = world[ni].point(p);
                 wn = rot[ni].dir(nrmv);
             }
+
+            if (boneNode >= 0 && boneNode < (int)m.nodes.size())
+                vtag[vi] = variantTag(m.nodes[boneNode].name);
 
             RVertex& rv = rm.verts[vi];
             rv.x = wp.x; rv.y = wp.y; rv.z = wp.z;
@@ -281,7 +310,22 @@ void srm_build_render(const SrmModel& m, SkinMode mode, std::vector<RenderMesh>&
             rv.nx = nn.x; rv.ny = nn.y; rv.nz = nn.z;
             if (uv) readUV(*uv, vi, rv.u, rv.v); else { rv.u = 0; rv.v = 0; }
         }
-        rm.indices = mesh.indices;
-        out.push_back(std::move(rm));
+
+        // Variant face filter (drop tris whose verts belong to an excluded loadout).
+        if (variant == VAR_ALL) {
+            rm.indices = mesh.indices;
+        } else {
+            const auto& src = mesh.indices;
+            rm.indices.reserve(src.size());
+            for (size_t i = 0; i + 2 < src.size(); i += 3) {
+                uint32_t a = src[i], b = src[i+1], c = src[i+2];
+                if (a < (uint32_t)vcount && b < (uint32_t)vcount && c < (uint32_t)vcount &&
+                    variantKeep(vtag[a], variant) && variantKeep(vtag[b], variant) &&
+                    variantKeep(vtag[c], variant)) {
+                    rm.indices.push_back(a); rm.indices.push_back(b); rm.indices.push_back(c);
+                }
+            }
+        }
+        if (rm.indices.size() >= 3) out.push_back(std::move(rm));
     }
 }
