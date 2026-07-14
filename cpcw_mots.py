@@ -61,6 +61,19 @@ the time/interpolation semantics (marked provisional) still want a Ghidra pass:
 Because ``t_or_dur`` is constant, per-key timing is currently taken as uniform
 over ``duration`` (keys evenly spaced). Confirm against the engine before
 treating playback timing as ground-truth.
+
+Ghidra cross-check (CPCWu.exe; see N:/gamePAKdata/re/MOTS_RESULT.md)
+-------------------------------------------------------------------
+The loader ``FUN_004d4e40`` (MOTS/MOTI) + parser ``FUN_004ce310`` (ANIM 'v002')
+CONFIRM this layout from the engine side: the fixup loop walks channels and
+keyframes both at stride 0x11 ints = **68 bytes**, and treats the per-key field
+at ``key+0x3c`` (our ``pool_offset``) as a relocated pointer. The ANIM block's
+``+0xc`` is an interpolation-TYPE enum (0..3) that selects one of four
+storage->engine **coordinate converters** (matrix / vec3 / quat / swizzled-with-
+sign-flip), i.e. which transform component a channel drives. STILL OPEN in the
+disassembly: the standalone per-frame evaluator (time->key + blend) that writes
+the node's ``ActTransform@0x8`` / ``ActLocalMatrix@0x38`` -- so the time &
+interpolation fields above remain provisional until it is read.
 """
 
 import struct
