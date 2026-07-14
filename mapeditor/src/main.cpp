@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <set>
 
 // --- editor modes (mirrored from the S.W.I.N.E. editor) ----------------------
 struct Mode { const char* name; const char* focus; const char* tools; };
@@ -58,6 +59,9 @@ static bool  g_openPopup = false;
 static bool  g_orbiting = false, g_panning = false;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
+static std::string g_srcMap;                       // original .map (empty if .json)
+static std::set<long> g_edited;                    // ids with pending field edits
+static char  g_saveStatus[256] = "";
 
 static void glfwError(int e, const char* d) { fprintf(stderr, "GLFW %d: %s\n", e, d); }
 
@@ -191,6 +195,8 @@ static bool loadScene(const std::string& path) {
     Scene s;
     if (!parseScene(txt, baseDir, s)) return false;
     g_scene = std::move(s); g_selected = -1; g_sceneDirty = true;
+    g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
+    g_edited.clear(); g_saveStatus[0] = '\0';
     snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
     // frame the camera on the loaded terrain
     float W = g_scene.world_w > 0 ? (float)g_scene.world_w : 512.0f;
@@ -206,6 +212,36 @@ static bool loadScene(const std::string& path) {
     return true;
 }
 
+// Save edited entity fields back to a .map through cpcw_map.py's verified `apply`
+// path (writes <map>_edited.map next to the source; never overwrites originals).
+static void doSave() {
+    if (g_srcMap.empty()) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus),
+                 "Save needs a .map source (open a .map, not a .json)."); return;
+    }
+    if (g_edited.empty()) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "No edits to save."); return;
+    }
+    nlohmann::json edits = nlohmann::json::array();
+    for (const Entity& e : g_scene.entities)
+        if (g_edited.count(e.id))
+            edits.push_back({{"id", e.id}, {"player", e.player},
+                             {"pos", {e.pos[0], e.pos[1], e.pos[2]}}});
+    nlohmann::json doc; doc["edits"] = edits;
+    const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
+    std::string ej = std::string(tmp) + "/cpcw_mapedit_edits.json";
+    { std::ofstream f(ej); f << doc.dump(); }
+    std::string out = g_srcMap.substr(0, g_srcMap.size() - 4) + "_edited.map";
+    const char* env = getenv("CPCW_MAP_PY");
+    std::string script = env ? env : "cpcw_map.py";
+    std::string cmd = "python \"" + script + "\" apply \"" + g_srcMap + "\" \"" +
+                      out + "\" --edits \"" + ej + "\"";
+    std::string res = runCapture(cmd);
+    snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved %d edit(s) -> %s",
+             (int)g_edited.size(), out.c_str());
+    (void)res;
+}
+
 static ImU32 playerColor(int p) {
     static const ImU32 c[] = {
         IM_COL32(200,200,200,255), IM_COL32(220,70,70,255), IM_COL32(70,120,220,255),
@@ -218,8 +254,9 @@ static void drawMenuBar() {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) g_openPopup = true;
-        ImGui::MenuItem("New"); ImGui::MenuItem("Save", "Ctrl+S");
-        ImGui::MenuItem("Save As..."); ImGui::Separator(); ImGui::MenuItem("Exit");
+        ImGui::MenuItem("New");
+        if (ImGui::MenuItem("Save edits", "Ctrl+S", false, !g_srcMap.empty())) doSave();
+        ImGui::Separator(); ImGui::MenuItem("Exit");
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
@@ -319,14 +356,22 @@ static void drawProperties() {
         if (g_selected < 0 || g_selected >= (int)g_scene.entities.size())
             ImGui::TextDisabled("Nothing selected.");
         else {
-            const Entity& e = g_scene.entities[g_selected];
+            Entity& e = g_scene.entities[g_selected];
             ImGui::Text("Type:  %s", e.type.c_str());
             ImGui::Text("ID:    %ld", e.id);
-            ImGui::Text("Player:%d", e.player);
             ImGui::TextWrapped("Proto: %s", e.proto.c_str());
-            ImGui::Text("Pos:   %.2f  %.2f  %.2f", e.pos[0], e.pos[1], e.pos[2]);
-            ImGui::TextDisabled("(editing writes back via cpcw_map.py apply — TODO)");
+            int player = e.player;
+            if (ImGui::InputInt("Player", &player)) {
+                e.player = player; g_edited.insert(e.id); g_sceneDirty = true;
+            }
+            float pos[3] = {e.pos[0], e.pos[1], e.pos[2]};
+            if (ImGui::DragFloat3("Pos", pos, 0.5f)) {
+                e.pos[0]=pos[0]; e.pos[1]=pos[1]; e.pos[2]=pos[2];
+                g_edited.insert(e.id); g_sceneDirty = true;
+            }
+            if (g_edited.count(e.id)) ImGui::TextDisabled("(edited — File > Save edits)");
         }
+        if (g_saveStatus[0]) { ImGui::Separator(); ImGui::TextWrapped("%s", g_saveStatus); }
     }
     ImGui::End();
 }
@@ -452,6 +497,10 @@ int main(int argc, char** argv) {
             cmax = ImVec2(central->Pos.x + central->Size.x, central->Pos.y + central->Size.y);
         }
         updateCamera(cmin, cmax);
+
+        ImGuiIO& kio = ImGui::GetIO();
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) doSave();
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_openPopup = true;
 
         ImGui::SetNextWindowBgAlpha(0.35f);
         if (ImGui::Begin("##status", nullptr,

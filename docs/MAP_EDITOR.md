@@ -95,9 +95,13 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       field/road/water/rock), height-ramp fallback when absent. Still TODO under
       M5b: **port parse/write to C++** (drop the Python bridge) and render real
       entity **models** (reuse the `.srm` loader) instead of point markers.
-- [ ] **M6 — GUI editing**: brushes/gizmos drive the edit-ops in the viewport and
-      emit the edit list / call the save path; undo/redo; structural edits
-      (add/remove entity — needs chunk-size recompute + schema-offset fixups).
+- [~] **M6 — GUI editing** (started): the Properties panel edits a selected
+      entity's Player/Pos; File > Save edits (Ctrl+S) writes the changes back
+      through `cpcw_map.py apply` to `<map>_edited.map` (never overwrites the
+      original). Verified end-to-end (edit -> apply -> reload, byte-faithful).
+      Still TODO: viewport gizmos/terrain brushes driving the edit-ops, undo/redo,
+      structural edits (add/remove entity — needs chunk-size recompute + the OBJS
+      `schema_offset` absolute-pointer fixups), 3D click-select.
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).
