@@ -13,6 +13,7 @@ struct Entity {
     // byte offsets of editable fields in Scene::raw (for native in-place save)
     long posOff = -1;         // FT_VEC3 (12 bytes)
     long dirOff = -1;         // Dir yaw = first float at this offset
+    long idOff = -1;          // ID (u32) offset
     long playerOff = -1;
     unsigned playerFtype = 0; // schema field type of Player (write size)
     long objtStart = -1, objtEnd = -1;   // byte range of this entity's OBJT in raw

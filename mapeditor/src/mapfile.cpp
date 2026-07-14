@@ -391,7 +391,7 @@ bool load_map_native(const std::string& path, Scene& out) {
         auto ps=o.find("Pos"); if(ps!=o.end()&&ps->second.kind==V_VEC3){ e.pos[0]=(float)ps->second.v3[0]; e.pos[1]=(float)ps->second.v3[1]; e.pos[2]=(float)ps->second.v3[2]; e.posOff=ps->second.off; }
         auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; e.dirOff=dr->second.off; }
         auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT){ e.player=(int)pl->second.i; e.playerOff=pl->second.off; e.playerFtype=pl->second.ftype; }
-        auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT) e.id=id->second.i;
+        auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT){ e.id=id->second.i; e.idOff=id->second.off; }
         auto os=o.find("_objtStart"); if(os!=o.end()) e.objtStart=os->second.i;
         auto oe=o.find("_objtEnd");   if(oe!=o.end()) e.objtEnd=oe->second.i;
         e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
@@ -451,6 +451,38 @@ bool delete_entity_native(const Scene& s, long id, const std::string& outPath) {
         uint32_t v = b[o] | (b[o+1]<<8) | (b[o+2]<<16) | ((uint32_t)b[o+3]<<24);
         if (v > 0) v -= 1;
         b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff;
+    }
+    std::ofstream f(outPath, std::ios::binary);
+    if (!f) return false;
+    f.write((const char*)b.data(), (std::streamsize)b.size());
+    return true;
+}
+
+bool add_entity_native(const Scene& s, long srcId, const float pos[3], long newId,
+                       const std::string& outPath) {
+    if (s.raw.empty()) return false;
+    const Entity* src = nullptr;
+    for (const auto& en : s.entities) if (en.id == srcId) { src = &en; break; }
+    if (!src || src->objtStart < 0 || src->objtEnd <= src->objtStart) return false;
+    long ss = src->objtStart, se = src->objtEnd, added = se - ss;
+    std::vector<unsigned char> copy(s.raw.begin() + ss, s.raw.begin() + se);
+    auto w32 = [&](std::vector<unsigned char>& v, long o, uint32_t x){ v[o]=x&0xff; v[o+1]=(x>>8)&0xff; v[o+2]=(x>>16)&0xff; v[o+3]=(x>>24)&0xff; };
+    if (src->posOff >= ss) { long r = src->posOff - ss;               // new Pos
+        for (int k=0;k<3;k++){ uint32_t v; std::memcpy(&v,&pos[k],4); w32(copy, r+k*4, v); } }
+    if (src->idOff >= ss)  w32(copy, src->idOff - ss, (uint32_t)newId); // new ID
+    long insertPos = -1;
+    if (s.objsSchemaOff >= 0 && s.objsSchemaOff + 4 <= (long)s.raw.size())
+        insertPos = s.raw[s.objsSchemaOff] | (s.raw[s.objsSchemaOff+1]<<8) |
+                    (s.raw[s.objsSchemaOff+2]<<16) | ((uint32_t)s.raw[s.objsSchemaOff+3]<<24);
+    if (insertPos < 0 || insertPos > (long)s.raw.size()) return false;
+    std::vector<unsigned char> b = s.raw;
+    b.insert(b.begin() + insertPos, copy.begin(), copy.end());   // before SCHD
+    auto grow = [&](long off){ if(off<0||off+4>(long)b.size())return; uint32_t v=b[off]|(b[off+1]<<8)|(b[off+2]<<16)|((uint32_t)b[off+3]<<24); v+=(uint32_t)added; w32(b,off,v); };
+    for (long off : s.containerSizeOffs) grow(off);
+    grow(s.objsSchemaOff);   // SCHD shifted later by `added`
+    if (s.untsCountOff >= 0 && s.untsCountOff + 4 <= (long)b.size()) {
+        long o = s.untsCountOff; uint32_t v = b[o]|(b[o+1]<<8)|(b[o+2]<<16)|((uint32_t)b[o+3]<<24);
+        w32(b, o, v + 1);
     }
     std::ofstream f(outPath, std::ios::binary);
     if (!f) return false;

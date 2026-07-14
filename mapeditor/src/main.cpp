@@ -701,6 +701,16 @@ int main(int argc, char** argv) {
             int shown=0; for (auto& kv : idx) { if(shown++>=3) break; printf("  %s -> %s\n", kv.first.c_str(), kv.second.c_str()); }
             return 0;
         }
+        else if (!strcmp(argv[i], "--addtest") && i + 4 < argc) {
+            Scene s; if (!load_map_native(argv[i+1], s)) return 2;
+            long srcId = atol(argv[i+2]), newId = atol(argv[i+3]);
+            float pos[3] = {100.0f, 100.0f, 0.0f};
+            bool ok = add_entity_native(s, srcId, pos, newId, argv[i+4]);
+            Scene s2; bool rok = load_map_native(argv[i+4], s2);
+            printf("addtest add=%d reparse=%d before=%zu after=%zu\n",
+                   (int)ok, (int)rok, s.entities.size(), s2.entities.size());
+            return ok && rok ? 0 : 3;
+        }
         else if (!strcmp(argv[i], "--deltest") && i + 3 < argc) {
             Scene s; if (!load_map_native(argv[i+1], s)) return 2;
             long id = atol(argv[i+2]);
@@ -841,12 +851,17 @@ int main(int argc, char** argv) {
             Entity& e = g_scene.entities[g_selected];
             if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { snapEntity(g_selected); e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { snapEntity(g_selected); e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
+            const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
+            std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
             // Delete: remove the entity (structural) and reload the shortened map
             if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !g_srcMap.empty()) {
-                long id = e.id;
-                const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
-                std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
-                if (delete_entity_native(g_scene, id, work)) loadScene(work);
+                if (delete_entity_native(g_scene, e.id, work)) loadScene(work);
+            }
+            // Ctrl+D: duplicate the selected entity nearby (structural insert)
+            if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D) && !g_srcMap.empty()) {
+                long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
+                float p[3] = { e.pos[0] + 8.0f, e.pos[1] + 8.0f, e.pos[2] };
+                if (add_entity_native(g_scene, e.id, p, newId, work)) loadScene(work);
             }
         }
 
