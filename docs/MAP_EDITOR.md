@@ -67,8 +67,9 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
 - [x] **M2 — in-place field edits** (`set_field`, `set_entity_field`, `move_entity`;
       `get_entities(with_offsets=True)`). Verified: move + scalar edits persist,
       size-preserving, round-trip intact.
-- [ ] **M2b — terrain height & splat edits** in place (heightmap offset is located
-      heuristically today — pin it, then `set_height(x,y,h)` / brush ops).
+- [x] **M2b — terrain height edits** in place (`heightmap_info`, `set_height`,
+      `set_heights`). Verified: brush-patch raise persists, size-preserving,
+      round-trip intact. (Splat-layer painting still TODO.)
 - [ ] **M3 — structural edits** (add/remove entity; size recompute up the chain).
 - [ ] **M4 — C++ editor scaffold**: GLFW+OpenGL+ImGui window, docking, mode
       switcher, panels, 3D viewport with orbit/pan/zoom; render terrain + entity

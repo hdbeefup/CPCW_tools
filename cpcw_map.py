@@ -724,7 +724,38 @@ class MapFile:
                 return None
             off = best[1]
         heights = list(struct.unpack_from('<%df' % need, d, off))
+        # Cache the located grid so the editor can write heights back in place.
+        self._heightmap = {'offset': off, 'w': W, 'h': H}
         return heights, W, H
+
+    def heightmap_info(self):
+        """(offset, W, H) of the located elevation grid, or None. Locates it on
+        first use (see get_heightmap). Enables in-place height edits."""
+        if getattr(self, '_heightmap', None) is None:
+            if self.get_heightmap() is None:
+                return None
+        hm = self._heightmap
+        return hm['offset'], hm['w'], hm['h']
+
+    def set_height(self, x, y, value):
+        """Set the elevation of grid vertex (x, y) in place (round-trip safe)."""
+        info = self.heightmap_info()
+        if info is None:
+            raise ValueError('no locatable heightmap in this map')
+        off, w, h = info
+        if not (0 <= x < w and 0 <= y < h):
+            raise IndexError('vertex (%d,%d) out of %dx%d grid' % (x, y, w, h))
+        struct.pack_into('<f', self.data, off + (y * w + x) * 4, value)
+
+    def set_heights(self, heights):
+        """Overwrite the whole elevation grid (list of W*H floats) in place."""
+        info = self.heightmap_info()
+        if info is None:
+            raise ValueError('no locatable heightmap in this map')
+        off, w, h = info
+        if len(heights) != w * h:
+            raise ValueError('expected %d heights, got %d' % (w * h, len(heights)))
+        struct.pack_into('<%df' % (w * h), self.data, off, *heights)
 
     def _entity_grid_samples(self, W, H, WW, WH, limit=200):
         E = []
