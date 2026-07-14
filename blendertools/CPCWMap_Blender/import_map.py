@@ -228,9 +228,12 @@ def _splat_mask_image(name, weight_bytes, W, H):
     """Build a WxH single-channel (in RGB) Blender image from uint8 splat weights."""
     bi = bpy.data.images.new(name, W, H, alpha=False, is_data=True)
     px = [0.0] * (W * H * 4)
+    # Blender's pixel array is bottom-up: row 0 == UV v=0 == grid row 0. The
+    # terrain UVs map v=j/ny (grid row j) directly, and the heightmap /
+    # _splat_vertex_colors read grid row j with NO flip -- so the mask must NOT
+    # flip either. (The old `sy = H-1-y` mirrored the paint N-S vs the terrain.)
     for y in range(H):
-        sy = (H - 1 - y)  # flip to match Blender bottom-up
-        row = sy * W
+        row = y * W
         for x in range(W):
             w = weight_bytes[row + x] / 255.0
             di = (y * W + x) * 4
