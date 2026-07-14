@@ -26,5 +26,8 @@ struct Scene {
     std::vector<unsigned char> colors;  // grid_w*grid_h*3 RGB splat colours, or empty
     std::vector<unsigned char> raw;     // original .map bytes (for native save), or empty
     std::string srcPath;                // original .map path, or empty (loaded from .json)
+    long heightOff = -1;                // byte offset of the heightmap grid in raw
+    bool terrainEdited = false;         // heights changed -> write them on save
+    std::vector<unsigned char> heightDirty;  // per-cell: brush-touched (save only these)
     bool loaded = false;
 };

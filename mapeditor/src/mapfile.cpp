@@ -389,6 +389,7 @@ bool load_map_native(const std::string& path, Scene& out) {
         int W=0,H=0;
         if (P.heightmap(WW,WH,ents,out.heights,W,H)) {
             out.grid_w=W; out.grid_h=H;
+            out.heightOff = (long)P.heightOff;   // for native height save
             P.colormap(out.colors);
         } else {
             // no locatable heightmap -> synthesize a flat ground plane so the
@@ -413,6 +414,13 @@ bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
     std::vector<unsigned char> b = s.raw;   // copy; overwrite only edited fields
     auto put32=[&](long off, uint32_t v){ if(off<0||off+4>(long)b.size())return; b[off]=v&0xff; b[off+1]=(v>>8)&0xff; b[off+2]=(v>>16)&0xff; b[off+3]=(v>>24)&0xff; };
     auto putf =[&](long off, float f){ uint32_t v; std::memcpy(&v,&f,4); put32(off,v); };
+    // edited terrain heights: write ONLY brush-touched cells (keeps NaN sentinels
+    // and untouched cells byte-identical)
+    if (s.terrainEdited && s.heightOff >= 0 && !s.heights.empty()) {
+        bool haveMask = s.heightDirty.size() == s.heights.size();
+        for (size_t i = 0; i < s.heights.size(); i++)
+            if (!haveMask || s.heightDirty[i]) putf(s.heightOff + (long)i*4, s.heights[i]);
+    }
     for (long id : editedIds) {
         const Entity* e=nullptr;
         for (const auto& en : s.entities) if (en.id==id) { e=&en; break; }

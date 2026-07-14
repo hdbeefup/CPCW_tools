@@ -79,7 +79,7 @@ static GLFWwindow* g_win = nullptr;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
-static bool  g_draggingEnt = false, g_modelsDirty = false;
+static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
 static std::string g_dataRoot;                     // folder holding ProtoDB.bin + models
 static std::string g_srcMap;                       // original .map (empty if .json)
 static std::set<long> g_edited;                    // ids with pending field edits
@@ -247,7 +247,7 @@ static void doSave() {
         snprintf(g_saveStatus, sizeof(g_saveStatus),
                  "Save needs a .map source (open a .map, not a .json)."); return;
     }
-    if (g_edited.empty()) {
+    if (g_edited.empty() && !g_scene.terrainEdited) {
         snprintf(g_saveStatus, sizeof(g_saveStatus), "No edits to save."); return;
     }
     std::vector<long> ids(g_edited.begin(), g_edited.end());
@@ -462,6 +462,54 @@ static void drawProperties() {
     ImGui::End();
 }
 
+// Ray from the camera through the mouse, intersected with a horizontal plane at
+// the camera target height -> terrain grid cell (gx,gy). Approximate (flat plane)
+// but fine for brushing. Returns false if the ray doesn't hit.
+static bool terrainHit(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
+                       float& gx, float& gy) {
+    float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
+    if (W < 1 || H < 1) return false;
+    float ndcx = 2.0f * (mp.x - cmin.x) / W - 1.0f;
+    float ndcy = 1.0f - 2.0f * (mp.y - cmin.y) / H;
+    V3 eye = g_cam.eye(), fwd = norm(g_cam.target - eye);
+    V3 right = norm(cross(fwd, V3{0,1,0})), up = cross(right, fwd);
+    float th = std::tan(0.45f), aspect = W / H;
+    V3 dir = norm(fwd + right * (ndcx * th * aspect) + up * (ndcy * th));
+    if (std::fabs(dir.y) < 1e-5f) return false;
+    float d = (g_cam.target.y - eye.y) / dir.y;
+    if (d < 0) return false;
+    gx = eye.x + dir.x * d;   // world X = grid i
+    gy = eye.z + dir.z * d;   // world Z = grid j
+    return true;
+}
+
+// Raise/Lower/Smooth the heightmap around (cx,cy) with radial falloff.
+static void applyTerrainBrush(float cx, float cy, int tool) {
+    int W = g_scene.grid_w, H = g_scene.grid_h;
+    if (W < 2 || H < 2 || (int)g_scene.heights.size() != W * H) return;
+    float radius = g_brushSize * 4.0f;
+    float strength = (g_brushPress * 1.8f + 0.2f);
+    int i0 = std::max(0, (int)(cx - radius)), i1 = std::min(W - 1, (int)(cx + radius));
+    int j0 = std::max(0, (int)(cy - radius)), j1 = std::min(H - 1, (int)(cy + radius));
+    std::vector<float>& h = g_scene.heights;
+    if (g_scene.heightDirty.size() != h.size()) g_scene.heightDirty.assign(h.size(), 0);
+    for (int j = j0; j <= j1; j++) for (int i = i0; i <= i1; i++) {
+        float dx = i - cx, dy = j - cy, r = std::sqrt(dx*dx + dy*dy);
+        if (r > radius) continue;
+        float w = 1.0f - r / radius; w *= w;
+        size_t gi = (size_t)j * W + i;
+        g_scene.heightDirty[gi] = 1;
+        if (tool == 1)      h[gi] += strength * w;              // Raise
+        else if (tool == 2) h[gi] -= strength * w;              // Lower
+        else {                                                  // Smooth
+            float a = (h[(size_t)j*W + std::max(0,i-1)] + h[(size_t)j*W + std::min(W-1,i+1)] +
+                       h[(size_t)std::max(0,j-1)*W + i] + h[(size_t)std::min(H-1,j+1)*W + i]) * 0.25f;
+            h[gi] += (a - h[gi]) * w * 0.5f;
+        }
+    }
+    g_scene.terrainEdited = true; g_terrainDirty = true;
+}
+
 // camera navigation over the central viewport region
 static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     ImGuiIO& io = ImGui::GetIO();
@@ -500,6 +548,14 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         g_cam.dist *= std::pow(0.88f, io.MouseWheel);
         if (g_cam.dist < 5.0f) g_cam.dist = 5.0f;
         if (g_cam.dist > 6000.0f) g_cam.dist = 6000.0f;
+    }
+    // Terrain mode + a brush tool (Raise/Lower/Smooth) => left-drag brushes the
+    // heightmap instead of selecting entities.
+    bool brushing = (g_mode == 0 && (g_activeTool == 1 || g_activeTool == 2 || g_activeTool == 6));
+    if (over && brushing && ImGui::IsMouseDown(0)) {
+        float gx, gy;
+        if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) applyTerrainBrush(gx, gy, g_activeTool);
+        return;   // don't pick/move entities while brushing
     }
     // Left-click picks the nearest entity by screen-space projection.
     if (over && ImGui::IsMouseClicked(0) && g_scene.loaded) {
@@ -571,6 +627,17 @@ int main(int argc, char** argv) {
             printf("protodb models=%zu\n", idx.size());
             int shown=0; for (auto& kv : idx) { if(shown++>=3) break; printf("  %s -> %s\n", kv.first.c_str(), kv.second.c_str()); }
             return 0;
+        }
+        else if (!strcmp(argv[i], "--heighttest") && i + 3 < argc) {
+            // dev: --heighttest <map> <cellIndex> <out>  (bump a height, save)
+            Scene s; if (!load_map_native(argv[i+1], s)) return 2;
+            int k = atoi(argv[i+2]);
+            s.heightDirty.assign(s.heights.size(), 0);
+            if (k >= 0 && k < (int)s.heights.size()) { s.heights[k] += 10.0f; s.heightDirty[k] = 1; }
+            s.terrainEdited = true;
+            bool ok = save_map_native(s, {}, argv[i+3]);
+            printf("heighttest heightOff=%ld cell=%d %s\n", s.heightOff, k, ok?"ok":"fail");
+            return ok ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--applytest") && i + 7 < argc) {
             // dev: --applytest <map> <id> <px> <py> <pz> <player> <out>
@@ -709,6 +776,9 @@ int main(int argc, char** argv) {
         }
         if (g_modelsDirty && g_glReady) {   // after a drag: refresh model instances
             g_vp.buildModels(g_scene, g_dataRoot); g_modelsDirty = false;
+        }
+        if (g_terrainDirty && g_glReady) {  // after a terrain brush stroke
+            g_vp.buildTerrain(g_scene); g_terrainDirty = false;
         }
 
         ImGui::Render();
