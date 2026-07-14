@@ -74,6 +74,7 @@ static bool  g_openPopup = false;
 static bool  g_pakBrowser = false;
 static std::vector<std::string> g_pakMaps;
 static char  g_pakFilter[128] = "";
+static long  g_placeSrcId = -1;   // prototype-browser: entity to duplicate on place
 static bool  g_orbiting = false, g_panning = false;
 static GLFWwindow* g_win = nullptr;
 static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
@@ -376,6 +377,17 @@ static void drawPakBrowser() {
     }
 }
 
+// Place a copy of entity srcId at the camera target (structural insert + reload).
+static void placeDuplicate(long srcId) {
+    if (srcId < 0 || g_srcMap.empty()) return;
+    long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
+    float p[3] = { g_cam.target.x, g_cam.target.z, 0.0f };
+    for (const auto& en : g_scene.entities) if (en.id == srcId) { p[2] = en.pos[2]; break; }
+    const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
+    std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
+    if (add_entity_native(g_scene, srcId, p, newId, work)) loadScene(work);
+}
+
 static ImU32 playerColor(int p) {
     static const ImU32 c[] = {
         IM_COL32(200,200,200,255), IM_COL32(220,70,70,255), IM_COL32(70,120,220,255),
@@ -459,7 +471,31 @@ static void drawModePanel() {
             ImGui::SliderFloat("Size", &g_brushSize, 0.5f, 8.0f);
             ImGui::SliderFloat("Height", &g_brushHeight, -50.0f, 50.0f);
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
-        } else ImGui::TextDisabled("(prototype browser TODO)");
+        } else {
+            // Prototype browser: distinct prototypes present on the map. Select
+            // one, then place a copy of it at the view center.
+            ImGui::TextWrapped("Prototypes on this map — select, then Place:");
+            ImGui::BeginChild("protos", ImVec2(0, 220), ImGuiChildFlags_None);
+            std::map<std::string, std::pair<long,int>> protos;  // proto -> (srcId, count)
+            for (const Entity& e : g_scene.entities) {
+                if (e.proto.empty()) continue;
+                auto& pr = protos[e.proto];
+                if (pr.second == 0) pr.first = e.id;
+                pr.second++;
+            }
+            for (auto& kv : protos) {
+                const Entity* se = nullptr;
+                for (const Entity& e : g_scene.entities) if (e.id == kv.second.first) { se = &e; break; }
+                char lbl[200];
+                snprintf(lbl, sizeof(lbl), "%s  x%d##%s",
+                         se ? se->type.c_str() : "?", kv.second.second, kv.first.c_str());
+                if (ImGui::Selectable(lbl, g_placeSrcId == kv.second.first)) g_placeSrcId = kv.second.first;
+            }
+            ImGui::EndChild();
+            if (ImGui::Button("Place copy at view center") && g_placeSrcId >= 0)
+                placeDuplicate(g_placeSrcId);
+            ImGui::TextDisabled("(Ctrl+D duplicates the selected entity; Delete removes it)");
+        }
     }
     ImGui::End();
 }
