@@ -269,7 +269,11 @@ static bool parseScene(const std::string& txt, const std::string& baseDir, Scene
 
 static void resetThumbCache();   // defined below; clears the prototype-thumb GL cache
 
-static bool loadScene(const std::string& path) {
+// Load a scene. `preserveView` keeps the current camera + data root (used when
+// reloading the temp work-map after a structural edit, so the view doesn't jump
+// and model resolution stays anchored to the original data root). `selectId`, if
+// >= 0, selects the entity with that ID after loading (feedback for place/dup).
+static bool loadScene(const std::string& path, bool preserveView = false, long selectId = -1) {
     Scene s;
     if (endsWithI(path, ".json")) {
         // a pre-exported scene (cpcw_map.py scene) + its sidecars
@@ -286,10 +290,15 @@ static bool loadScene(const std::string& path) {
     }
     g_scene = std::move(s); g_selected = -1; g_sceneDirty = true;
     g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
-    g_dataRoot = g_srcMap.empty() ? std::string() : findDataRoot(g_srcMap);
+    if (!preserveView)
+        g_dataRoot = g_srcMap.empty() ? std::string() : findDataRoot(g_srcMap);
     g_edited.clear(); g_saveStatus[0] = '\0';
     resetThumbCache();
-    snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
+    if (!preserveView) snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
+    if (selectId >= 0)
+        for (int i = 0; i < (int)g_scene.entities.size(); i++)
+            if (g_scene.entities[i].id == selectId) { g_selected = i; break; }
+    if (preserveView) return true;   // keep camera; skip the reframe below
     // frame the camera on the loaded terrain
     float W = g_scene.world_w > 0 ? (float)g_scene.world_w : 512.0f;
     float H = g_scene.world_h > 0 ? (float)g_scene.world_h : 512.0f;
@@ -385,15 +394,33 @@ static void drawPakBrowser() {
     }
 }
 
-// Place a copy of entity srcId at the camera target (structural insert + reload).
+// Sample the terrain elevation at world (x, y) via bilinear interp of the height
+// grid. Returns 0 if there is no heightmap.
+static float terrainHeightAt(float x, float y) {
+    const Scene& s = g_scene;
+    if (s.heights.empty() || s.grid_w < 2 || s.grid_h < 2) return 0.0f;
+    float fx = x, fy = y;
+    if (fx < 0) fx = 0; if (fx > s.grid_w - 1) fx = (float)(s.grid_w - 1);
+    if (fy < 0) fy = 0; if (fy > s.grid_h - 1) fy = (float)(s.grid_h - 1);
+    int x0 = (int)fx, y0 = (int)fy;
+    int x1 = x0 + 1 < s.grid_w ? x0 + 1 : x0, y1 = y0 + 1 < s.grid_h ? y0 + 1 : y0;
+    float tx = fx - x0, ty = fy - y0;
+    auto H = [&](int i, int j){ return s.heights[(size_t)j * s.grid_w + i]; };
+    float a = H(x0, y0) * (1 - tx) + H(x1, y0) * tx;
+    float b = H(x0, y1) * (1 - tx) + H(x1, y1) * tx;
+    return a * (1 - ty) + b * ty;
+}
+
+// Place a copy of entity srcId at the camera target, grounded on the terrain
+// (structural insert + reload; keeps the view and selects the new entity).
 static void placeDuplicate(long srcId) {
     if (srcId < 0 || g_srcMap.empty()) return;
     long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
-    float p[3] = { g_cam.target.x, g_cam.target.z, 0.0f };
-    for (const auto& en : g_scene.entities) if (en.id == srcId) { p[2] = en.pos[2]; break; }
+    float wx = g_cam.target.x, wy = g_cam.target.z;
+    float p[3] = { wx, wy, terrainHeightAt(wx, wy) };   // ground on the heightmap
     const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
     std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
-    if (add_entity_native(g_scene, srcId, p, newId, work)) loadScene(work);
+    if (add_entity_native(g_scene, srcId, p, newId, work)) loadScene(work, true, newId);
 }
 
 // --- prototype thumbnails (THMB chunk of each model .srm) ------------------
@@ -436,6 +463,43 @@ static unsigned thumbForProto(const std::string& protoGuid) {
 static void resetThumbCache() {
     for (auto& kv : g_thumbCache) if (kv.second) { unsigned t = kv.second; glDeleteTextures(1, &t); }
     g_thumbCache.clear(); g_protoIndex.clear(); g_protoIndexBuilt = false;
+}
+// Resolve a prototype's model .srm path (forward-slashed, original case), or "".
+static std::string modelPathForProto(const std::string& protoGuid) {
+    if (!g_protoIndexBuilt) {
+        g_protoIndex = protodb_model_index(vfs_resolve("ProtoDB.bin", g_dataRoot));
+        g_protoIndexBuilt = true;
+    }
+    std::string g; for (char c : protoGuid) g += (char)tolower((unsigned char)c);
+    auto it = g_protoIndex.find(g);
+    return it == g_protoIndex.end() ? std::string() : it->second;
+}
+// Bucket a prototype into a browser category from its model path (top folder),
+// falling back to the entity schema kind.
+static std::string categoryForProto(const std::string& protoGuid, const std::string& schemaType) {
+    std::string mp = modelPathForProto(protoGuid);
+    if (!mp.empty()) {
+        std::string low; for (char c : mp) low += (char)tolower((unsigned char)c);
+        size_t s1 = low.find('/');
+        std::string top = s1 == std::string::npos ? low : low.substr(0, s1);
+        std::string rest = s1 == std::string::npos ? std::string() : low.substr(s1 + 1);
+        size_t s2 = rest.find('/');
+        std::string sub = s2 == std::string::npos ? rest : rest.substr(0, s2);
+        auto has = [](const std::string& s, const char* k){ return s.find(k) != std::string::npos; };
+        if (top == "vehicles") return "Vehicles";
+        if (top == "buildings") return "Buildings";
+        if (top == "objects") {
+            if (has(sub,"nature")||has(sub,"tree")||has(sub,"veget")||has(sub,"plant")||has(sub,"forest"))
+                return "Nature / Trees";
+            return "Objects";
+        }
+        if (!top.empty()) { std::string c = top; c[0] = (char)toupper((unsigned char)c[0]); return c; }
+    }
+    if (schemaType.find("Building") != std::string::npos) return "Buildings";
+    if (schemaType.find("Vehicle") != std::string::npos || schemaType.find("Unit") != std::string::npos) return "Units";
+    if (schemaType.find("Effect") != std::string::npos || schemaType.find("Sound") != std::string::npos) return "Effects";
+    if (schemaType.find("Doodad") != std::string::npos) return "Doodads";
+    return "Other";
 }
 
 static ImU32 playerColor(int p) {
@@ -522,54 +586,65 @@ static void drawModePanel() {
             ImGui::SliderFloat("Height", &g_brushHeight, -50.0f, 50.0f);
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
         } else {
-            // Prototype browser: distinct prototypes present on the map, shown
-            // as a thumbnail grid (each model's baked THMB preview). Click one,
-            // then place a copy of it at the view center.
+            // Prototype browser: distinct prototypes on the map, grouped by
+            // category, each shown as its baked THMB preview. Click one, then Place.
             ImGui::TextWrapped("Prototypes on this map — click a thumbnail, then Place:");
-            std::map<std::string, std::pair<long,int>> protos;  // proto -> (srcId, count)
+            struct PInfo { long srcId; int count; std::string type; };
+            std::map<std::string, PInfo> protos;   // proto guid -> info
             for (const Entity& e : g_scene.entities) {
                 if (e.proto.empty()) continue;
                 auto& pr = protos[e.proto];
-                if (pr.second == 0) pr.first = e.id;
-                pr.second++;
+                if (pr.count == 0) { pr.srcId = e.id; pr.type = e.type; }
+                pr.count++;
             }
-            ImGui::BeginChild("protos", ImVec2(0, 300), ImGuiChildFlags_None);
+            // bucket into categories (sorted; each holds pointers into `protos`)
+            std::map<std::string, std::vector<std::pair<const std::string, PInfo>*>> cats;
+            for (auto& kv : protos)
+                cats[categoryForProto(kv.first, kv.second.type)].push_back(&kv);
+
+            ImGui::BeginChild("protos", ImVec2(0, 340), ImGuiChildFlags_None);
             const float img = 56.0f, cell = img + 18.0f;
-            float availw = ImGui::GetContentRegionAvail().x;
-            int perRow = (int)(availw / cell); if (perRow < 1) perRow = 1;
-            int col = 0;
-            for (auto& kv : protos) {
-                const std::string& proto = kv.first;
-                long srcId = kv.second.first;
-                const Entity* se = nullptr;
-                for (const Entity& e : g_scene.entities) if (e.id == srcId) { se = &e; break; }
-                unsigned tex = thumbForProto(proto);
-                bool sel = (g_placeSrcId == srcId);
-                ImGui::PushID(proto.c_str());
-                ImGui::BeginGroup();
-                if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
-                             ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-                bool clicked;
-                if (tex)
-                    clicked = ImGui::ImageButton("t", (ImTextureID)tex, ImVec2(img, img));
-                else
-                    clicked = ImGui::Button("?##noimg", ImVec2(img + 8, img + 8));
-                if (sel) ImGui::PopStyleColor();
-                if (clicked) g_placeSrcId = srcId;
-                char cap[32];
-                snprintf(cap, sizeof(cap), "%.6s x%d", se ? se->type.c_str() : "?", kv.second.second);
-                ImGui::TextUnformatted(cap);
-                ImGui::EndGroup();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s\n%s  (x%d)",
-                                      se ? se->type.c_str() : "?", proto.c_str(), kv.second.second);
-                ImGui::PopID();
-                if (++col % perRow != 0) ImGui::SameLine();
+            for (auto& c : cats) {
+                char hdr[64]; snprintf(hdr, sizeof(hdr), "%s (%d)", c.first.c_str(), (int)c.second.size());
+                if (!ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen)) continue;
+                float availw = ImGui::GetContentRegionAvail().x;
+                int perRow = (int)(availw / cell); if (perRow < 1) perRow = 1;
+                int col = 0;
+                for (auto* kvp : c.second) {
+                    const std::string& proto = kvp->first;
+                    const PInfo& pi = kvp->second;
+                    unsigned tex = thumbForProto(proto);
+                    bool sel = (g_placeSrcId == pi.srcId);
+                    ImGui::PushID(proto.c_str());
+                    ImGui::BeginGroup();
+                    if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
+                                 ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                    bool clicked;
+                    if (tex)   // flip V: THMB rows are top-down, ImGui samples bottom-up
+                        clicked = ImGui::ImageButton("t", (ImTextureID)tex, ImVec2(img, img),
+                                                     ImVec2(0, 1), ImVec2(1, 0));
+                    else
+                        clicked = ImGui::Button("?##noimg", ImVec2(img + 8, img + 8));
+                    if (sel) ImGui::PopStyleColor();
+                    if (clicked) g_placeSrcId = pi.srcId;
+                    char cap[32];
+                    snprintf(cap, sizeof(cap), "%.6s x%d", pi.type.c_str(), pi.count);
+                    ImGui::TextUnformatted(cap);
+                    ImGui::EndGroup();
+                    if (ImGui::IsItemHovered()) {
+                        std::string mp = modelPathForProto(proto);
+                        ImGui::SetTooltip("%s\n%s\n%s  (x%d)", pi.type.c_str(),
+                                          mp.empty() ? "(no model)" : mp.c_str(), proto.c_str(), pi.count);
+                    }
+                    ImGui::PopID();
+                    if (++col % perRow != 0) ImGui::SameLine();
+                }
+                ImGui::TreePop();
             }
             ImGui::EndChild();
             if (ImGui::Button("Place copy at view center") && g_placeSrcId >= 0)
                 placeDuplicate(g_placeSrcId);
-            ImGui::TextDisabled("(Ctrl+D duplicates the selected entity; Delete removes it)");
+            ImGui::TextDisabled("(placed at view center, grounded; Ctrl+D dup, Delete remove)");
         }
     }
     ImGui::End();
@@ -980,13 +1055,13 @@ int main(int argc, char** argv) {
             std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
             // Delete: remove the entity (structural) and reload the shortened map
             if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !g_srcMap.empty()) {
-                if (delete_entity_native(g_scene, e.id, work)) loadScene(work);
+                if (delete_entity_native(g_scene, e.id, work)) loadScene(work, true);
             }
             // Ctrl+D: duplicate the selected entity nearby (structural insert)
             if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D) && !g_srcMap.empty()) {
                 long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
                 float p[3] = { e.pos[0] + 8.0f, e.pos[1] + 8.0f, e.pos[2] };
-                if (add_entity_native(g_scene, e.id, p, newId, work)) loadScene(work);
+                if (add_entity_native(g_scene, e.id, p, newId, work)) loadScene(work, true, newId);
             }
         }
 
