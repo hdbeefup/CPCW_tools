@@ -537,6 +537,13 @@ static void drawMenuBar() {
         ImGui::MenuItem("3D models", nullptr, &g_showModels);
         ImGui::MenuItem("Entity dots", nullptr, &g_showDots);
         ImGui::MenuItem("Wireframe", nullptr, &g_wireframe);
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Terrain")) {
+            if (ImGui::MenuItem("Textured", nullptr, g_vp.terrainMode==0)) g_vp.terrainMode=0;
+            if (ImGui::MenuItem("Palette",  nullptr, g_vp.terrainMode==1)) g_vp.terrainMode=1;
+            if (ImGui::MenuItem("Height ramp", nullptr, g_vp.terrainMode==2)) g_vp.terrainMode=2;
+            ImGui::EndMenu();
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Mode")) {
@@ -978,6 +985,7 @@ int main(int argc, char** argv) {
     // headless render-to-BMP: one frame of the 3D scene, full framebuffer, exit.
     if (!shotPath.empty()) {
         g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+        g_vp.buildSplatTextures(g_scene, g_dataRoot);
         g_vp.buildModels(g_scene, g_dataRoot);
         g_sceneDirty = false;
         int fbw = 1360, fbh = 850;
@@ -1075,6 +1083,7 @@ int main(int argc, char** argv) {
 
         if (g_sceneDirty && g_glReady) {
             g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+            g_vp.buildSplatTextures(g_scene, g_dataRoot);
             g_vp.buildModels(g_scene, g_dataRoot);
             g_sceneDirty = false;
         }

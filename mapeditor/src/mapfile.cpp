@@ -59,7 +59,7 @@ struct Value { int kind=0; double f=0, v3[3]={0,0,0}; long i=0; std::string s;
 enum { V_NONE, V_INT, V_FLOAT, V_VEC3, V_STR };
 typedef std::map<std::string, Value> Obj;
 
-struct GTRDLayer { std::string name; bool active=false; };
+struct GTRDLayer { std::string name; float uvScale=1.0f; bool active=false; };
 
 struct Parser {
     Data D;
@@ -236,10 +236,10 @@ struct Parser {
         for (uint32_t i=0;i<layerCount && p<end;i++){
             size_t np; std::string name=D.str(p,np); p=np;
             p+=4;                   // unk u32
-            p+=4;                   // uv_scale f32
+            float uv=D.f32(p); p+=4;             // uv_scale f32
             std::string det=D.str(p,np); p=np;   // detail
             uint8_t flag=D.u8(p); p+=1;
-            layers.push_back({name, flag!=0});
+            layers.push_back({name, uv, flag!=0});
         }
         splatOff=p; gtrdEnd=end; return true;
     }
@@ -358,6 +358,18 @@ struct Parser {
             out[gi*3]=(unsigned char)(c.x*255); out[gi*3+1]=(unsigned char)(c.y*255); out[gi*3+2]=(unsigned char)(c.z*255);
         }
     }
+    // Slice the raw per-layer uint8 opacity grids that follow the heightmap
+    // (one gW*gH grid per layer, file order). Must run after heightmap().
+    void splatWeights(std::vector<std::vector<unsigned char>>& out) {
+        out.clear();
+        size_t need=(size_t)gW*gH; if (need==0) return;
+        for (size_t i=0;i<gLayers.size();i++){
+            size_t a=splatBase+i*need;
+            if (a+need>D.n || a+need>gtrdLimit) break;   // ran out of grids
+            out.emplace_back(D.d+a, D.d+a+need);
+        }
+    }
+    const std::vector<GTRDLayer>& layers() const { return gLayers; }
     struct V3 { float x,y,z; };
 };
 
@@ -404,6 +416,10 @@ bool load_map_native(const std::string& path, Scene& out) {
             out.grid_w=W; out.grid_h=H;
             out.heightOff = (long)P.heightOff;   // for native height save
             P.colormap(out.colors);
+            // real terrain paint: layer texture paths + uv scale + per-vertex opacity
+            for (const auto& l : P.layers())
+                out.terrainLayers.push_back({l.name, l.uvScale, l.active});
+            P.splatWeights(out.splatWeights);
         } else {
             // no locatable heightmap -> synthesize a flat ground plane so the
             // map still renders (never just dots in the void).

@@ -31,6 +31,18 @@ typedef ptrdiff_t GLintptr;
 #define GL_DEPTH_ATTACHMENT          0x8D00
 #define GL_DEPTH_COMPONENT24         0x81A6
 #define GL_FRAMEBUFFER_COMPLETE      0x8CD5
+#ifndef GL_TEXTURE0
+#define GL_TEXTURE0                  0x84C0
+#endif
+#ifndef GL_RGBA8
+#define GL_RGBA8                     0x8058
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE             0x812F   // GL 1.2; absent from ancient Windows gl.h
+#endif
+#ifndef GL_POLYGON_OFFSET_FILL
+#define GL_POLYGON_OFFSET_FILL       0x8037
+#endif
 
 #define GL_FUNCS(X) \
     X(GLuint, glCreateShader, (GLenum)) \
@@ -50,7 +62,11 @@ typedef ptrdiff_t GLintptr;
     X(void,   glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*)) \
     X(void,   glUniform3fv, (GLint, GLsizei, const GLfloat*)) \
     X(void,   glUniform1f, (GLint, GLfloat)) \
+    X(void,   glUniform2f, (GLint, GLfloat, GLfloat)) \
     X(void,   glUniform1i, (GLint, GLint)) \
+    X(void,   glUniform1iv, (GLint, GLsizei, const GLint*)) \
+    X(void,   glUniform1fv, (GLint, GLsizei, const GLfloat*)) \
+    X(void,   glActiveTexture, (GLenum)) \
     X(void,   glGenBuffers, (GLsizei, GLuint*)) \
     X(void,   glDeleteBuffers, (GLsizei, const GLuint*)) \
     X(void,   glBindBuffer, (GLenum, GLuint)) \

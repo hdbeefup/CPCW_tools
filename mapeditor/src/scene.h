@@ -25,7 +25,12 @@ struct Scene {
     int grid_w = 0, grid_h = 0;      // heightmap vertex dims (world_*+1)
     std::vector<Entity> entities;
     std::vector<float> heights;         // grid_w*grid_h row-major elevations, or empty
-    std::vector<unsigned char> colors;  // grid_w*grid_h*3 RGB splat colours, or empty
+    std::vector<unsigned char> colors;  // grid_w*grid_h*3 RGB splat colours (fallback), or empty
+    // real terrain paint: per-layer texture + per-vertex opacity, for textured
+    // rendering (falls back to `colors` when a layer texture can't be resolved).
+    struct TerrainLayer { std::string path; float uvScale = 1.0f; bool active = false; };
+    std::vector<TerrainLayer> terrainLayers;              // file order (incl. inactive)
+    std::vector<std::vector<unsigned char>> splatWeights; // per-layer grid_w*grid_h uint8
     std::vector<unsigned char> raw;     // original .map bytes (for native save), or empty
     std::string srcPath;                // original .map path, or empty (loaded from .json)
     long heightOff = -1;                // byte offset of the heightmap grid in raw

@@ -143,6 +143,47 @@ public:
         uMdlColor=glGetUniformLocation(modelProg,"uColor");
         uMdlHasTex=glGetUniformLocation(modelProg,"uHasTex");
         glUseProgram(modelProg); glUniform1i(glGetUniformLocation(modelProg,"uTex"),0);
+
+        // Splat-textured terrain: blend up to MAXL real layer .dds by per-vertex
+        // opacity (2 RGBA weight textures) tiled by uv_scale. Base layer opaque.
+        terrainTexProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
+            "uniform mat4 uMVP; uniform vec2 uGridInv;\n"
+            "out vec3 vN; out vec2 vTerrUV; out vec2 vWorldXZ;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aN;\n"
+            " vTerrUV=vec2((aPos.x+0.5)*uGridInv.x,(aPos.z+0.5)*uGridInv.y);\n"
+            " vWorldXZ=vec2(aPos.x,aPos.z); }\n",
+            "#version 330 core\n"
+            "in vec3 vN; in vec2 vTerrUV; in vec2 vWorldXZ; out vec4 F;\n"
+            "uniform vec3 uLight; uniform int uLayerCount; uniform float uTile;\n"
+            "uniform sampler2D uLayerTex[8]; uniform float uUvScale[8];\n"
+            "uniform int uHasTex[8]; uniform vec3 uFallback[8];\n"
+            "uniform sampler2D uW0; uniform sampler2D uW1;\n"
+            "void main(){ float w[8];\n"
+            " vec4 a=texture(uW0,vTerrUV), b=texture(uW1,vTerrUV);\n"
+            " w[0]=a.r;w[1]=a.g;w[2]=a.b;w[3]=a.a;w[4]=b.r;w[5]=b.g;w[6]=b.b;w[7]=b.a;\n"
+            " vec3 col=vec3(0.0);\n"
+            " for(int i=0;i<uLayerCount;i++){\n"
+            "   vec3 s = (uHasTex[i]==1) ? texture(uLayerTex[i], vWorldXZ*uTile*uUvScale[i]).rgb : uFallback[i];\n"
+            "   float al = (i==0)?1.0:clamp(w[i],0.0,1.0);\n"
+            "   col = mix(col, s, al); }\n"
+            " float d=max(dot(normalize(vN),normalize(uLight)),0.0)*0.75+0.25;\n"
+            " F=vec4(col*d,1.0); }\n");
+        uTTMVP=glGetUniformLocation(terrainTexProg,"uMVP");
+        uTTGridInv=glGetUniformLocation(terrainTexProg,"uGridInv");
+        uTTLight=glGetUniformLocation(terrainTexProg,"uLight");
+        uTTLayerCount=glGetUniformLocation(terrainTexProg,"uLayerCount");
+        uTTTile=glGetUniformLocation(terrainTexProg,"uTile");
+        uTTUvScale=glGetUniformLocation(terrainTexProg,"uUvScale");
+        uTTHasTex=glGetUniformLocation(terrainTexProg,"uHasTex");
+        uTTFallback=glGetUniformLocation(terrainTexProg,"uFallback");
+        glUseProgram(terrainTexProg);
+        int units[8]={0,1,2,3,4,5,6,7};
+        glUniform1iv(glGetUniformLocation(terrainTexProg,"uLayerTex"),8,units);
+        glUniform1i(glGetUniformLocation(terrainTexProg,"uW0"),8);
+        glUniform1i(glGetUniformLocation(terrainTexProg,"uW1"),9);
+        glUseProgram(0);
     }
 
     // Resolve each entity's Prototype (ProtoDB at dataRoot/ProtoDB.bin) to a
@@ -340,6 +381,107 @@ public:
         }
         texCache[key] = tex; return tex;
     }
+    // keyword fallback colour for a layer whose .dds can't be resolved
+    static void layerFallbackColor(const std::string& nm, float out[3]) {
+        std::string s; for (char c : nm) s += (char)tolower((unsigned char)c);
+        struct P { const char* k; float r,g,b; };
+        static const P pal[] = {
+            {"grass",0.27f,0.39f,0.17f},{"foliage",0.27f,0.39f,0.17f},{"meadow",0.27f,0.39f,0.17f},
+            {"tillage",0.34f,0.25f,0.16f},{"soil",0.34f,0.25f,0.16f},{"mud",0.34f,0.25f,0.16f},
+            {"dirt",0.34f,0.25f,0.16f},{"field",0.34f,0.25f,0.16f},{"ploughland",0.34f,0.25f,0.16f},
+            {"gritty",0.52f,0.44f,0.30f},{"ground",0.52f,0.44f,0.30f},{"sand",0.52f,0.44f,0.30f},
+            {"straw",0.52f,0.44f,0.30f},{"dry",0.52f,0.44f,0.30f},{"default",0.52f,0.44f,0.30f},
+            {"cobble",0.44f,0.43f,0.42f},{"road",0.44f,0.43f,0.42f},{"pavement",0.44f,0.43f,0.42f},
+            {"stone",0.44f,0.43f,0.42f},{"rock",0.44f,0.43f,0.42f},{"ruin",0.44f,0.43f,0.42f},
+            {"gravel",0.44f,0.43f,0.42f},{"mine",0.44f,0.43f,0.42f},
+            {"water",0.20f,0.29f,0.33f},{"river",0.20f,0.29f,0.33f},{"puddle",0.20f,0.29f,0.33f},
+            {"snow",0.80f,0.82f,0.85f},{"winter",0.80f,0.82f,0.85f},{"ice",0.80f,0.82f,0.85f},
+        };
+        for (auto& p : pal) if (s.find(p.k) != std::string::npos) { out[0]=p.r;out[1]=p.g;out[2]=p.b; return; }
+        out[0]=0.35f; out[1]=0.33f; out[2]=0.28f;
+    }
+    // strip a leading map prefix (M1_, M12_, M_01_, Tutor_1_) from a lowercased stem
+    static std::string stripMapPrefix(const std::string& stem) {
+        size_t i = 0;
+        if (stem.compare(0,1,"m")==0) {
+            size_t j=1; if (j<stem.size()&&stem[j]=='_') j++;
+            size_t k=j; while (k<stem.size() && isdigit((unsigned char)stem[k])) k++;
+            if (k>j && k<stem.size() && stem[k]=='_') i=k+1;
+        } else if (stem.compare(0,6,"tutor_")==0) {
+            size_t k=6; while (k<stem.size() && (isdigit((unsigned char)stem[k])||stem[k]=='_')) k++;
+            i=k;
+        }
+        return stem.substr(i);
+    }
+    // Resolve a GTRD layer path (e.g. "Terrain/Layer/M_01/Cobblestone_02_c_n") to a
+    // GL texture: try the basename, then map-prefix-stripped, then a longest-prefix
+    // scan over the .dds stem index. Returns 0 if nothing resolves.
+    GLuint resolveLayerTex(const std::string& logical) {
+        size_t sl = logical.find_last_of('/');
+        std::string base = (sl==std::string::npos) ? logical : logical.substr(sl+1);
+        std::string low; for (char c : base) low += (char)tolower((unsigned char)c);
+        GLuint t = loadTexture(low); if (t) return t;
+        std::string np = stripMapPrefix(low);
+        if (np != low) { t = loadTexture(np); if (t) return t; }
+        // longest-prefix / suffix-tolerant scan (Cobblestone_02_c_n -> cobblestone_02)
+        const std::string& q = np;
+        std::string bestKey; size_t bestLen = 0;
+        for (const auto& kv : texIndex) {
+            const std::string& k = kv.first;
+            size_t m = (q.size()<k.size()) ? q.size() : k.size();
+            if (m < 4) continue;
+            if (q.compare(0,m,k,0,m)==0 && m > bestLen) { bestLen=m; bestKey=k; }
+        }
+        if (!bestKey.empty()) return loadTexture(bestKey);
+        return 0;
+    }
+    // Build the per-map splat textures + active-layer arrays for terrainTexProg.
+    void buildSplatTextures(const Scene& s, const std::string& dataRoot) {
+        splatReady = false; splatLayerCount = 0;
+        if (s.terrainLayers.empty() || s.splatWeights.empty()) return;
+        if (dataRoot.empty() && !vfs_any_mounted()) return;
+        buildTexIndex(dataRoot);
+        int W=s.grid_w, H=s.grid_h; if (W<2||H<2) return;
+        // active layers in file order (base first); cap at MAXL=8
+        std::vector<int> act;
+        for (int i=0;i<(int)s.terrainLayers.size();i++)
+            if (s.terrainLayers[i].active && i<(int)s.splatWeights.size()) act.push_back(i);
+        if (act.empty()) return;
+        if (act.size()>8) { fprintf(stderr,"terrain: %zu active layers, capping at 8\n", act.size()); act.resize(8); }
+        splatLayerCount = (int)act.size();
+        int resolved = 0;
+        for (int k=0;k<splatLayerCount;k++){
+            const auto& L = s.terrainLayers[act[k]];
+            GLuint t = resolveLayerTex(L.path);
+            splatLayerTex[k] = t; splatHasTex[k] = t?1:0; splatUv[k] = L.uvScale>0?L.uvScale:1.0f;
+            if (t) resolved++;
+            layerFallbackColor(L.path, &splatFallback[k*3]);
+        }
+        // pack per-layer weights (active order) into 2 RGBA8 weight textures
+        size_t need=(size_t)W*H;
+        std::vector<unsigned char> w0(need*4,0), w1(need*4,0);
+        for (int k=0;k<splatLayerCount;k++){
+            const std::vector<unsigned char>& g = s.splatWeights[act[k]];
+            if (g.size()<need) continue;
+            std::vector<unsigned char>& dst = (k<4)?w0:w1; int ch=k%4;
+            for (size_t gi=0;gi<need;gi++) dst[gi*4+ch]=g[gi];
+        }
+        auto up=[&](GLuint& tex, const std::vector<unsigned char>& d){
+            if(!tex) glGenTextures(1,&tex);
+            glBindTexture(GL_TEXTURE_2D,tex);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,d.data());
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D,0);
+        };
+        up(splatW0,w0); up(splatW1,w1);
+        splatGridInv[0]=1.0f/W; splatGridInv[1]=1.0f/H;
+        splatReady = (resolved>0);   // only use textured path if at least one layer resolved
+    }
+    bool splatIsReady() const { return splatReady; }
+
     void clearModels() {
         for (auto& kv : modelCache) {
             if (kv.second.vao) glDeleteVertexArrays(1,&kv.second.vao);
@@ -376,10 +518,28 @@ public:
         }
         if (terrainCount) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
-            glUseProgram(terrainProg);
-            glUniformMatrix4fv(uTerrMVP,1,GL_FALSE,mvp.m);
-            float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uTerrLight,1,light);
-            glUniform1i(uTerrUseColor, terrainHasColor ? 1 : 0);
+            float light[3]={0.4f,0.8f,0.35f};
+            bool useTex = (terrainMode==0) && splatReady && terrainTexProg;
+            if (useTex) {
+                glUseProgram(terrainTexProg);
+                glUniformMatrix4fv(uTTMVP,1,GL_FALSE,mvp.m);
+                glUniform2f(uTTGridInv, splatGridInv[0], splatGridInv[1]);
+                glUniform3fv(uTTLight,1,light);
+                glUniform1i(uTTLayerCount, splatLayerCount);
+                glUniform1f(uTTTile, terrainTile);
+                glUniform1fv(uTTUvScale, splatLayerCount, splatUv);
+                glUniform1iv(uTTHasTex, splatLayerCount, splatHasTex);
+                glUniform3fv(uTTFallback, splatLayerCount, splatFallback);
+                for (int k=0;k<splatLayerCount;k++){ glActiveTexture(GL_TEXTURE0+k); glBindTexture(GL_TEXTURE_2D, splatLayerTex[k]); }
+                glActiveTexture(GL_TEXTURE0+8); glBindTexture(GL_TEXTURE_2D, splatW0);
+                glActiveTexture(GL_TEXTURE0+9); glBindTexture(GL_TEXTURE_2D, splatW1);
+                glActiveTexture(GL_TEXTURE0);
+            } else {
+                glUseProgram(terrainProg);
+                glUniformMatrix4fv(uTerrMVP,1,GL_FALSE,mvp.m);
+                glUniform3fv(uTerrLight,1,light);
+                glUniform1i(uTerrUseColor, (terrainMode!=2 && terrainHasColor) ? 1 : 0);
+            }
             glBindVertexArray(terrainVAO);
             glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
@@ -418,4 +578,15 @@ private:
     GLint uTerrMVP=-1, uTerrLight=-1, uTerrUseColor=-1, uEntMVP=-1, uEntSize=-1, uEntWhite=-1;
     int terrainCount=0, entCount=0;
     bool terrainHasColor=false;
+
+    // splat-textured terrain
+    GLuint terrainTexProg=0;
+    GLint uTTMVP=-1,uTTGridInv=-1,uTTLight=-1,uTTLayerCount=-1,uTTTile=-1,uTTUvScale=-1,uTTHasTex=-1,uTTFallback=-1;
+    int   splatLayerCount=0;
+    GLuint splatLayerTex[8]={0}; float splatUv[8]={0}; int splatHasTex[8]={0};
+    float splatFallback[24]={0}; GLuint splatW0=0, splatW1=0; float splatGridInv[2]={0,0};
+    bool  splatReady=false;
+public:
+    int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
+    float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
 };
