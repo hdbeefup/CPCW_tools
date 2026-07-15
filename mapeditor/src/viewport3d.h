@@ -235,10 +235,9 @@ public:
             GLModel* gm = loadModel(mp);
             if (!gm || gm->parts.empty() || gm->vao == 0) continue;
             V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
-            // The X mirror (LH->RH handedness) reverses the yaw sense, so negate
-            // the entity yaw to match the in-game facing.
-            float yaw = -e.dir * 3.14159265f / 180.0f;
-            M4 xf = mul(mul(translate(wp), rotY(yaw)), scaleM(-1.0f, 1.0f, 1.0f));
+            // model is converted to RH at load (negate Z); place with a plain yaw.
+            float yaw = e.dir * 3.14159265f / 180.0f;
+            M4 xf = mul(translate(wp), rotY(yaw));
             instances.push_back({ gm, xf });
         }
     }
@@ -334,12 +333,19 @@ public:
             std::vector<float> verts; std::vector<unsigned> idx; unsigned base = 0;
             for (auto& rm : rms) {                      // one Part per RenderMesh (its diffuse tex)
                 Part part; part.off = (int)idx.size();
+                // DirectX(LH) -> OpenGL(RH): negate Z + reverse winding. This is a
+                // depth flip (NOT a left-right mirror), so text/logos stay readable
+                // and faces wind outward (no "inside-out" models).
                 for (auto& v : rm.verts) {
-                    verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
-                    verts.push_back(v.nx); verts.push_back(v.ny); verts.push_back(v.nz);
+                    verts.push_back(v.x); verts.push_back(v.y); verts.push_back(-v.z);
+                    verts.push_back(v.nx); verts.push_back(v.ny); verts.push_back(-v.nz);
                     verts.push_back(v.u); verts.push_back(v.v);
                 }
-                for (auto i : rm.indices) idx.push_back(base + i);
+                for (size_t t = 0; t + 2 < rm.indices.size(); t += 3) {
+                    idx.push_back(base + rm.indices[t]);
+                    idx.push_back(base + rm.indices[t+2]);
+                    idx.push_back(base + rm.indices[t+1]);
+                }
                 base += (unsigned)rm.verts.size();
                 part.count = (int)rm.indices.size();
                 part.tex = loadTexture(rm.diffuseTex);
@@ -575,6 +581,9 @@ public:
         glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
         if (showModels && !instances.empty()) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+            // cull back faces so you never see through into the model interior
+            // (winding is corrected in loadModel: negate-Z + reversed order = CW front)
+            if (!wireframe) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); glFrontFace(GL_CW); }
             glUseProgram(modelProg);
             float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uMdlLight,1,light);
             float col[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,col);
@@ -590,6 +599,7 @@ public:
                                    (void*)(size_t)(part.off * sizeof(unsigned)));
                 }
             }
+            glDisable(GL_CULL_FACE);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
         if (terrainCount) {
