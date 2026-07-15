@@ -73,43 +73,52 @@ void parseMesh(const uint8_t* d, size_t start, size_t end, SrmMesh& mesh) {
         }
     }
 
-    // Single submesh + material/texture block (mirrors srm_format.py).
+    // Submesh material/texture blocks — ONE PER SUBMESH. Each = 25-byte header
+    // (flag(1) + 6*u32; index_start = u32@+13, face_count(tris) = u32@+17) + material
+    // name + property list. A mesh can have several submeshes, each with its OWN
+    // texture(s) on its OWN index range; reading only the first mis-textures the rest.
     if (!mesh.streams.empty()) {
-        SrmSubmesh sm;
-        sm.materialName = "default";
-        // best-effort material parse; failures leave textures empty
-        size_t mp = p + 25;   // flag(1) + 6*u32(24)
-        if (mp + 2 <= end) {
-            uint16_t mlen = u16(d, mp); mp += 2;
-            if (mlen > 0 && mlen < 256 && mp + mlen <= end) {
-                std::string mname((const char*)(d + mp), mlen); mp += mlen;
-                if (!mname.empty() && mname.back() == '\\') mname.pop_back();
-                sm.materialName = mname;
-                if (mp + 8 <= end) {
-                    mp += 2;  // prop_count u16
-                    mp += 2;  // unk u16
-                    uint32_t propTotal = u32(d, mp); mp += 4;
-                    for (uint32_t i = 0; i < propTotal && mp + 2 <= end; i++) {
-                        uint16_t plen = u16(d, mp); mp += 2;
-                        if (mp + plen > end) break;
-                        std::string pname((const char*)(d + mp), plen); mp += plen;
-                        if (mp + 8 > end) break;
-                        uint32_t ptype = u32(d, mp); mp += 4;
-                        uint32_t psize = u32(d, mp); mp += 4;
-                        if (ptype == 6) {
-                            if (mp + 2 > end) break;
-                            uint16_t tlen = u16(d, mp); mp += 2;
-                            if (mp + tlen > end) break;
-                            std::string tname((const char*)(d + mp), tlen); mp += tlen;
-                            sm.textures[pname] = tname;
-                        } else if (ptype == 0 && psize > 0) {
-                            mp += psize;
+        for (int s = 0; s < mesh.submeshCount && p + 25 <= end; s++) {
+            SrmSubmesh sm;
+            sm.materialName = "default";
+            sm.faceStart = (int)u32(d, p + 13);   // index_start (index units)
+            sm.faceCount = (int)u32(d, p + 17);   // triangle count
+            size_t mp = p + 25;                    // past flag + 6*u32
+            bool ok = (mp + 2 <= end);
+            if (ok) {
+                uint16_t mlen = u16(d, mp); mp += 2;
+                if (mlen < 256 && mp + mlen <= end) {
+                    std::string mname((const char*)(d + mp), mlen); mp += mlen;
+                    if (!mname.empty() && mname.back() == '\\') mname.pop_back();
+                    sm.materialName = mname;
+                    if (mp + 8 <= end) {
+                        mp += 2;  // prop_count u16
+                        mp += 2;  // unk u16
+                        uint32_t propTotal = u32(d, mp); mp += 4;
+                        for (uint32_t i = 0; i < propTotal && mp + 2 <= end; i++) {
+                            uint16_t plen = u16(d, mp); mp += 2;
+                            if (mp + plen > end) { ok = false; break; }
+                            std::string pname((const char*)(d + mp), plen); mp += plen;
+                            if (mp + 8 > end) { ok = false; break; }
+                            uint32_t ptype = u32(d, mp); mp += 4;
+                            uint32_t psize = u32(d, mp); mp += 4;
+                            if (ptype == 6) {
+                                if (mp + 2 > end) { ok = false; break; }
+                                uint16_t tlen = u16(d, mp); mp += 2;
+                                if (mp + tlen > end) { ok = false; break; }
+                                std::string tname((const char*)(d + mp), tlen); mp += tlen;
+                                sm.textures[pname] = tname;
+                            } else if (psize > 0) {        // skip any non-texture payload
+                                mp += psize;               // (Color/MultiPlayerColor/...)
+                            }
                         }
                     }
-                }
+                } else ok = false;
             }
+            mesh.submeshes.push_back(std::move(sm));
+            if (!ok) break;         // parse desynced -> stop, keep what we have
+            p = mp;                 // advance to the next submesh header
         }
-        mesh.submeshes.push_back(std::move(sm));
     }
 }
 
@@ -375,10 +384,8 @@ static void readUV(const SrmStream& s, int i, float& u, float& v) {
 // ALPHA channel is a transparency mask (DiffuseTexture/Diffuse — foliage/fence cutouts;
 // opaque models simply have alpha=255). It is FALSE for DiffuseSpec*, whose alpha is a
 // specular map — alpha-testing those would punch holes in solid models.
-static std::string pickDiffuse(const SrmMesh& mesh, bool* alphaCut = nullptr) {
+static std::string pickDiffuseTex(const std::map<std::string,std::string>& tex, bool* alphaCut) {
     if (alphaCut) *alphaCut = false;
-    if (mesh.submeshes.empty()) return "";
-    const auto& tex = mesh.submeshes[0].textures;
     const char* cutKeys[] = { "DiffuseTexture", "Diffuse" };
     for (const char* k : cutKeys) { auto it = tex.find(k); if (it != tex.end()) { if (alphaCut) *alphaCut = true; return it->second; } }
     const char* specKeys[] = { "DiffuseSpecTexture", "DiffuseSpec" };
@@ -390,6 +397,11 @@ static std::string pickDiffuse(const SrmMesh& mesh, bool* alphaCut = nullptr) {
             return kv.second;
     }
     return "";
+}
+static std::string pickDiffuse(const SrmMesh& mesh, bool* alphaCut = nullptr) {
+    if (alphaCut) *alphaCut = false;
+    if (mesh.submeshes.empty()) return "";
+    return pickDiffuseTex(mesh.submeshes[0].textures, alphaCut);
 }
 
 // 0 = BASE, 1 = STD, 2 = UPG  (from a bone/node name's suffix).
@@ -473,12 +485,7 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
         bool smooth = haveBones && bi && bi->stride == 4;
         bool rigid = haveBones && !smooth && nrm && nrm->stride == 4;
 
-        RenderMesh rm;
-        rm.nodeIndex = (int)ni;
-        bool alphaCut = false;
-        rm.diffuseTex = pickDiffuse(mesh, &alphaCut);
-        rm.alphaTest = alphaCut;
-        rm.verts.resize(vcount);
+        std::vector<RVertex> verts(vcount);  // shared across this mesh's submeshes
         std::vector<int> vtag(vcount, 0);    // per-vertex variant tag (bone node suffix)
         std::vector<char> sflag(vcount, 0);  // per-vertex: skinned to a 'shadow' node
 
@@ -525,25 +532,44 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
                 sflag[vi] = isShadowNode(m.nodes[boneNode].name) ? 1 : 0;
             }
 
-            RVertex& rv = rm.verts[vi];
+            RVertex& rv = verts[vi];
             rv.x = wp.x; rv.y = wp.y; rv.z = wp.z;
             Vec3 nn = normalize(wn);
             rv.nx = nn.x; rv.ny = nn.y; rv.nz = nn.z;
             if (uv) readUV(*uv, vi, rv.u, rv.v); else { rv.u = 0; rv.v = 0; }
         }
 
-        // Face filter: drop shadow-caster tris (engine draws 'shadow' separately) and,
-        // for a non-ALL variant, tris whose verts belong to an excluded loadout.
+        // Emit one RenderMesh per submesh — each has its OWN diffuse + index range.
+        // (Multi-submesh meshes pack several materials into one index buffer; painting
+        // the whole mesh with submesh 0 mis-textures the rest.) Per-tri filter drops
+        // shadow-caster tris and, for a non-ALL variant, excluded-loadout tris.
         const auto& src = mesh.indices;
-        rm.indices.reserve(src.size());
-        for (size_t i = 0; i + 2 < src.size(); i += 3) {
-            uint32_t a = src[i], b = src[i+1], c = src[i+2];
-            if (a >= (uint32_t)vcount || b >= (uint32_t)vcount || c >= (uint32_t)vcount) continue;
-            if (sflag[a] || sflag[b] || sflag[c]) continue;                 // shadow caster
-            if (variant != VAR_ALL && !(variantKeep(vtag[a], variant) &&
-                variantKeep(vtag[b], variant) && variantKeep(vtag[c], variant))) continue;
-            rm.indices.push_back(a); rm.indices.push_back(b); rm.indices.push_back(c);
+        auto emitRange = [&](size_t i0, size_t i1, const SrmSubmesh* sub) {
+            if (i1 > src.size()) i1 = src.size();
+            RenderMesh rm; rm.nodeIndex = (int)ni;
+            bool alphaCut = false;
+            rm.diffuseTex = sub ? pickDiffuseTex(sub->textures, &alphaCut)
+                                : pickDiffuse(mesh, &alphaCut);
+            rm.alphaTest = alphaCut;
+            for (size_t i = i0; i + 2 < i1; i += 3) {
+                uint32_t a = src[i], b = src[i+1], c = src[i+2];
+                if (a >= (uint32_t)vcount || b >= (uint32_t)vcount || c >= (uint32_t)vcount) continue;
+                if (sflag[a] || sflag[b] || sflag[c]) continue;             // shadow caster
+                if (variant != VAR_ALL && !(variantKeep(vtag[a], variant) &&
+                    variantKeep(vtag[b], variant) && variantKeep(vtag[c], variant))) continue;
+                rm.indices.push_back(a); rm.indices.push_back(b); rm.indices.push_back(c);
+            }
+            if (rm.indices.size() >= 3) { rm.verts = verts; out.push_back(std::move(rm)); }
+        };
+        bool multi = mesh.submeshes.size() > 1, ranged = multi;
+        for (const auto& sm : mesh.submeshes)
+            if (sm.faceStart < 0 || sm.faceCount <= 0 ||
+                (size_t)sm.faceStart + (size_t)sm.faceCount*3 > src.size()) ranged = false;
+        if (multi && ranged) {
+            for (const auto& sm : mesh.submeshes)
+                emitRange((size_t)sm.faceStart, (size_t)sm.faceStart + (size_t)sm.faceCount*3, &sm);
+        } else {
+            emitRange(0, src.size(), mesh.submeshes.empty() ? nullptr : &mesh.submeshes[0]);
         }
-        if (rm.indices.size() >= 3) out.push_back(std::move(rm));
     }
 }

@@ -29,6 +29,8 @@ struct SrmStream {
 struct SrmSubmesh {
     std::string materialName;
     std::map<std::string, std::string> textures;   // e.g. "DiffuseTexture" -> "foo.dds"
+    int faceStart = 0;   // first index (in index units) of this submesh's range
+    int faceCount = 0;   // triangle count -> range = [faceStart, faceStart + 3*faceCount)
 };
 
 struct SrmMesh {
