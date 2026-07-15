@@ -544,6 +544,8 @@ static void drawMenuBar() {
             if (ImGui::MenuItem("Height ramp", nullptr, g_vp.terrainMode==2)) g_vp.terrainMode=2;
             ImGui::EndMenu();
         }
+        ImGui::MenuItem("Roads", nullptr, &g_vp.showRoads);
+        ImGui::MenuItem("Decals", nullptr, &g_vp.showDecals);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Mode")) {
@@ -908,6 +910,18 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
+        else if (!strcmp(argv[i], "--overlaytest") && i + 1 < argc) {
+            // dev: --overlaytest <map>  (decode roads/decals, print counts + bounds)
+            Scene s; if (!load_map_native(argv[i+1], s)) return 2;
+            size_t rv=0, dv=0; int noTex=0;
+            for (auto& m : s.roads)  { rv += m.verts.size()/5; if (m.tex.empty()) noTex++; }
+            for (auto& m : s.decals) { dv += m.verts.size()/5; if (m.tex.empty()) noTex++; }
+            printf("overlays: roads=%zu (%zu verts) decals=%zu (%zu verts) noTex=%d\n",
+                   s.roads.size(), rv, s.decals.size(), dv, noTex);
+            for (size_t k=0;k<s.roads.size() && k<3;k++) printf("  road[%zu] %s\n", k, s.roads[k].tex.c_str());
+            for (size_t k=0;k<s.decals.size() && k<3;k++) printf("  decal[%zu] %s\n", k, s.decals[k].tex.c_str());
+            return 0;
+        }
         else if (!strcmp(argv[i], "--addtest") && i + 4 < argc) {
             Scene s; if (!load_map_native(argv[i+1], s)) return 2;
             long srcId = atol(argv[i+2]), newId = atol(argv[i+3]);
@@ -986,6 +1000,7 @@ int main(int argc, char** argv) {
     if (!shotPath.empty()) {
         g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
         g_vp.buildSplatTextures(g_scene, g_dataRoot);
+        g_vp.buildOverlays(g_scene, g_dataRoot);
         g_vp.buildModels(g_scene, g_dataRoot);
         g_sceneDirty = false;
         int fbw = 1360, fbh = 850;

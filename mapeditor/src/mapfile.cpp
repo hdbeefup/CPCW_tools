@@ -2,6 +2,7 @@
 // oracle). Parses the SCEN chunk tree, SCHD schemas, UNTS/OBJS entities, the
 // GTRD terrain (heightmap locator + splatmap colormap) directly into a Scene.
 #include "mapfile.h"
+#include "overlays.h"
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -441,6 +442,8 @@ bool load_map_native(const std::string& path, Scene& out) {
 
     out.raw = P.buf;          // keep original bytes for native in-place save
     out.srcPath = path;
+    // roads (GROL/GROA) + decals (GDCL/GDEC) overlay geometry (needs heights set)
+    parse_overlays(out.raw, out);
     out.loaded = true;
     return true;
 }

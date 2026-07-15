@@ -184,6 +184,20 @@ public:
         glUniform1i(glGetUniformLocation(terrainTexProg,"uW0"),8);
         glUniform1i(glGetUniformLocation(terrainTexProg,"uW1"),9);
         glUseProgram(0);
+
+        // road/decal overlays: textured, alpha-blended, terrain-projected
+        overlayProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; layout(location=1) in vec2 aUV;\n"
+            "uniform mat4 uMVP; out vec2 vUV;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vUV=aUV; }\n",
+            "#version 330 core\n"
+            "in vec2 vUV; out vec4 F; uniform sampler2D uTex;\n"
+            "void main(){ vec4 t=texture(uTex, vec2(vUV.x,1.0-vUV.y));\n"
+            " if(t.a<0.04) discard; F=t; }\n");
+        uOvMVP=glGetUniformLocation(overlayProg,"uMVP");
+        glUseProgram(overlayProg); glUniform1i(glGetUniformLocation(overlayProg,"uTex"),0);
+        glUseProgram(0);
     }
 
     // Resolve each entity's Prototype (ProtoDB at dataRoot/ProtoDB.bin) to a
@@ -482,6 +496,51 @@ public:
     }
     bool splatIsReady() const { return splatReady; }
 
+    // Build GL batches for road/decal overlays, grouped by resolved texture so the
+    // whole overlay set draws in a handful of calls. Meshes whose texture won't
+    // resolve are skipped.
+    void buildOverlays(const Scene& s, const std::string& dataRoot) {
+        clearOverlays();
+        if ((s.roads.empty() && s.decals.empty())) return;
+        if (dataRoot.empty() && !vfs_any_mounted()) return;
+        buildTexIndex(dataRoot);
+        // group vertices/indices by (GL texture, isDecal)
+        std::map<std::pair<GLuint,int>, std::pair<std::vector<float>, std::vector<unsigned>>> groups;
+        auto add=[&](const std::vector<Scene::OverlayMesh>& list, int isDecal){
+            for (const auto& m : list) {
+                GLuint t = resolveLayerTex(m.tex);
+                if (!t) continue;
+                auto& g = groups[{t,isDecal}];
+                unsigned base = (unsigned)(g.first.size()/5);
+                g.first.insert(g.first.end(), m.verts.begin(), m.verts.end());
+                for (unsigned ix : m.idx) g.second.push_back(base + ix);
+            }
+        };
+        add(s.roads, 0); add(s.decals, 1);
+        for (auto& kv : groups) {
+            OverlayBatch ob; ob.tex = kv.first.first; ob.isDecal = kv.first.second; ob.count = (int)kv.second.second.size();
+            glGenVertexArrays(1,&ob.vao); glGenBuffers(1,&ob.vbo); glGenBuffers(1,&ob.ebo);
+            glBindVertexArray(ob.vao);
+            glBindBuffer(GL_ARRAY_BUFFER, ob.vbo);
+            glBufferData(GL_ARRAY_BUFFER, kv.second.first.size()*sizeof(float), kv.second.first.data(), GL_STATIC_DRAW);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ob.ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, kv.second.second.size()*sizeof(unsigned), kv.second.second.data(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,5*sizeof(float),(void*)0);
+            glEnableVertexAttribArray(1); glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,5*sizeof(float),(void*)(3*sizeof(float)));
+            glBindVertexArray(0);
+            overlayBatches.push_back(ob);
+        }
+    }
+    void clearOverlays() {
+        for (auto& b : overlayBatches) {
+            if (b.vao) glDeleteVertexArrays(1,&b.vao);
+            if (b.vbo) glDeleteBuffers(1,&b.vbo);
+            if (b.ebo) glDeleteBuffers(1,&b.ebo);
+        }
+        overlayBatches.clear();
+    }
+    int overlayBatchCount() const { return (int)overlayBatches.size(); }
+
     void clearModels() {
         for (auto& kv : modelCache) {
             if (kv.second.vao) glDeleteVertexArrays(1,&kv.second.vao);
@@ -544,6 +603,21 @@ public:
             glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
+        // road/decal overlays: textured, alpha-blended, lifted above the terrain
+        if (!overlayBatches.empty() && !wireframe) {
+            glUseProgram(overlayProg);
+            glUniformMatrix4fv(uOvMVP,1,GL_FALSE,mvp.m);
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-2.0f,-2.0f);
+            glActiveTexture(GL_TEXTURE0);
+            for (auto& b : overlayBatches) {
+                if (b.isDecal ? !showDecals : !showRoads) continue;
+                glBindTexture(GL_TEXTURE_2D, b.tex);
+                glBindVertexArray(b.vao);
+                glDrawElements(GL_TRIANGLES, b.count, GL_UNSIGNED_INT, 0);
+            }
+            glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_BLEND);
+        }
         if (showDots && entCount) {
             glUseProgram(entProg);
             glUniformMatrix4fv(uEntMVP,1,GL_FALSE,mvp.m);
@@ -586,7 +660,13 @@ private:
     GLuint splatLayerTex[8]={0}; float splatUv[8]={0}; int splatHasTex[8]={0};
     float splatFallback[24]={0}; GLuint splatW0=0, splatW1=0; float splatGridInv[2]={0,0};
     bool  splatReady=false;
+
+    // road/decal overlays
+    GLuint overlayProg=0; GLint uOvMVP=-1;
+    struct OverlayBatch { GLuint tex=0, vao=0, vbo=0, ebo=0; int count=0, isDecal=0; };
+    std::vector<OverlayBatch> overlayBatches;
 public:
     int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
     float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
+    bool  showRoads=true, showDecals=true;
 };

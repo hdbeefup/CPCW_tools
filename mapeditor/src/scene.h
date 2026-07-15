@@ -31,6 +31,13 @@ struct Scene {
     struct TerrainLayer { std::string path; float uvScale = 1.0f; bool active = false; };
     std::vector<TerrainLayer> terrainLayers;              // file order (incl. inactive)
     std::vector<std::vector<unsigned char>> splatWeights; // per-layer grid_w*grid_h uint8
+    // road (GROA) & decal (GDEC) overlay geometry, projected onto the terrain.
+    struct OverlayMesh {
+        std::string tex;                 // material path (e.g. Terrain/Road/.../M1_Cobblestone_01b)
+        std::vector<float> verts;        // interleaved x,y,z,u,v
+        std::vector<unsigned> idx;       // triangle indices
+    };
+    std::vector<OverlayMesh> roads, decals;
     std::vector<unsigned char> raw;     // original .map bytes (for native save), or empty
     std::string srcPath;                // original .map path, or empty (loaded from .json)
     long heightOff = -1;                // byte offset of the heightmap grid in raw
