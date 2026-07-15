@@ -592,6 +592,8 @@ static void drawModePanel() {
         ImGui::SeparatorText("Parameters");
         if (m.focus[0] == 't') {
             ImGui::SliderFloat("Size", &g_brushSize, 0.5f, 8.0f);
+            float rad = g_brushSize * 4.0f;
+            ImGui::TextDisabled("diameter %.0f world units  (radius %.1f)", rad * 2.0f, rad);
             ImGui::SliderFloat("Height", &g_brushHeight, -50.0f, 50.0f);
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
         } else {
@@ -809,6 +811,23 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     // Terrain mode + a brush tool (Raise/Lower/Smooth) => left-drag brushes the
     // heightmap instead of selecting entities.
     bool brushing = (g_mode == 0 && (g_activeTool == 1 || g_activeTool == 2 || g_activeTool == 6));
+    // Brush cursor ring: show the exact terrain area the brush will modify while
+    // hovering with a brush tool (matches applyTerrainBrush's radius).
+    {
+        float gx, gy;
+        if (over && brushing && g_scene.loaded && terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
+            const int N = 48; float rad = g_brushSize * 4.0f;
+            std::vector<float> ring; ring.reserve(N * 3);
+            for (int k = 0; k < N; k++) {
+                float a = 6.2831853f * k / N;
+                float x = gx + rad * std::cos(a), z = gy + rad * std::sin(a);
+                ring.push_back(x); ring.push_back(terrainHeightAt(x, z) + 0.3f); ring.push_back(z);
+            }
+            g_vp.setBrushRing(std::move(ring));
+        } else {
+            g_vp.setBrushRing({});
+        }
+    }
     if (over && brushing && ImGui::IsMouseDown(0)) {
         if (!g_strokeActive) { g_strokeH0 = g_scene.heights; g_strokeActive = true; }
         float gx, gy;

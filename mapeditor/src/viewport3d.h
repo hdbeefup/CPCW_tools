@@ -198,7 +198,22 @@ public:
         uOvMVP=glGetUniformLocation(overlayProg,"uMVP");
         glUseProgram(overlayProg); glUniform1i(glGetUniformLocation(overlayProg,"uTex"),0);
         glUseProgram(0);
+
+        // flat-colour line shader (terrain brush cursor ring)
+        lineProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; uniform mat4 uMVP;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); }\n",
+            "#version 330 core\n"
+            "out vec4 F; uniform vec3 uColor;\n"
+            "void main(){ F=vec4(uColor,1.0); }\n");
+        uLineMVP=glGetUniformLocation(lineProg,"uMVP");
+        uLineColor=glGetUniformLocation(lineProg,"uColor");
     }
+
+    // Set the terrain brush cursor ring (world-space line-loop vertices, xyz*).
+    // Pass an empty vector to hide it.
+    void setBrushRing(std::vector<float> ringXYZ) { brushRing = std::move(ringXYZ); }
 
     // Resolve each entity's Prototype (ProtoDB at dataRoot/ProtoDB.bin) to a
     // model .srm under dataRoot, load unique models, and place an instance at the
@@ -629,6 +644,22 @@ public:
                 glDrawArrays(GL_POINTS, selected, 1);
             }
         }
+        // terrain brush cursor ring — drawn last, depth-test off so it's always
+        // visible as a cursor showing the exact area the brush will modify.
+        if (brushRing.size() >= 9) {
+            if (!ringVAO) { glGenVertexArrays(1,&ringVAO); glGenBuffers(1,&ringVBO); }
+            glBindVertexArray(ringVAO);
+            glBindBuffer(GL_ARRAY_BUFFER, ringVBO);
+            glBufferData(GL_ARRAY_BUFFER, brushRing.size()*sizeof(float), brushRing.data(), GL_DYNAMIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(lineProg);
+            glUniformMatrix4fv(uLineMVP,1,GL_FALSE,mvp.m);
+            float col[3]={1.0f,0.85f,0.2f}; glUniform3fv(uLineColor,1,col);
+            glDrawArrays(GL_LINE_LOOP, 0, (int)(brushRing.size()/3));
+            glEnable(GL_DEPTH_TEST);
+        }
         glBindVertexArray(0);
         glUseProgram(0);
     }
@@ -665,6 +696,10 @@ private:
     GLuint overlayProg=0; GLint uOvMVP=-1;
     struct OverlayBatch { GLuint tex=0, vao=0, vbo=0, ebo=0; int count=0, isDecal=0; };
     std::vector<OverlayBatch> overlayBatches;
+
+    // terrain brush cursor ring
+    GLuint lineProg=0, ringVAO=0, ringVBO=0; GLint uLineMVP=-1, uLineColor=-1;
+    std::vector<float> brushRing;
 public:
     int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
     float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
