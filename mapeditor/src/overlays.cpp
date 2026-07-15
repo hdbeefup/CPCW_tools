@@ -117,7 +117,7 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
     float wmax = (float)(s.world_w > 0 ? s.world_w : 4096);
     float hmax = (float)(s.world_h > 0 ? s.world_h : 4096);
 
-    // ---- roads: GROA polyline -> textured ribbon --------------------------
+    // ---- roads: GROA centreline polyline -> textured ribbon ---------------
     if (grolOff) {
         for (const Rec& r : walkRecords(d, grolOff, grolSz, "GROA")) {
             size_t b = r.bodyOff, e = b + r.bodySize;
@@ -142,7 +142,6 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
             Scene::OverlayMesh om; om.tex = mat;
             float vrun = 0.0f;
             for (size_t i = 0; i < px.size(); i++) {
-                // tangent from neighbours
                 size_t a = i>0?i-1:i, c = i+1<px.size()?i+1:i;
                 float dx = px[c]-px[a], dz = pz[c]-pz[a];
                 float len = std::sqrt(dx*dx+dz*dz); if (len<1e-4f) len=1e-4f;

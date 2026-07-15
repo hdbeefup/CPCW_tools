@@ -235,7 +235,9 @@ public:
             GLModel* gm = loadModel(mp);
             if (!gm || gm->parts.empty() || gm->vao == 0) continue;
             V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
-            float yaw = e.dir * 3.14159265f / 180.0f;
+            // The X mirror (LH->RH handedness) reverses the yaw sense, so negate
+            // the entity yaw to match the in-game facing.
+            float yaw = -e.dir * 3.14159265f / 180.0f;
             M4 xf = mul(mul(translate(wp), rotY(yaw)), scaleM(-1.0f, 1.0f, 1.0f));
             instances.push_back({ gm, xf });
         }
