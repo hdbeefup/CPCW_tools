@@ -134,7 +134,8 @@ public:
             "#version 330 core\n"
             "in vec3 vN; in vec2 vUV; out vec4 F;\n"
             "uniform vec3 uLight, uColor; uniform sampler2D uTex; uniform int uHasTex;\n"
-            "void main(){ float d=max(dot(normalize(vN),normalize(uLight)),0.0)*0.7+0.35;\n"
+            "void main(){ vec3 n=normalize(vN); if(!gl_FrontFacing) n=-n;\n"   // two-sided
+            " float d=max(dot(n,normalize(uLight)),0.0)*0.7+0.35;\n"
             " vec3 base = uHasTex==1 ? texture(uTex, vec2(vUV.x, 1.0-vUV.y)).rgb : uColor;\n"
             " F=vec4(base*d,1.0); }\n");
         uMdlMVP=glGetUniformLocation(modelProg,"uMVP");
@@ -581,9 +582,6 @@ public:
         glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
         if (showModels && !instances.empty()) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
-            // cull back faces so you never see through into the model interior
-            // (winding is corrected in loadModel: negate-Z + reversed order = CW front)
-            if (!wireframe) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); glFrontFace(GL_CW); }
             glUseProgram(modelProg);
             float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uMdlLight,1,light);
             float col[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,col);
@@ -599,7 +597,6 @@ public:
                                    (void*)(size_t)(part.off * sizeof(unsigned)));
                 }
             }
-            glDisable(GL_CULL_FACE);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
         if (terrainCount) {
