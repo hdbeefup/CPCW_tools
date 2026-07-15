@@ -39,15 +39,30 @@ Content starts immediately after the 8-byte header and spans `Size` bytes.
 
 Root container. Content = all other chunks concatenated.
 
-## THMB Chunk — Thumbnail
+## THMB Chunk — Thumbnail (decoded)
+
+The preview image the game's authoring tool bakes into every `.srm` (shown in the
+map editor's prototype browser). **RLE over 3-byte BGR pixels**, decoded 2087/2087.
 
 ```
-Version:  4 bytes "v001"
-Width:    u32 LE (typically 64)
-Height:   u32 LE (typically 64)
-Unknown:  u32 LE
-Data:     remaining bytes (encoded thumbnail image, appears to be raw BGRA or compressed)
+Version:   4 bytes "v001"
+Width:     u32 LE (always 64)
+Height:    u32 LE (always 64)
+Unknown:   u32 LE (0x1801 on every shipped file)
+Flag:      1 byte  (0x01)
+EncLen:    u32 LE  (length of the RLE stream that follows)
+Stream:    EncLen bytes — RLE of 3-byte BGR pixels, row-major top-to-bottom
 ```
+
+RLE control byte `C`:
+- **high bit set** (`C & 0x80`): a *run* — `(C & 0x7F) + 1` copies of the next one
+  BGR pixel (so `0xBF` = a run of 64 = one full row).
+- **high bit clear**: *literals* — `C + 1` BGR pixels follow verbatim.
+
+Pixels are stored **B, G, R**; background is white (`FF FF FF`). Decoder:
+`cpcw_srm.py read_thumbnail()` / CLI `cpcw_srm.py thumb <file> [-o out.png]`;
+native `mapeditor/src/thumb.cpp load_thmb()` (returns RGBA), verified
+byte-identical to the Python reference.
 
 ## PMOD Chunk — Model Data
 

@@ -22,6 +22,11 @@
 #include "protodb.h"
 #include "pak.h"
 #include "vfs.h"
+#include "thumb.h"
+#include <map>
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F   // GL 1.2; absent from the ancient Windows gl.h
+#endif
 #include <nlohmann/json.hpp>
 #include <iterator>
 #include <algorithm>
@@ -262,6 +267,8 @@ static bool parseScene(const std::string& txt, const std::string& baseDir, Scene
     }
 }
 
+static void resetThumbCache();   // defined below; clears the prototype-thumb GL cache
+
 static bool loadScene(const std::string& path) {
     Scene s;
     if (endsWithI(path, ".json")) {
@@ -281,6 +288,7 @@ static bool loadScene(const std::string& path) {
     g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
     g_dataRoot = g_srcMap.empty() ? std::string() : findDataRoot(g_srcMap);
     g_edited.clear(); g_saveStatus[0] = '\0';
+    resetThumbCache();
     snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
     // frame the camera on the loaded terrain
     float W = g_scene.world_w > 0 ? (float)g_scene.world_w : 512.0f;
@@ -388,6 +396,48 @@ static void placeDuplicate(long srcId) {
     if (add_entity_native(g_scene, srcId, p, newId, work)) loadScene(work);
 }
 
+// --- prototype thumbnails (THMB chunk of each model .srm) ------------------
+static std::map<std::string, std::string> g_protoIndex;   // guid -> model .srm
+static bool  g_protoIndexBuilt = false;
+static std::map<std::string, unsigned> g_thumbCache;      // guid -> GL tex (0=none)
+
+// Lazily decode & upload the THMB thumbnail for a prototype GUID. Returns a GL
+// texture id, or 0 if the model has no thumbnail / can't be resolved. Each guid
+// is attempted once (0 is cached too) so the browser stays cheap.
+static unsigned thumbForProto(const std::string& protoGuid) {
+    std::string g; for (char c : protoGuid) g += (char)tolower((unsigned char)c);
+    auto ci = g_thumbCache.find(g);
+    if (ci != g_thumbCache.end()) return ci->second;
+    if (!g_protoIndexBuilt) {
+        g_protoIndex = protodb_model_index(vfs_resolve("ProtoDB.bin", g_dataRoot));
+        g_protoIndexBuilt = true;
+    }
+    unsigned tex = 0;
+    auto it = g_protoIndex.find(g);
+    if (it != g_protoIndex.end()) {
+        std::string mp = vfs_resolve(it->second, g_dataRoot);
+        int w, h; std::vector<unsigned char> rgba;
+        if (!mp.empty() && load_thmb(mp, w, h, rgba)) {
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, rgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+    }
+    g_thumbCache[g] = tex;
+    return tex;
+}
+// Drop cached thumbnails/index when the map (and thus data root) changes.
+static void resetThumbCache() {
+    for (auto& kv : g_thumbCache) if (kv.second) { unsigned t = kv.second; glDeleteTextures(1, &t); }
+    g_thumbCache.clear(); g_protoIndex.clear(); g_protoIndexBuilt = false;
+}
+
 static ImU32 playerColor(int p) {
     static const ImU32 c[] = {
         IM_COL32(200,200,200,255), IM_COL32(220,70,70,255), IM_COL32(70,120,220,255),
@@ -472,10 +522,10 @@ static void drawModePanel() {
             ImGui::SliderFloat("Height", &g_brushHeight, -50.0f, 50.0f);
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
         } else {
-            // Prototype browser: distinct prototypes present on the map. Select
-            // one, then place a copy of it at the view center.
-            ImGui::TextWrapped("Prototypes on this map — select, then Place:");
-            ImGui::BeginChild("protos", ImVec2(0, 220), ImGuiChildFlags_None);
+            // Prototype browser: distinct prototypes present on the map, shown
+            // as a thumbnail grid (each model's baked THMB preview). Click one,
+            // then place a copy of it at the view center.
+            ImGui::TextWrapped("Prototypes on this map — click a thumbnail, then Place:");
             std::map<std::string, std::pair<long,int>> protos;  // proto -> (srcId, count)
             for (const Entity& e : g_scene.entities) {
                 if (e.proto.empty()) continue;
@@ -483,13 +533,38 @@ static void drawModePanel() {
                 if (pr.second == 0) pr.first = e.id;
                 pr.second++;
             }
+            ImGui::BeginChild("protos", ImVec2(0, 300), ImGuiChildFlags_None);
+            const float img = 56.0f, cell = img + 18.0f;
+            float availw = ImGui::GetContentRegionAvail().x;
+            int perRow = (int)(availw / cell); if (perRow < 1) perRow = 1;
+            int col = 0;
             for (auto& kv : protos) {
+                const std::string& proto = kv.first;
+                long srcId = kv.second.first;
                 const Entity* se = nullptr;
-                for (const Entity& e : g_scene.entities) if (e.id == kv.second.first) { se = &e; break; }
-                char lbl[200];
-                snprintf(lbl, sizeof(lbl), "%s  x%d##%s",
-                         se ? se->type.c_str() : "?", kv.second.second, kv.first.c_str());
-                if (ImGui::Selectable(lbl, g_placeSrcId == kv.second.first)) g_placeSrcId = kv.second.first;
+                for (const Entity& e : g_scene.entities) if (e.id == srcId) { se = &e; break; }
+                unsigned tex = thumbForProto(proto);
+                bool sel = (g_placeSrcId == srcId);
+                ImGui::PushID(proto.c_str());
+                ImGui::BeginGroup();
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
+                             ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                bool clicked;
+                if (tex)
+                    clicked = ImGui::ImageButton("t", (ImTextureID)tex, ImVec2(img, img));
+                else
+                    clicked = ImGui::Button("?##noimg", ImVec2(img + 8, img + 8));
+                if (sel) ImGui::PopStyleColor();
+                if (clicked) g_placeSrcId = srcId;
+                char cap[32];
+                snprintf(cap, sizeof(cap), "%.6s x%d", se ? se->type.c_str() : "?", kv.second.second);
+                ImGui::TextUnformatted(cap);
+                ImGui::EndGroup();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s\n%s  (x%d)",
+                                      se ? se->type.c_str() : "?", proto.c_str(), kv.second.second);
+                ImGui::PopID();
+                if (++col % perRow != 0) ImGui::SameLine();
             }
             ImGui::EndChild();
             if (ImGui::Button("Place copy at view center") && g_placeSrcId >= 0)
@@ -735,6 +810,20 @@ int main(int argc, char** argv) {
             auto idx = protodb_model_index(argv[i+1]);
             printf("protodb models=%zu\n", idx.size());
             int shown=0; for (auto& kv : idx) { if(shown++>=3) break; printf("  %s -> %s\n", kv.first.c_str(), kv.second.c_str()); }
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--thumbtest") && i + 1 < argc) {
+            // dev: --thumbtest <model.srm> [out.ppm]  (decode THMB, print + dump)
+            int w, h; std::vector<unsigned char> rgba;
+            if (!load_thmb(argv[i+1], w, h, rgba)) { printf("thumb: no/invalid THMB\n"); return 2; }
+            unsigned long sum = 0; for (unsigned char c : rgba) sum += c;
+            printf("thumb %dx%d bytes=%zu checksum=%lu\n", w, h, rgba.size(), sum);
+            if (i + 2 < argc) {
+                std::ofstream o(argv[i+2], std::ios::binary);
+                o << "P6\n" << w << " " << h << "\n255\n";
+                for (int k = 0; k < w*h; k++) o.write((const char*)&rgba[k*4], 3);
+                printf("wrote %s\n", argv[i+2]);
+            }
             return 0;
         }
         else if (!strcmp(argv[i], "--addtest") && i + 4 < argc) {

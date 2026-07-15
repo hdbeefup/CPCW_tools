@@ -119,9 +119,13 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       auto-mounts main1/main2/enUS.pak next to it and reads maps/models/textures/
       ProtoDB straight from them (single-exe in the game folder). File > "Open from
       .pak" browses maps. Verified: a full scene renders from the Steam paks alone.
-- [ ] **Remaining**: model **thumbnails** for the prototype browser (THMB codec
-      undecoded; render-based previews deferred); placing prototypes not already on
-      the map (needs OBJT construction); confirm the model handedness axis vs the game.
+- [x] **M8 — model thumbnails**: the **THMB codec is decoded** (RLE over 3-byte BGR
+      pixels; `docs/FORMAT_SRM.md`). `cpcw_srm.py read_thumbnail()` / `thumb` CLI and
+      native `mapeditor/src/thumb.cpp load_thmb()` (verified byte-identical, 2087/2087).
+      The prototype browser now shows each model's baked preview as a thumbnail grid
+      (lazy-decoded + GL-cached).
+- [ ] **Remaining**: placing prototypes not already on the map (needs OBJT
+      construction from the schema); confirm the model handedness axis vs the game.
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).

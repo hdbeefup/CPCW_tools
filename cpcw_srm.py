@@ -139,6 +139,69 @@ def parse_srm(filepath):
     return nodes
 
 
+def read_thumbnail(filepath):
+    """Decode the THMB preview image embedded in an .srm.
+
+    Returns (width, height, rgb) where ``rgb`` is ``bytes`` of length
+    ``width*height*3`` in top-to-bottom, left-to-right RGB order, or ``None`` if
+    the file has no usable thumbnail. Background pixels are white.
+
+    THMB layout (after the 8-byte "THMB" + size header):
+        "v001", u32 width, u32 height, u32 unk,
+        then 1 flag byte (0x01) + u32 encoded-length + an RLE stream of
+        3-byte **BGR** pixels. Control byte C: high bit set -> a run of
+        (C & 0x7F)+1 copies of the next one pixel; clear -> (C+1) literal pixels.
+    """
+    data = open(os.path.normpath(filepath), 'rb').read()
+    if data[:4] != b'MAIN' or data[8:12] != b'THMB':
+        return None
+    size = struct.unpack_from('<I', data, 12)[0]
+    body = data[16:16 + size]
+    if body[:4] != b'v001' or len(body) < 21:
+        return None
+    w, h, _unk = struct.unpack_from('<III', body, 4)
+    enc_len = struct.unpack_from('<I', body, 17)[0]   # after v001+w+h+unk+flag
+    s = body[21:21 + enc_len]
+    out = bytearray()
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]; i += 1
+        if c & 0x80:
+            cnt = (c & 0x7F) + 1
+            b, g, r = s[i], s[i + 1], s[i + 2]; i += 3
+            out += bytes([r, g, b]) * cnt
+        else:
+            cnt = c + 1
+            for _ in range(cnt):
+                b, g, r = s[i], s[i + 1], s[i + 2]; i += 3
+                out += bytes([r, g, b])
+    if len(out) != w * h * 3:
+        return None
+    return w, h, bytes(out)
+
+
+def cmd_thumb(filepath, output=None):
+    """Export the .srm's THMB thumbnail as a PNG (needs Pillow)."""
+    res = read_thumbnail(filepath)
+    if not res:
+        print('No thumbnail in', filepath)
+        return
+    w, h, rgb = res
+    out = output or os.path.splitext(filepath)[0] + '_thumb.png'
+    try:
+        from PIL import Image
+        Image.frombytes('RGB', (w, h), rgb).save(out)
+        print('Wrote', out, f'({w}x{h})')
+    except ImportError:
+        # Fall back to a headerful PPM if Pillow is unavailable.
+        out = os.path.splitext(out)[0] + '.ppm'
+        with open(out, 'wb') as f:
+            f.write(('P6\n%d %d\n255\n' % (w, h)).encode())
+            f.write(rgb)
+        print('Wrote', out, f'({w}x{h}) [Pillow not found -> PPM]')
+
+
 def _parse_pmod(data, start, end):
     """Parse a PMOD chunk.
 
@@ -911,6 +974,10 @@ def main():
     p_rt.add_argument('--batch', action='store_true',
                       help='Verify every .srm under a directory re-writes identically')
 
+    p_th = sub.add_parser('thumb', help='Export the embedded THMB thumbnail as PNG')
+    p_th.add_argument('file')
+    p_th.add_argument('-o', '--output', help='Output PNG (default: <name>_thumb.png)')
+
     args = parser.parse_args()
     if args.command == 'info':
         cmd_info(args.file)
@@ -921,6 +988,8 @@ def main():
                     skin_mode=mode)
     elif args.command == 'roundtrip':
         cmd_roundtrip(args.file, args.output, getattr(args, 'batch', False))
+    elif args.command == 'thumb':
+        cmd_thumb(args.file, args.output)
 
 
 if __name__ == '__main__':
