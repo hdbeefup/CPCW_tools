@@ -49,9 +49,28 @@ void parseMesh(const uint8_t* d, size_t start, size_t end, SrmMesh& mesh) {
         st.usage = (int)usage; st.semantic = (int)semantic;
         st.stride = (int)stride; st.vertexCount = (int)vertCount;
         size_t need = (size_t)vertCount * stride;
+        // Foliage cards prepend a vertex-declaration block (32 B) before the vertex
+        // array (VERS payload > vertCount*stride). Skip it so POSITION isn't read
+        // 32 B early (was producing NaN/inf verts -> invisible trees). No-op for the
+        // normal streams where payload == vertCount*stride exactly.
+        size_t avail = (vsEnd > vp) ? (vsEnd - vp) : 0;
+        if (avail > need) vp += (avail - need);
         if (vp + need <= end) st.data.assign(d + vp, d + vp + need);
         mesh.streams.push_back(std::move(st));
         p = vsEnd;
+    }
+    // A foliage mesh packs POS+COLOR+UV+NORMAL into one stride-44 POSITION stream
+    // with no separate TEXCOORD stream. Synthesize a TEXCOORD view (uv interleaved
+    // at +16) so byUsage(TEXCOORD) resolves and the leaves get textured (normals are
+    // a constant packed value -> left at the default, foliage lighting is ~flat).
+    if (!mesh.byUsage(USAGE_TEXCOORD)) {
+        const SrmStream* pos = mesh.byUsage(USAGE_POSITION);
+        if (pos && pos->stride == 44 && pos->vertexCount > 0) {
+            SrmStream uvs;
+            uvs.usage = USAGE_TEXCOORD; uvs.stride = 44; uvs.offset = 16;
+            uvs.vertexCount = pos->vertexCount; uvs.data = pos->data;
+            mesh.streams.push_back(std::move(uvs));
+        }
     }
 
     // Single submesh + material/texture block (mirrors srm_format.py).
@@ -338,25 +357,32 @@ std::vector<Mat4> srm_animated_world(const SrmModel& m, int motionIdx, float tim
 }
 
 static Vec3 readPos(const SrmStream& s, int i) {
-    const uint8_t* d = s.data.data() + (size_t)i * s.stride;
+    const uint8_t* d = s.data.data() + (size_t)i * s.stride + s.offset;
     return Vec3(f32(d,0), f32(d,4), f32(d,8));
 }
 static Vec3 readNormal(const SrmStream& s, int i) {
-    const uint8_t* d = s.data.data() + (size_t)i * s.stride;
+    const uint8_t* d = s.data.data() + (size_t)i * s.stride + s.offset;
     if (s.stride == 4)
         return Vec3(d[0]/127.5f - 1.0f, d[1]/127.5f - 1.0f, d[2]/127.5f - 1.0f);
     return Vec3(f32(d,0), f32(d,4), f32(d,8));
 }
 static void readUV(const SrmStream& s, int i, float& u, float& v) {
-    const uint8_t* d = s.data.data() + (size_t)i * s.stride;
+    const uint8_t* d = s.data.data() + (size_t)i * s.stride + s.offset;
     u = f32(d, 0); v = f32(d, 4);
 }
 
-static std::string pickDiffuse(const SrmMesh& mesh) {
+// Picks the diffuse texture basename. `alphaCut` (out) = true when the chosen key's
+// ALPHA channel is a transparency mask (DiffuseTexture/Diffuse — foliage/fence cutouts;
+// opaque models simply have alpha=255). It is FALSE for DiffuseSpec*, whose alpha is a
+// specular map — alpha-testing those would punch holes in solid models.
+static std::string pickDiffuse(const SrmMesh& mesh, bool* alphaCut = nullptr) {
+    if (alphaCut) *alphaCut = false;
     if (mesh.submeshes.empty()) return "";
     const auto& tex = mesh.submeshes[0].textures;
-    const char* keys[] = { "DiffuseTexture", "DiffuseSpecTexture", "DiffuseSpec", "Diffuse" };
-    for (const char* k : keys) { auto it = tex.find(k); if (it != tex.end()) return it->second; }
+    const char* cutKeys[] = { "DiffuseTexture", "Diffuse" };
+    for (const char* k : cutKeys) { auto it = tex.find(k); if (it != tex.end()) { if (alphaCut) *alphaCut = true; return it->second; } }
+    const char* specKeys[] = { "DiffuseSpecTexture", "DiffuseSpec" };
+    for (const char* k : specKeys) { auto it = tex.find(k); if (it != tex.end()) return it->second; }
     // fall back to any texture that isn't clearly a normal/aux map
     for (const auto& kv : tex) {
         std::string kl = kv.first;
@@ -378,6 +404,15 @@ static bool variantKeep(int tag, Variant v) {
     if (v == VAR_ALL) return true;
     if (v == VAR_STANDARD) return tag == 0 || tag == 1;
     return tag == 0 || tag == 2;   // VAR_UPGRADED
+}
+
+// A node named "shadow" owns a hull-shaped shadow-caster the engine draws in a
+// separate darkened/projected pass. Merged tanks skin a whole mesh's verts to it;
+// drawn as normal geometry it punches through the hull, so we drop those tris.
+static bool isShadowNode(const std::string& name) {
+    std::string n; n.reserve(name.size());
+    for (char c : name) n += (char)tolower((unsigned char)c);
+    return n == "shadow";
 }
 
 // Palette compaction: a BONE-palette value V does NOT index nodes directly; it
@@ -440,9 +475,12 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
 
         RenderMesh rm;
         rm.nodeIndex = (int)ni;
-        rm.diffuseTex = pickDiffuse(mesh);
+        bool alphaCut = false;
+        rm.diffuseTex = pickDiffuse(mesh, &alphaCut);
+        rm.alphaTest = alphaCut;
         rm.verts.resize(vcount);
-        std::vector<int> vtag(vcount, 0);   // per-vertex variant tag (bone node suffix)
+        std::vector<int> vtag(vcount, 0);    // per-vertex variant tag (bone node suffix)
+        std::vector<char> sflag(vcount, 0);  // per-vertex: skinned to a 'shadow' node
 
         for (int vi = 0; vi < vcount; vi++) {
             Vec3 p = readPos(*pos, vi);
@@ -482,8 +520,10 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
                 wn = rot[ni].dir(nrmv);
             }
 
-            if (boneNode >= 0 && boneNode < (int)m.nodes.size())
-                vtag[vi] = variantTag(m.nodes[boneNode].name);
+            if (boneNode >= 0 && boneNode < (int)m.nodes.size()) {
+                vtag[vi]  = variantTag(m.nodes[boneNode].name);
+                sflag[vi] = isShadowNode(m.nodes[boneNode].name) ? 1 : 0;
+            }
 
             RVertex& rv = rm.verts[vi];
             rv.x = wp.x; rv.y = wp.y; rv.z = wp.z;
@@ -492,20 +532,17 @@ void srm_build_render_w(const SrmModel& m, SkinMode mode, Variant variant,
             if (uv) readUV(*uv, vi, rv.u, rv.v); else { rv.u = 0; rv.v = 0; }
         }
 
-        // Variant face filter (drop tris whose verts belong to an excluded loadout).
-        if (variant == VAR_ALL) {
-            rm.indices = mesh.indices;
-        } else {
-            const auto& src = mesh.indices;
-            rm.indices.reserve(src.size());
-            for (size_t i = 0; i + 2 < src.size(); i += 3) {
-                uint32_t a = src[i], b = src[i+1], c = src[i+2];
-                if (a < (uint32_t)vcount && b < (uint32_t)vcount && c < (uint32_t)vcount &&
-                    variantKeep(vtag[a], variant) && variantKeep(vtag[b], variant) &&
-                    variantKeep(vtag[c], variant)) {
-                    rm.indices.push_back(a); rm.indices.push_back(b); rm.indices.push_back(c);
-                }
-            }
+        // Face filter: drop shadow-caster tris (engine draws 'shadow' separately) and,
+        // for a non-ALL variant, tris whose verts belong to an excluded loadout.
+        const auto& src = mesh.indices;
+        rm.indices.reserve(src.size());
+        for (size_t i = 0; i + 2 < src.size(); i += 3) {
+            uint32_t a = src[i], b = src[i+1], c = src[i+2];
+            if (a >= (uint32_t)vcount || b >= (uint32_t)vcount || c >= (uint32_t)vcount) continue;
+            if (sflag[a] || sflag[b] || sflag[c]) continue;                 // shadow caster
+            if (variant != VAR_ALL && !(variantKeep(vtag[a], variant) &&
+                variantKeep(vtag[b], variant) && variantKeep(vtag[c], variant))) continue;
+            rm.indices.push_back(a); rm.indices.push_back(b); rm.indices.push_back(c);
         }
         if (rm.indices.size() >= 3) out.push_back(std::move(rm));
     }

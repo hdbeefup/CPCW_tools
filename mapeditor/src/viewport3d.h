@@ -60,7 +60,7 @@ struct Camera {
                            std::cos(pitch)*std::cos(yaw)} * dist;
     }
     M4 viewProj(float aspect) const {
-        return mul(perspective(0.9f, aspect, 1.0f, 8000.0f),
+        return mul(perspective(0.9f, aspect, 0.5f, 8000.0f),
                    lookAt(eye(), target, {0,1,0}));
     }
 };
@@ -82,9 +82,19 @@ static inline GLuint glProgram(const char* vs, const char* fs) {
                fprintf(stderr, "link: %s\n", log); }
     glDeleteShader(v); glDeleteShader(f); return p;
 }
+static inline GLuint glProgram(const char* vs, const char* gs, const char* fs) {
+    GLuint v=glCompile(GL_VERTEX_SHADER,vs), g=glCompile(GL_GEOMETRY_SHADER,gs),
+           f=glCompile(GL_FRAGMENT_SHADER,fs);
+    GLuint p=glCreateProgram(); glAttachShader(p,v); glAttachShader(p,g); glAttachShader(p,f);
+    glLinkProgram(p);
+    GLint ok=0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetProgramInfoLog(p,1024,nullptr,log);
+               fprintf(stderr, "link: %s\n", log); }
+    glDeleteShader(v); glDeleteShader(g); glDeleteShader(f); return p;
+}
 
 class Viewport3D {
-    struct Part { int off=0, count=0; GLuint tex=0; };   // index range + diffuse tex
+    struct Part { int off=0, count=0; GLuint tex=0; bool alphaTest=false; };   // index range + diffuse tex
     struct GLModel { GLuint vao=0, vbo=0, ebo=0; std::vector<Part> parts;
                      V3 bmin{1e9f,1e9f,1e9f}, bmax{-1e9f,-1e9f,-1e9f}; };  // local AABB
     struct ModelInst { GLModel* model; M4 xf; int entIdx=-1; };
@@ -134,16 +144,25 @@ public:
             "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aN; vUV=aUV; }\n",
             "#version 330 core\n"
             "in vec3 vN; in vec2 vUV; out vec4 F;\n"
-            "uniform vec3 uLight, uColor; uniform sampler2D uTex; uniform int uHasTex;\n"
-            "void main(){ vec3 n=normalize(vN); if(!gl_FrontFacing) n=-n;\n"   // two-sided
-            " float d=max(dot(n,normalize(uLight)),0.0)*0.7+0.35;\n"
-            " vec3 base = uHasTex==1 ? texture(uTex, vec2(vUV.x, 1.0-vUV.y)).rgb : uColor;\n"
-            " F=vec4(base*d,1.0); }\n");
+            "uniform vec3 uLight, uColor; uniform sampler2D uTex; uniform int uHasTex, uAlphaTest;\n"
+            "void main(){\n"
+            " vec4 tx = uHasTex==1 ? texture(uTex, vec2(vUV.x, 1.0-vUV.y)) : vec4(uColor,1.0);\n"
+            " if (uAlphaTest==1 && tx.a < 0.5) discard;\n"                    // foliage/fence cutout
+            " vec3 n=normalize(vN); if(!gl_FrontFacing) n=-n;\n"             // two-sided
+            " vec3 kdir=normalize(uLight);\n"                                // key
+            " vec3 fdir=normalize(vec3(-0.5, 0.35, -0.6));\n"               // fill (opposite-ish)
+            " float key=max(dot(n,kdir),0.0);\n"
+            " float fill=max(dot(n,fdir),0.0);\n"
+            " float amb=mix(0.32, 0.52, n.y*0.5+0.5);\n"                    // hemispheric ambient
+            " float lit=amb + 0.60*key + 0.16*fill;\n"
+            " vec3 c=pow(tx.rgb*lit, vec3(1.0/2.2));\n"                      // gamma (fixes muddy)
+            " F=vec4(c,1.0); }\n");
         uMdlMVP=glGetUniformLocation(modelProg,"uMVP");
         uMdlModel=glGetUniformLocation(modelProg,"uModel");
         uMdlLight=glGetUniformLocation(modelProg,"uLight");
         uMdlColor=glGetUniformLocation(modelProg,"uColor");
         uMdlHasTex=glGetUniformLocation(modelProg,"uHasTex");
+        uMdlAlphaTest=glGetUniformLocation(modelProg,"uAlphaTest");
         glUseProgram(modelProg); glUniform1i(glGetUniformLocation(modelProg,"uTex"),0);
 
         // Splat-textured terrain: blend up to MAXL real layer .dds by per-vertex
@@ -211,6 +230,33 @@ public:
             "void main(){ F=vec4(uColor,1.0); }\n");
         uLineMVP=glGetUniformLocation(lineProg,"uMVP");
         uLineColor=glGetUniformLocation(lineProg,"uColor");
+        // Thick lines: a geometry shader expands each GL_LINES segment into a
+        // screen-space quad of uThick pixels — GL 3.3 core clamps glLineWidth to 1.
+        thickProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; uniform mat4 uMVP;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); }\n",
+            "#version 330 core\n"
+            "layout(lines) in; layout(triangle_strip, max_vertices=4) out;\n"
+            "uniform vec2 uViewport; uniform float uThick;\n"
+            "void main(){\n"
+            " vec4 p0=gl_in[0].gl_Position, p1=gl_in[1].gl_Position;\n"
+            " if(p0.w<=0.0||p1.w<=0.0) return;\n"          // skip segments behind camera
+            " vec2 n0=p0.xy/p0.w, n1=p1.xy/p1.w;\n"
+            " vec2 d=(n1-n0)*uViewport; if(dot(d,d)<1e-12) return; d=normalize(d);\n"
+            " vec2 nm=vec2(-d.y,d.x); vec2 off=(nm/uViewport)*uThick;\n"
+            " gl_Position=vec4((n0+off)*p0.w,p0.z,p0.w); EmitVertex();\n"
+            " gl_Position=vec4((n0-off)*p0.w,p0.z,p0.w); EmitVertex();\n"
+            " gl_Position=vec4((n1+off)*p1.w,p1.z,p1.w); EmitVertex();\n"
+            " gl_Position=vec4((n1-off)*p1.w,p1.z,p1.w); EmitVertex();\n"
+            " EndPrimitive(); }\n",
+            "#version 330 core\n"
+            "out vec4 F; uniform vec3 uColor;\n"
+            "void main(){ F=vec4(uColor,1.0); }\n");
+        uThMVP=glGetUniformLocation(thickProg,"uMVP");
+        uThColor=glGetUniformLocation(thickProg,"uColor");
+        uThViewport=glGetUniformLocation(thickProg,"uViewport");
+        uThThick=glGetUniformLocation(thickProg,"uThick");
     }
 
     // Set the terrain brush cursor ring (world-space line-loop vertices, xyz*).
@@ -343,24 +389,28 @@ public:
             std::vector<float> verts; std::vector<unsigned> idx; unsigned base = 0;
             for (auto& rm : rms) {                      // one Part per RenderMesh (its diffuse tex)
                 Part part; part.off = (int)idx.size();
-                // DirectX(LH) -> OpenGL(RH): negate Z + reverse winding. This is a
-                // depth flip (NOT a left-right mirror), so text/logos stay readable
-                // and faces wind outward (no "inside-out" models).
+                // .srm is DirectX LH; render in OpenGL RH. Negating a SINGLE axis is a
+                // reflection -> mirrors chiral detail (fuselage text read backwards).
+                // Negate BOTH X and Z = a 180-deg Y rotation (det +1, NO mirror), so
+                // text reads correctly (user-confirmed). Two data reflections preserve
+                // winding orientation, so keep normal index order; exterior stays CCW
+                // (Back-cull = solid). Model yaw keeps its +180 offset to match facing.
                 for (auto& v : rm.verts) {
-                    verts.push_back(v.x); verts.push_back(v.y); verts.push_back(-v.z);
-                    verts.push_back(v.nx); verts.push_back(v.ny); verts.push_back(-v.nz);
+                    verts.push_back(-v.x); verts.push_back(v.y); verts.push_back(-v.z);
+                    verts.push_back(-v.nx); verts.push_back(v.ny); verts.push_back(-v.nz);
                     verts.push_back(v.u); verts.push_back(v.v);
-                    gm.bmin.x=std::min(gm.bmin.x,v.x); gm.bmin.y=std::min(gm.bmin.y,v.y); gm.bmin.z=std::min(gm.bmin.z,-v.z);
-                    gm.bmax.x=std::max(gm.bmax.x,v.x); gm.bmax.y=std::max(gm.bmax.y,v.y); gm.bmax.z=std::max(gm.bmax.z,-v.z);
+                    gm.bmin.x=std::min(gm.bmin.x,-v.x); gm.bmin.y=std::min(gm.bmin.y,v.y); gm.bmin.z=std::min(gm.bmin.z,-v.z);
+                    gm.bmax.x=std::max(gm.bmax.x,-v.x); gm.bmax.y=std::max(gm.bmax.y,v.y); gm.bmax.z=std::max(gm.bmax.z,-v.z);
                 }
                 for (size_t t = 0; t + 2 < rm.indices.size(); t += 3) {
                     idx.push_back(base + rm.indices[t]);
-                    idx.push_back(base + rm.indices[t+2]);
                     idx.push_back(base + rm.indices[t+1]);
+                    idx.push_back(base + rm.indices[t+2]);
                 }
                 base += (unsigned)rm.verts.size();
                 part.count = (int)rm.indices.size();
                 part.tex = loadTexture(rm.diffuseTex);
+                part.alphaTest = rm.alphaTest;
                 gm.parts.push_back(part);
             }
             if (!idx.empty()) {
@@ -418,13 +468,20 @@ public:
                                ? pi->second : vfs_resolve(pi->second, "");
             DdsImage img = real.empty() ? DdsImage{} : dds_load(real);
             if (img.ok && img.width > 0) {
+                texDim[key] = { img.width, img.height };   // for road width-from-texture
                 glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0,
                              GL_RGBA, GL_UNSIGNED_BYTE, img.rgba.data());
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glGenerateMipmap(GL_TEXTURE_2D);   // trilinear -> no shimmer on distant/oblique surfaces
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                float maxAniso = 1.0f;             // clamp to hw max; no-op if unsupported
+                glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso);
+                if (maxAniso > 1.0f)
+                    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY,
+                                    maxAniso < 8.0f ? maxAniso : 8.0f);
                 glBindTexture(GL_TEXTURE_2D, 0);
             }
         }
@@ -465,24 +522,53 @@ public:
     // Resolve a GTRD layer path (e.g. "Terrain/Layer/M_01/Cobblestone_02_c_n") to a
     // GL texture: try the basename, then map-prefix-stripped, then a longest-prefix
     // scan over the .dds stem index. Returns 0 if nothing resolves.
-    GLuint resolveLayerTex(const std::string& logical) {
+    // Resolve a material path to the texIndex KEY (lowercased stem) that best matches,
+    // or "" if none. Skips normal/aux maps in the fuzzy fallback (they are blue and
+    // rendered decals purple when picked as the diffuse).
+    std::string resolveTexKey(const std::string& logical) {
         size_t sl = logical.find_last_of('/');
         std::string base = (sl==std::string::npos) ? logical : logical.substr(sl+1);
         std::string low; for (char c : base) low += (char)tolower((unsigned char)c);
-        GLuint t = loadTexture(low); if (t) return t;
+        if (texIndex.count(low)) return low;
         std::string np = stripMapPrefix(low);
-        if (np != low) { t = loadTexture(np); if (t) return t; }
-        // longest-prefix / suffix-tolerant scan (Cobblestone_02_c_n -> cobblestone_02)
+        if (np != low && texIndex.count(np)) return np;
+        auto isAuxMap = [](const std::string& k){
+            auto ends = [&](const std::string& s){
+                return k.size()>=s.size() && k.compare(k.size()-s.size(),s.size(),s)==0; };
+            return ends("_n") || ends("_nm") || ends("_bump") || ends("_spec") ||
+                   k.find("normal")!=std::string::npos || k.find("bump")!=std::string::npos;
+        };
         const std::string& q = np;
+        // A road surface's material (e.g. sw_wide_05) must resolve to the tiling STRIP
+        // texture, not a corner/junction decal piece that shares the prefix. Skip piece
+        // textures unless the query itself is one (decals name their own piece).
+        auto hasTok = [](const std::string& s, const char* t){ return s.find(t)!=std::string::npos; };
+        bool qPiece = hasTok(q,"corner")||hasTok(q,"cross")||hasTok(q,"junc")||hasTok(q,"end");
         std::string bestKey; size_t bestLen = 0;
         for (const auto& kv : texIndex) {
             const std::string& k = kv.first;
+            if (isAuxMap(k)) continue;
+            if (!qPiece && (hasTok(k,"corner")||hasTok(k,"cross")||hasTok(k,"junc"))) continue;
             size_t m = (q.size()<k.size()) ? q.size() : k.size();
             if (m < 4) continue;
-            if (q.compare(0,m,k,0,m)==0 && m > bestLen) { bestLen=m; bestKey=k; }
+            // longest prefix wins; ties -> the key closest in length to q (the base strip)
+            if (q.compare(0,m,k,0,m)==0 &&
+                (m > bestLen || (m == bestLen && !bestKey.empty() && k.size() < bestKey.size())))
+                { bestLen=m; bestKey=k; }
         }
-        if (!bestKey.empty()) return loadTexture(bestKey);
-        return 0;
+        return bestKey;
+    }
+    GLuint resolveLayerTex(const std::string& logical) {
+        std::string k = resolveTexKey(logical);
+        return k.empty() ? 0 : loadTexture(k);
+    }
+    // Pixel dims of the resolved texture (loads it if needed). false if unresolved.
+    bool resolveTexDims(const std::string& logical, int& w, int& h) {
+        std::string k = resolveTexKey(logical);
+        if (k.empty()) return false;
+        loadTexture(k);                       // ensures texDim[k] is populated
+        auto it = texDim.find(k); if (it == texDim.end()) return false;
+        w = it->second.first; h = it->second.second; return true;
     }
     // Build the per-map splat textures + active-layer arrays for terrainTexProg.
     void buildSplatTextures(const Scene& s, const std::string& dataRoot) {
@@ -536,7 +622,7 @@ public:
     // resolve are skipped.
     void buildOverlays(const Scene& s, const std::string& dataRoot) {
         clearOverlays();
-        if ((s.roads.empty() && s.decals.empty())) return;
+        if (s.roads.empty() && s.decals.empty() && s.roadSplines.empty()) return;
         if (dataRoot.empty() && !vfs_any_mounted()) return;
         buildTexIndex(dataRoot);
         // group vertices/indices by (GL texture, isDecal)
@@ -552,6 +638,60 @@ public:
             }
         };
         add(s.roads, 0); add(s.decals, 1);
+
+        // --- centreline roads: extrude with width from the road TEXTURE ----------
+        // Engine (FUN_004d7a10) derives width from the road tex's short (across) dim,
+        // tiling the long (along) dim down the spline (see [[cpcw-road-groa]]). Strip
+        // textures are 1024x128 (narrow) / 1024x256 (wide); width = shortDim * WPT.
+        const float WPT = 0.02f, BIAS = 0.25f;   // world units per texel; overlay lift
+        auto Hgt = [&](float x, float z)->float {
+            if (s.heights.empty() || s.grid_w<2 || s.grid_h<2) return 0.0f;
+            if (x<0)x=0; if (x>s.grid_w-1)x=(float)(s.grid_w-1);
+            if (z<0)z=0; if (z>s.grid_h-1)z=(float)(s.grid_h-1);
+            int x0=(int)x,z0=(int)z,x1=x0+1<s.grid_w?x0+1:x0,z1=z0+1<s.grid_h?z0+1:z0;
+            float tx=x-x0,tz=z-z0; auto gg=[&](int i,int j){return s.heights[(size_t)j*s.grid_w+i];};
+            float aa=gg(x0,z0)*(1-tx)+gg(x1,z0)*tx, bb=gg(x0,z1)*(1-tx)+gg(x1,z1)*tx;
+            return aa*(1-tz)+bb*tz;
+        };
+        auto nameHW = [](const std::string& mat)->float {   // fallback for square/unresolved
+            std::string m; for(char c:mat) m+=(char)tolower((unsigned char)c);
+            auto h=[&](const char*t){return m.find(t)!=std::string::npos;};
+            if (h("runway")) return 9.0f; if (h("dwide")) return 4.5f;
+            if (h("asfalt_wide")||h("asphalt_wide")) return 3.8f; if (h("wide")) return 3.0f;
+            if (h("road")||h("high")) return 2.8f; if (h("cobblestone")) return 2.0f;
+            if (h("sidewalk")) return 1.4f; if (h("narrow")) return 1.2f; return 1.8f;
+        };
+        for (const auto& rs : s.roadSplines) {
+            GLuint t = resolveLayerTex(rs.tex);
+            if (!t || rs.cx.size() < 2) continue;
+            int tw=0, th=0; float hw; float tileLen = 12.0f;
+            if (resolveTexDims(rs.tex, tw, th) && tw>0 && th>0) {
+                int shortd = tw<th?tw:th, longd = tw<th?th:tw;
+                if ((float)longd/(float)shortd >= 1.5f) {    // elongated strip -> tex width
+                    hw = shortd * WPT * 0.5f;
+                    tileLen = longd * WPT;
+                } else hw = nameHW(rs.tex);                  // ~square: width not encoded
+            } else hw = nameHW(rs.tex);
+            auto& g = groups[{t,0}];
+            unsigned base = (unsigned)(g.first.size()/5);
+            const auto& px = rs.cx; const auto& pz = rs.cz;
+            float vrun = 0.0f;
+            for (size_t i=0;i<px.size();i++){
+                size_t a=i>0?i-1:i, c=i+1<px.size()?i+1:i;
+                float dx=px[c]-px[a], dz=pz[c]-pz[a];
+                float len=std::sqrt(dx*dx+dz*dz); if(len<1e-4f)len=1e-4f;
+                float nx=-dz/len, nz=dx/len;
+                if(i>0){float sx=px[i]-px[i-1],sz=pz[i]-pz[i-1];vrun+=std::sqrt(sx*sx+sz*sz);}
+                float lx=px[i]-nx*hw,lz=pz[i]-nz*hw,rx=px[i]+nx*hw,rz=pz[i]+nz*hw;
+                float u=vrun/tileLen;                        // along road (tiles)
+                g.first.insert(g.first.end(), { lx, Hgt(lx,lz)+BIAS, lz, u, 0.0f });
+                g.first.insert(g.first.end(), { rx, Hgt(rx,rz)+BIAS, rz, u, 1.0f });
+            }
+            for (size_t i=0;i+1<px.size();i++){
+                unsigned aa=base+(unsigned)(i*2), b2=aa+1, cc=aa+2, dd=aa+3;
+                g.second.insert(g.second.end(), { aa,cc,b2, b2,cc,dd });
+            }
+        }
         for (auto& kv : groups) {
             OverlayBatch ob; ob.tex = kv.first.first; ob.isDecal = kv.first.second; ob.count = (int)kv.second.second.size();
             glGenVertexArrays(1,&ob.vao); glGenBuffers(1,&ob.vbo); glGenBuffers(1,&ob.ebo);
@@ -602,16 +742,8 @@ public:
         static const int E[24]={0,1,1,2,2,3,3,0, 4,5,5,6,6,7,7,4, 0,4,1,5,2,6,3,7};
         std::vector<float> ln; ln.reserve(24*3);
         for (int i=0;i<24;i++){ ln.push_back(w[E[i]].x); ln.push_back(w[E[i]].y); ln.push_back(w[E[i]].z); }
-        if (!ringVAO){ glGenVertexArrays(1,&ringVAO); glGenBuffers(1,&ringVBO); }
-        glBindVertexArray(ringVAO); glBindBuffer(GL_ARRAY_BUFFER,ringVBO);
-        glBufferData(GL_ARRAY_BUFFER, ln.size()*sizeof(float), ln.data(), GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
         glDisable(GL_DEPTH_TEST);
-        glLineWidth(2.5f);
-        glUseProgram(lineProg); glUniformMatrix4fv(uLineMVP,1,GL_FALSE,mvp.m);
-        float col[3]={r,g,b}; glUniform3fv(uLineColor,1,col);
-        glDrawArrays(GL_LINES,0,24);
-        glLineWidth(1.0f);
+        drawThickLines(mvp, ln, r, g, b, 2.5f);   // real thickness (glLineWidth is clamped)
         glEnable(GL_DEPTH_TEST);
     }
 
@@ -622,22 +754,35 @@ public:
         glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
         if (showModels && !instances.empty()) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+            // Optional backface cull on models only (terrain/overlays stay two-sided).
+            // Culls the single-sided text-decal backfaces that render text mirrored.
+            if (cullMode) { glEnable(GL_CULL_FACE); glCullFace(cullMode==1?GL_BACK:GL_FRONT); }
             glUseProgram(modelProg);
             float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uMdlLight,1,light);
             float col[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,col);
+            // flipModelX reflects each model in its LOCAL X. Combined with loadModel's
+            // negate-Z that is a 180-deg Y rotation (two reflections = no mirror), so
+            // it un-mirrors fuselage/decal text. Experiment toggle (key X) to confirm.
             for (auto& inst : instances) {
-                M4 mvpM = mul(mvp, inst.xf);
+                M4 xf = flipModelX ? mul(inst.xf, scaleM(-1,1,1)) : inst.xf;
+                M4 mvpM = mul(mvp, xf);
                 glUniformMatrix4fv(uMdlMVP,1,GL_FALSE,mvpM.m);
-                glUniformMatrix4fv(uMdlModel,1,GL_FALSE,inst.xf.m);
+                glUniformMatrix4fv(uMdlModel,1,GL_FALSE,xf.m);
                 glBindVertexArray(inst.model->vao);
                 for (auto& part : inst.model->parts) {
+                    // Alpha-tested foliage/fence cards are single-sided quads -> draw
+                    // them two-sided (cull off) so leaves show from both sides.
+                    if (cullMode) { if (part.alphaTest) glDisable(GL_CULL_FACE);
+                                    else { glEnable(GL_CULL_FACE); glCullFace(cullMode==1?GL_BACK:GL_FRONT); } }
                     glUniform1i(uMdlHasTex, part.tex ? 1 : 0);
+                    glUniform1i(uMdlAlphaTest, part.alphaTest ? 1 : 0);
                     if (part.tex) glBindTexture(GL_TEXTURE_2D, part.tex);
                     glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT,
                                    (void*)(size_t)(part.off * sizeof(unsigned)));
                 }
             }
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            if (cullMode) glDisable(GL_CULL_FACE);
             // hover (cyan) + selection (yellow) highlight boxes on model entities
             if (hovered >= 0 || selected >= 0)
                 for (auto& inst : instances) {
@@ -673,19 +818,25 @@ public:
             glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
-        // road/decal overlays: textured, alpha-blended, lifted above the terrain
+        // road/decal overlays: textured, alpha-blended, lifted above the terrain.
+        // Depth WRITES off so the many coplanar overlays don't z-fight each other;
+        // two passes (roads first, then decals) so markings paint on top of roads.
         if (!overlayBatches.empty() && !wireframe) {
             glUseProgram(overlayProg);
             glUniformMatrix4fv(uOvMVP,1,GL_FALSE,mvp.m);
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-2.0f,-2.0f);
+            glDepthMask(GL_FALSE);
             glActiveTexture(GL_TEXTURE0);
-            for (auto& b : overlayBatches) {
-                if (b.isDecal ? !showDecals : !showRoads) continue;
-                glBindTexture(GL_TEXTURE_2D, b.tex);
-                glBindVertexArray(b.vao);
-                glDrawElements(GL_TRIANGLES, b.count, GL_UNSIGNED_INT, 0);
-            }
+            for (int pass = 0; pass < 2; pass++)         // 0 = roads, 1 = decals
+                for (auto& b : overlayBatches) {
+                    if (b.isDecal != pass) continue;
+                    if (b.isDecal ? !showDecals : !showRoads) continue;
+                    glBindTexture(GL_TEXTURE_2D, b.tex);
+                    glBindVertexArray(b.vao);
+                    glDrawElements(GL_TRIANGLES, b.count, GL_UNSIGNED_INT, 0);
+                }
+            glDepthMask(GL_TRUE);
             glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_BLEND);
         }
         if (showDots && entCount) {
@@ -702,17 +853,16 @@ public:
         // terrain brush cursor ring — drawn last, depth-test off so it's always
         // visible as a cursor showing the exact area the brush will modify.
         if (brushRing.size() >= 9) {
-            if (!ringVAO) { glGenVertexArrays(1,&ringVAO); glGenBuffers(1,&ringVBO); }
-            glBindVertexArray(ringVAO);
-            glBindBuffer(GL_ARRAY_BUFFER, ringVBO);
-            glBufferData(GL_ARRAY_BUFFER, brushRing.size()*sizeof(float), brushRing.data(), GL_DYNAMIC_DRAW);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+            // expand the closed loop of points into GL_LINES segment pairs
+            size_t n = brushRing.size() / 3;
+            std::vector<float> segs; segs.reserve(n * 6);
+            for (size_t i = 0; i < n; i++) {
+                size_t j = (i + 1) % n;
+                segs.insert(segs.end(), { brushRing[i*3], brushRing[i*3+1], brushRing[i*3+2],
+                                          brushRing[j*3], brushRing[j*3+1], brushRing[j*3+2] });
+            }
             glDisable(GL_DEPTH_TEST);
-            glUseProgram(lineProg);
-            glUniformMatrix4fv(uLineMVP,1,GL_FALSE,mvp.m);
-            float col[3]={1.0f,0.85f,0.2f}; glUniform3fv(uLineColor,1,col);
-            glDrawArrays(GL_LINE_LOOP, 0, (int)(brushRing.size()/3));
+            drawThickLines(mvp, segs, 1.0f, 0.85f, 0.2f, 2.0f);
             glEnable(GL_DEPTH_TEST);
         }
         glBindVertexArray(0);
@@ -723,13 +873,57 @@ public:
     int entityCount() const { return entCount; }
     V3 debugEye(const Camera& c) const { return c.eye(); }
 
+    // Pick the model instance under screen point mp: the one nearest the camera
+    // whose projected AABB contains the point. Returns entIdx (-1 if none). Uses
+    // the whole model footprint so big models are clickable anywhere on their body,
+    // not just near their origin (which the dot-based pickEntity required).
+    int pickModel(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
+                  const Camera& cam) const {
+        float W = cmax.x-cmin.x, H = cmax.y-cmin.y;
+        if (W <= 1 || H <= 1) return -1;
+        M4 vp = cam.viewProj(W/H);
+        V3 eye = cam.eye();
+        int best = -1; float bestDepth = 1e30f;
+        for (const auto& inst : instances) {
+            V3 lo = inst.model->bmin, hi = inst.model->bmax;
+            if (lo.x > hi.x) continue;
+            const float* m = inst.xf.m;
+            float minx=1e30f,miny=1e30f,maxx=-1e30f,maxy=-1e30f; bool any=false;
+            V3 ctr{0,0,0};
+            for (int c=0;c<8;c++){
+                V3 p{ (c&1)?hi.x:lo.x, (c&2)?hi.y:lo.y, (c&4)?hi.z:lo.z };
+                V3 w{ m[0]*p.x+m[4]*p.y+m[8]*p.z+m[12],
+                      m[1]*p.x+m[5]*p.y+m[9]*p.z+m[13],
+                      m[2]*p.x+m[6]*p.y+m[10]*p.z+m[14] };
+                ctr = ctr + w;
+                float cx=vp.m[0]*w.x+vp.m[4]*w.y+vp.m[8]*w.z+vp.m[12];
+                float cy=vp.m[1]*w.x+vp.m[5]*w.y+vp.m[9]*w.z+vp.m[13];
+                float cw=vp.m[3]*w.x+vp.m[7]*w.y+vp.m[11]*w.z+vp.m[15];
+                if (cw <= 0.001f) continue;
+                float sx=cmin.x+(cx/cw*0.5f+0.5f)*W;
+                float sy=cmin.y+(1.0f-(cy/cw*0.5f+0.5f))*H;
+                minx=std::min(minx,sx); maxx=std::max(maxx,sx);
+                miny=std::min(miny,sy); maxy=std::max(maxy,sy); any=true;
+            }
+            if (!any) continue;
+            if (mp.x>=minx && mp.x<=maxx && mp.y>=miny && mp.y<=maxy) {
+                ctr = ctr * 0.125f;
+                float dx=ctr.x-eye.x, dy=ctr.y-eye.y, dz=ctr.z-eye.z;
+                float depth = dx*dx+dy*dy+dz*dz;
+                if (depth < bestDepth) { bestDepth = depth; best = inst.entIdx; }
+            }
+        }
+        return best;
+    }
+
 private:
     std::map<std::string, GLModel> modelCache;
     std::vector<ModelInst> instances;
     GLuint modelProg=0;
-    GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1, uMdlHasTex=-1;
+    GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1, uMdlHasTex=-1, uMdlAlphaTest=-1;
     bool modelsBuilt=false;
     std::map<std::string, GLuint> texCache;    // basename -> GL texture
+    std::map<std::string, std::pair<int,int>> texDim;  // basename -> (w,h) pixels
     std::map<std::string, std::string> texIndex; // basename -> .dds path
     std::string texRoot;
 
@@ -755,8 +949,33 @@ private:
     // terrain brush cursor ring
     GLuint lineProg=0, ringVAO=0, ringVBO=0; GLint uLineMVP=-1, uLineColor=-1;
     std::vector<float> brushRing;
+    // thick screen-space lines (geometry-shader quad expansion)
+    GLuint thickProg=0, thickVAO=0, thickVBO=0;
+    GLint  uThMVP=-1, uThColor=-1, uThViewport=-1, uThThick=-1;
+
+    // Draw a set of GL_LINES segments (segs = xyz pairs) as quads `thick` px wide.
+    void drawThickLines(const M4& mvp, const std::vector<float>& segs,
+                        float r, float g, float b, float thick) {
+        if (segs.size() < 6) return;
+        GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+        if (!thickVAO) { glGenVertexArrays(1,&thickVAO); glGenBuffers(1,&thickVBO); }
+        glBindVertexArray(thickVAO); glBindBuffer(GL_ARRAY_BUFFER, thickVBO);
+        glBufferData(GL_ARRAY_BUFFER, segs.size()*sizeof(float), segs.data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+        glUseProgram(thickProg);
+        glUniformMatrix4fv(uThMVP,1,GL_FALSE,mvp.m);
+        float col[3]={r,g,b}; glUniform3fv(uThColor,1,col);
+        glUniform2f(uThViewport, (float)vp[2], (float)vp[3]);
+        glUniform1f(uThThick, thick);
+        glDrawArrays(GL_LINES, 0, (int)(segs.size()/3));
+    }
 public:
     int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
     float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
     bool  showRoads=true, showDecals=true;
+    // Model backface cull: 0 Off, 1 Back, 2 Front. Exterior faces are CCW (verified
+    // live: Front-cull shows the interior), so Back-cull is correct/standard and
+    // hides the hull interior. Toggle: View>Model cull, or key C.
+    int   cullMode=1;
+    bool  flipModelX=false;       // reflect models in local X (mirror-text experiment, key X)
 };

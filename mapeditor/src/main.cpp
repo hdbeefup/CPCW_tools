@@ -411,16 +411,27 @@ static float terrainHeightAt(float x, float y) {
     return a * (1 - ty) + b * ty;
 }
 
-// Place a copy of entity srcId at the camera target, grounded on the terrain
+// Place a copy of entity srcId at world XZ (wx,wy), grounded on the terrain
 // (structural insert + reload; keeps the view and selects the new entity).
-static void placeDuplicate(long srcId) {
+static void placeDuplicateAt(long srcId, float wx, float wy) {
     if (srcId < 0 || g_srcMap.empty()) return;
     long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
-    float wx = g_cam.target.x, wy = g_cam.target.z;
     float p[3] = { wx, wy, terrainHeightAt(wx, wy) };   // ground on the heightmap
     const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
     std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
     if (add_entity_native(g_scene, srcId, p, newId, work)) loadScene(work, true, newId);
+}
+// Convenience: place at the current camera target (used by the panel button).
+static void placeDuplicate(long srcId) { placeDuplicateAt(srcId, g_cam.target.x, g_cam.target.z); }
+
+// True when the active mode's selected tool is the "Place" tool (Object/Unit/
+// Ambient modes) — i.e. a left-click on terrain should drop a prototype copy.
+static bool activeToolIsPlace() {
+    char buf[256]; snprintf(buf, sizeof(buf), "%s", kModes[g_mode].tools);
+    int idx = 0;
+    for (char* tok = strtok(buf, " "); tok; tok = strtok(nullptr, " "), idx++)
+        if (idx == g_activeTool) return strcmp(tok, "Place") == 0;
+    return false;
 }
 
 // --- prototype thumbnails (THMB chunk of each model .srm) ------------------
@@ -546,6 +557,14 @@ static void drawMenuBar() {
         }
         ImGui::MenuItem("Roads", nullptr, &g_vp.showRoads);
         ImGui::MenuItem("Decals", nullptr, &g_vp.showDecals);
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Model cull")) {   // hides hull interior (pick what looks right)
+            if (ImGui::MenuItem("Off (two-sided)", nullptr, g_vp.cullMode==0)) g_vp.cullMode=0;
+            if (ImGui::MenuItem("Backface",        nullptr, g_vp.cullMode==1)) g_vp.cullMode=1;
+            if (ImGui::MenuItem("Frontface",       nullptr, g_vp.cullMode==2)) g_vp.cullMode=2;
+            ImGui::EndMenu();
+        }
+        ImGui::MenuItem("Flip model X (debug)", "X", &g_vp.flipModelX);   // mirror now baked in
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Mode")) {
@@ -653,9 +672,10 @@ static void drawModePanel() {
                 ImGui::TreePop();
             }
             ImGui::EndChild();
-            if (ImGui::Button("Place copy at view center") && g_placeSrcId >= 0)
+            if (ImGui::Button("Place at view center") && g_placeSrcId >= 0)
                 placeDuplicate(g_placeSrcId);
-            ImGui::TextDisabled("(placed at view center, grounded; Ctrl+D dup, Delete remove)");
+            ImGui::TextDisabled("Or: with the Place tool, left-click on terrain to drop a copy.");
+            ImGui::TextDisabled("(grounded on the heightmap; Ctrl+D dup, Delete remove)");
         }
     }
     ImGui::End();
@@ -811,6 +831,14 @@ static int pickEntity(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax) 
     return bi;
 }
 
+// Pick under the cursor: prefer a real model footprint (easy to click big models),
+// fall back to the projected-origin dot pick for model-less entities (effects).
+static int pickAny(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax) {
+    int mi = g_vp.pickModel(mp, cmin, cmax, g_cam);
+    if (mi >= 0) return mi;
+    return pickEntity(mp, cmin, cmax);
+}
+
 // camera navigation over the central viewport region
 static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     ImGuiIO& io = ImGui::GetIO();
@@ -820,7 +848,7 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     // does NOT crawl when zoomed in (was purely distance-scaled before).
     if (!io.WantCaptureKeyboard && !io.KeyCtrl) {
         float dt = io.DeltaTime > 0.0f ? io.DeltaTime : 0.016f;
-        float sp = (g_cam.dist * 0.5f + 15.0f) * dt * (io.KeyShift ? 3.0f : 1.0f);
+        float sp = (g_cam.dist * 0.4f + 50.0f) * dt * (io.KeyShift ? 3.0f : 1.0f);
         V3 fwd = norm(g_cam.target - g_cam.eye()); fwd.y = 0; fwd = norm(fwd);
         V3 right = norm(cross(fwd, V3{0, 1, 0}));
         if (ImGui::IsKeyDown(ImGuiKey_W) || ImGui::IsKeyDown(ImGuiKey_UpArrow))    g_cam.target = g_cam.target + fwd * sp;
@@ -841,14 +869,26 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     if (g_panning) {
         V3 e = g_cam.eye(), fwd = norm(g_cam.target - e);
         V3 right = norm(cross(fwd, {0,1,0})), up = cross(right, fwd);
-        float k = g_cam.dist * 0.0016f + 0.02f;   // floor so it pans when zoomed in
+        float k = g_cam.dist * 0.0016f + 0.15f;   // floor so it pans when zoomed in
         g_cam.target = g_cam.target - right * (io.MouseDelta.x * k)
                                     + up    * (io.MouseDelta.y * k);
     }
     if (over && io.MouseWheel != 0.0f) {
+        float gx, gy;
+        bool hit = g_scene.loaded &&
+                   terrainHit(io.MousePos, cmin, cmax, gx, gy);   // BEFORE changing dist
+        float old = g_cam.dist;
         g_cam.dist *= std::pow(0.88f, io.MouseWheel);
-        if (g_cam.dist < 5.0f) g_cam.dist = 5.0f;
+        if (g_cam.dist < 1.0f)    g_cam.dist = 1.0f;              // was 5.0 — get close
         if (g_cam.dist > 6000.0f) g_cam.dist = 6000.0f;
+        // On zoom-IN, glide the pivot toward the cursor's ground point by the same
+        // fraction the distance shrank, so that point stays put and the pivot lands
+        // on real terrain (fixes the mid-elevation floating pivot).
+        if (hit && io.MouseWheel > 0.0f && old > 1e-4f) {
+            float f = 1.0f - g_cam.dist / old;                    // (0,1)
+            V3 gp{ gx, terrainHeightAt(gx, gy), gy };
+            g_cam.target = g_cam.target + (gp - g_cam.target) * f;
+        }
     }
     // Terrain mode + a brush tool (Raise/Lower/Smooth) => left-drag brushes the
     // heightmap instead of selecting entities.
@@ -876,12 +916,22 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) applyTerrainBrush(gx, gy, g_activeTool);
         return;   // don't pick/move entities while brushing
     }
+    // Place-on-click: with a browser prototype selected and the Place tool active
+    // (Object/Unit/Ambient), left-click on terrain drops a grounded copy there.
+    bool placing = g_scene.loaded && g_placeSrcId >= 0 && activeToolIsPlace();
+    if (over && placing && ImGui::IsMouseClicked(0)) {
+        float gx, gy;
+        if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
+            placeDuplicateAt(g_placeSrcId, gx, gy);
+            return;   // consumed the click; don't also pick/move an entity
+        }
+    }
     // Hover highlight: track the entity under the cursor each frame (not while
-    // brushing/dragging), so the viewport shows what a click would select.
-    g_hovered = (over && !brushing && !g_draggingEnt) ? pickEntity(io.MousePos, cmin, cmax) : -1;
+    // brushing/dragging/placing), so the viewport shows what a click would select.
+    g_hovered = (over && !brushing && !placing && !g_draggingEnt) ? pickAny(io.MousePos, cmin, cmax) : -1;
     // Left-click picks the nearest entity by screen-space projection.
     if (over && ImGui::IsMouseClicked(0) && g_scene.loaded) {
-        int bi = pickEntity(io.MousePos, cmin, cmax);
+        int bi = pickAny(io.MousePos, cmin, cmax);
         if (bi >= 0) { g_selected = bi; g_draggingEnt = true; snapEntity(bi); }
     }
     // Left-drag: the selected entity follows the cursor on the terrain (grounded).
@@ -935,6 +985,26 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
+        else if (!strcmp(argv[i], "--srmcheck") && i + 1 < argc) {
+            // dev: parse+build a .srm and report finite-ness/bbox/uv (foliage fix check)
+            SrmModel m; std::string err;
+            if (!srm_parse(argv[i+1], m, &err)) { printf("parse FAIL: %s\n", err.c_str()); return 2; }
+            std::vector<RenderMesh> rms; srm_build_render(m, SKIN_FULL, VAR_ALL, rms);
+            int tot=0, bad=0; float lo[3]={1e30f,1e30f,1e30f}, hi[3]={-1e30f,-1e30f,-1e30f};
+            for (auto& rm : rms) for (auto& v : rm.verts) { tot++;
+                if (!std::isfinite(v.x)||!std::isfinite(v.y)||!std::isfinite(v.z)) { bad++; continue; }
+                lo[0]=std::min(lo[0],v.x); hi[0]=std::max(hi[0],v.x);
+                lo[1]=std::min(lo[1],v.y); hi[1]=std::max(hi[1],v.y);
+                lo[2]=std::min(lo[2],v.z); hi[2]=std::max(hi[2],v.z); }
+            int uvMesh=0; for (auto& mesh : m.meshes) if (mesh.byUsage(USAGE_TEXCOORD)) uvMesh++;
+            printf("srmcheck '%s': nodes=%zu meshes=%zu rmeshes=%zu verts=%d nonfinite=%d\n",
+                   argv[i+1], m.nodes.size(), m.meshes.size(), rms.size(), tot, bad);
+            printf("  bbox=[%.2f %.2f %.2f]..[%.2f %.2f %.2f]  meshesWithUV=%d/%zu\n",
+                   lo[0],lo[1],lo[2], hi[0],hi[1],hi[2], uvMesh, m.meshes.size());
+            for (auto& rm : rms) printf("  rmesh node=%d verts=%zu tris=%zu tex='%s' alphaTest=%d\n",
+                   rm.nodeIndex, rm.verts.size(), rm.indices.size()/3, rm.diffuseTex.c_str(), (int)rm.alphaTest);
+            return bad ? 3 : 0;
+        }
         else if (!strcmp(argv[i], "--protodbtest") && i + 1 < argc) {
             auto idx = protodb_model_index(argv[i+1]);
             printf("protodb models=%zu\n", idx.size());
@@ -961,9 +1031,10 @@ int main(int argc, char** argv) {
             size_t rv=0, dv=0; int noTex=0;
             for (auto& m : s.roads)  { rv += m.verts.size()/5; if (m.tex.empty()) noTex++; }
             for (auto& m : s.decals) { dv += m.verts.size()/5; if (m.tex.empty()) noTex++; }
-            printf("overlays: roads=%zu (%zu verts) decals=%zu (%zu verts) noTex=%d\n",
-                   s.roads.size(), rv, s.decals.size(), dv, noTex);
-            for (size_t k=0;k<s.roads.size() && k<3;k++) printf("  road[%zu] %s\n", k, s.roads[k].tex.c_str());
+            printf("overlays: roadSplines=%zu areafills=%zu (%zu verts) decals=%zu (%zu verts) noTex=%d\n",
+                   s.roadSplines.size(), s.roads.size(), rv, s.decals.size(), dv, noTex);
+            for (size_t k=0;k<s.roadSplines.size() && k<4;k++)
+                printf("  spline[%zu] nodes=%zu %s\n", k, s.roadSplines[k].cx.size(), s.roadSplines[k].tex.c_str());
             for (size_t k=0;k<s.decals.size() && k<3;k++) printf("  decal[%zu] %s\n", k, s.decals[k].tex.c_str());
             return 0;
         }
@@ -1113,6 +1184,11 @@ int main(int argc, char** argv) {
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) doOpen();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoEdit();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redoEdit();
+        // C cycles model cull (Off -> Back -> Front); X flips model local-X (mirror text)
+        if (!kio.WantCaptureKeyboard && !kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C))
+            g_vp.cullMode = (g_vp.cullMode + 1) % 3;
+        if (!kio.WantCaptureKeyboard && !kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X))
+            g_vp.flipModelX = !g_vp.flipModelX;
         // [ / ] rotate the selected entity 5 degrees (yaw)
         if (!kio.WantCaptureKeyboard && g_selected >= 0 &&
             g_selected < (int)g_scene.entities.size()) {
@@ -1144,6 +1220,7 @@ int main(int argc, char** argv) {
         if (g_sceneDirty && g_glReady) {
             g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
             g_vp.buildSplatTextures(g_scene, g_dataRoot);
+            g_vp.buildOverlays(g_scene, g_dataRoot);   // roads + decals (was missing -> no roads)
             g_vp.buildModels(g_scene, g_dataRoot);
             g_sceneDirty = false;
         }

@@ -51,6 +51,7 @@ struct GpuMesh {
     IDirect3DIndexBuffer9*  ib = nullptr;
     IDirect3DTexture9*      tex = nullptr;   // shared (not owned) pointer into g_texCache
     int numVerts = 0, numTris = 0;
+    bool alphaTest = false;                  // cutout diffuse (foliage/fence) -> alpha-test + 2-sided
 };
 
 static SrmModel            g_model;
@@ -237,6 +238,7 @@ static void buildGpu(const std::vector<Mat4>* worldOverride = nullptr,
         memcpy(pi, rm.indices.data(), ibSize); gm.ib->Unlock();
 
         gm.tex = loadTexture(rm.diffuseTex);
+        gm.alphaTest = rm.alphaTest;
         g_gpu.push_back(gm);
     }
     if (verbose) printf("built %d gpu meshes (skin=%s)\n", (int)g_gpu.size(), skinName(g_skin));
@@ -462,6 +464,20 @@ static void render() {
             g_dev->SetTexture(0, nullptr);
             g_dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
             g_dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        }
+        // Cutout foliage/fence: alpha-test the texture mask + draw two-sided.
+        bool at = textured && g.alphaTest;
+        if (at) {
+            g_dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+            g_dev->SetRenderState(D3DRS_ALPHAREF, 0x80);
+            g_dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+            g_dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            g_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        } else {
+            g_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+            D3DCULL cull = g_cull == 0 ? D3DCULL_NONE : (g_cull == 1 ? D3DCULL_CCW : D3DCULL_CW);
+            g_dev->SetRenderState(D3DRS_CULLMODE, cull);
         }
         g_dev->SetStreamSource(0, g.vb, 0, sizeof(RVertex));
         g_dev->SetIndices(g.ib);

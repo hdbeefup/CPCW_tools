@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <algorithm>
 
 namespace {
 uint32_t u32(const std::vector<unsigned char>& d, size_t p) {
@@ -98,7 +99,7 @@ std::vector<Rec> walkRecords(const std::vector<unsigned char>& d, size_t off, si
 } // namespace
 
 void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
-    s.roads.clear(); s.decals.clear();
+    s.roads.clear(); s.decals.clear(); s.roadSplines.clear();
     // find GTRN, then its children GROL/GDCL (GTRN body has a 1-byte version)
     size_t gtrn = std::string::npos;
     for (size_t i = 0; i + 4 <= d.size(); i++)
@@ -133,30 +134,42 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
             }
             if (px.size() < 2) continue;
             std::string mat = findMaterial(d, b, e);
-            // half-width heuristic from the material name
-            float hw = 2.2f;
-            { std::string m; for(char c:mat) m+=(char)tolower((unsigned char)c);
-              if (m.find("wide")!=std::string::npos) hw=3.2f;
-              else if (m.find("narrow")!=std::string::npos) hw=1.4f;
-              else if (m.find("high")!=std::string::npos||m.find("road")!=std::string::npos) hw=3.6f; }
-            Scene::OverlayMesh om; om.tex = mat;
-            float vrun = 0.0f;
-            for (size_t i = 0; i < px.size(); i++) {
-                size_t a = i>0?i-1:i, c = i+1<px.size()?i+1:i;
-                float dx = px[c]-px[a], dz = pz[c]-pz[a];
-                float len = std::sqrt(dx*dx+dz*dz); if (len<1e-4f) len=1e-4f;
-                float nx = -dz/len, nz = dx/len;                 // left normal
-                if (i>0){ float sx=px[i]-px[i-1], sz2=pz[i]-pz[i-1]; vrun += std::sqrt(sx*sx+sz2*sz2); }
-                float lx=px[i]-nx*hw, lz=pz[i]-nz*hw, rx=px[i]+nx*hw, rz=pz[i]+nz*hw;
-                float vy = vrun/(hw*2.0f);
-                om.verts.insert(om.verts.end(), { lx, heightAt(s,lx,lz)+BIAS, lz, 0.0f, vy });
-                om.verts.insert(om.verts.end(), { rx, heightAt(s,rx,rz)+BIAS, rz, 1.0f, vy });
+            std::string m; for (char c : mat) m += (char)tolower((unsigned char)c);
+            auto has = [&](const char* t){ return m.find(t) != std::string::npos; };
+
+            // Some GROA records are 2D area fills (airfield aprons, parking/plaza
+            // concrete) rather than centrelines — their nodes trace the region
+            // boundary. Detect by material family (concrete/park/apron) AND a
+            // genuinely 2D bounding box, then triangulate as a filled polygon.
+            // (Shoelace area alone misclassifies curvy roads, so gate on name.)
+            float minx=px[0],maxx=px[0],minz=pz[0],maxz=pz[0];
+            for (size_t i=1;i<px.size();i++){ minx=std::min(minx,px[i]); maxx=std::max(maxx,px[i]);
+                                              minz=std::min(minz,pz[i]); maxz=std::max(maxz,pz[i]); }
+            bool areaMat = has("concr") || has("park") || has("apron") || has("plaza");
+            bool isArea = areaMat && px.size() >= 4 &&
+                          std::min(maxx-minx, maxz-minz) > 15.0f;
+
+            if (isArea) {
+                // centroid-fan triangulation (parking/apron regions are convex-ish)
+                Scene::OverlayMesh om; om.tex = mat;
+                const float TILE = 1.0f/16.0f;      // texture repeat for area fills
+                float cx=0,cz=0; for (size_t i=0;i<px.size();i++){ cx+=px[i]; cz+=pz[i]; }
+                cx/=px.size(); cz/=px.size();
+                om.verts.insert(om.verts.end(), { cx, heightAt(s,cx,cz)+BIAS, cz, cx*TILE, cz*TILE });
+                for (size_t i=0;i<px.size();i++)
+                    om.verts.insert(om.verts.end(),
+                        { px[i], heightAt(s,px[i],pz[i])+BIAS, pz[i], px[i]*TILE, pz[i]*TILE });
+                unsigned n=(unsigned)px.size();
+                for (unsigned i=0;i<n;i++)
+                    om.idx.insert(om.idx.end(), { 0u, 1u+i, 1u+((i+1)%n) });
+                if (!om.idx.empty()) s.roads.push_back(std::move(om));
+            } else {
+                // Store the centreline; the ribbon is extruded at render time in
+                // buildOverlays() using the road TEXTURE's height for width.
+                Scene::RoadSpline rs; rs.tex = mat;
+                rs.cx = std::move(px); rs.cz = std::move(pz);
+                s.roadSplines.push_back(std::move(rs));
             }
-            for (size_t i = 0; i + 1 < px.size(); i++) {
-                unsigned a=(unsigned)(i*2), b2=a+1, c=a+2, dd=a+3;
-                om.idx.insert(om.idx.end(), { a,c,b2, b2,c,dd });
-            }
-            if (!om.idx.empty()) s.roads.push_back(std::move(om));
         }
     }
 

@@ -38,6 +38,11 @@ struct Scene {
         std::vector<unsigned> idx;       // triangle indices
     };
     std::vector<OverlayMesh> roads, decals;
+    // Centreline roads: extruded to a ribbon at render time using the road TEXTURE's
+    // dimensions for width (engine derives width from tex height; see cpcw-road-groa).
+    // Area-fill roads (aprons/plazas) stay in `roads` as pre-triangulated meshes.
+    struct RoadSpline { std::string tex; std::vector<float> cx, cz; };
+    std::vector<RoadSpline> roadSplines;
     std::vector<unsigned char> raw;     // original .map bytes (for native save), or empty
     std::string srcPath;                // original .map path, or empty (loaded from .json)
     long heightOff = -1;                // byte offset of the heightmap grid in raw

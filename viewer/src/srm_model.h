@@ -22,6 +22,7 @@ enum {
 
 struct SrmStream {
     int usage = 0, semantic = 0, stride = 0, vertexCount = 0;
+    int offset = 0;   // byte offset of this attribute WITHIN each stride (interleaved streams)
     std::vector<uint8_t> data;
 };
 
@@ -106,6 +107,7 @@ struct RenderMesh {
     std::vector<uint32_t> indices;
     int nodeIndex = -1;
     std::string diffuseTex;   // basename (no path), or empty
+    bool alphaTest = false;   // diffuse came from a cutout key (alpha=mask, not spec)
 };
 
 // Build world matrices per node (parent chain, T*R*S, R=Rx*Ry*Rz).

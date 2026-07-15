@@ -63,25 +63,69 @@ Panzers Cold War/*.pak`.
   + material -> a rotated terrain-projected quad. Verified: M_01 320 roads + 126
   decals, all materials resolve.
 
-## OPEN ISSUES (priority order)
-1. **Road/pavement/apron width (biggest visual gap).** Wide roads, sidewalk pavements,
-   and the airfield apron render as thin ribbons. Find the true width: check the GROA
-   *trailer* (the ~149-byte block after the nodes: a 4x4 matrix + bbox — width may be
-   derivable from the bbox vs centreline length), or the GROL per-record 9/18-byte
-   prefix, or whether some records are area polygons (nodes forming a closed loop to
-   be triangulated, not a centreline). Cross-check by rendering M_01 vs an in-game
-   screenshot of the same street. Do NOT reinterpret nodes as left/right edge pairs —
-   that was tried and breaks the streets (nodes are a centreline).
-2. **Yaw / mirroring confirmation.** `+180` is applied. Confirm it's right for all
-   objects. Check whether fuselage text is ever mirrored (user's image 11 looked
-   reversed, but "USAF" read correctly — may be far-face bleed-through from two-sided
-   no-cull rendering; if real, the depth-flip axis or winding needs revisiting).
-3. **Place-on-click.** Replace the "Place copy at view center" button: with a browser
-   prototype selected, left-click on terrain (use `terrainHit`) to place a copy there.
-   `add_entity_native` already does the structural insert.
-4. **Thick highlight lines.** Selection/hover boxes + brush ring use `glLineWidth(2.5)`,
-   which GL 3.3 CORE clamps to 1.0. If lines look thin, render them as screen-space
-   quads instead of `GL_LINES`.
+## RECENTLY FIXED (verify live, then delete from here)
+- **SRM model fidelity (shared `viewer/src/srm_model.{cpp,h}` + `mapeditor/src/
+  viewport3d.h` — fixes BOTH viewer and map editor).**
+  - **Foliage trees loaded (36 `Objects/Tree/*.srm` incl. oak_1_autumn).** Their VERS
+    chunk prepends a 32-byte vertex-declaration block before the vertex array; the
+    parser read POSITION 32 B early -> NaN verts -> invisible. Fix: skip `avail-need`
+    leading bytes in the VERS loop. UV/normal are interleaved INSIDE the stride-44
+    POSITION stream (uv@+16), so `SrmStream` gained an `offset` field and parseMesh
+    synthesizes a TEXCOORD view at +16 for the foliage class. Verified: `--srmcheck
+    oak_1_autumn.srm` -> nonfinite=0, sane bbox, meshesWithUV=2/2.
+  - **Alpha-test cutouts (foliage/fence/window).** Model shaders forced alpha=1. Now
+    per-mesh `alphaTest` (RenderMesh->Part/GpuMesh): true only when diffuse came from a
+    `DiffuseTexture`/`Diffuse` key (alpha=mask), NEVER `DiffuseSpec*` (alpha=spec — would
+    perforate tanks). Shader `if(a<0.5) discard;` + drawn two-sided (cull off) for those
+    parts. `pickDiffuse` reports the flag.
+  - **FR_ARL-44 / merged-tank 'shadow' sheet removed.** `srm_build_render_w` drops tris
+    skinned to a node named `shadow` (also US_M103, US_Maus). Verified: shadow mesh
+    1438->376 tris.
+  - **Texture quality.** `loadTexture`: mipmaps (`glGenerateMipmap`) + trilinear +
+    anisotropy (added `glGenerateMipmap`/aniso enums to glcore.h). Model shader: gamma
+    (pow 1/2.2, fixes muddy) + hemispheric ambient + key + fill light (was one flat
+    directional). Dev harness: `--srmcheck <file>` (finite/bbox/uv/alpha report).
+  - **DEFERRED — merged-tank "track explosion" (17 heavy tanks).** `srm_bone_node_list`
+    (srm_model.cpp ~391-403) ALL-fallback (`unk4 != 4`) maps track verts onto rotated
+    `dust/entrance` gameplay markers -> verts fling to X+-5.6. Needs the engine's real
+    `model+0x180` bone-gather order (Ghidra). Affected: FR_ARL-44, SU_Object_279,
+    US_Maus, US_A41_Centurion, SU_IS-10, SU_Product_416, SU_ISU_152M, US_M103,
+    US_M53-GMC, US_M48_Patton, US_M59, US_M26-Pershing, su_tiger, US_tiger, SU_T-54,
+    US_M41_Bulldog, SK_Skoda_E100. (`cpcw_srm.py`/writer have the same latent
+    decl-prefix bug on foliage — oracle parity not yet applied.)
+- **Camera zoom-to-cursor + no zoom-in slowdown.** Wheel dollies toward the terrain
+  point under the cursor and lands the pivot on real ground (`updateCamera`,
+  main.cpp). Min dist 5->1, near plane 1.0->0.5 (viewport3d.h). WASD/pan floors
+  raised so movement doesn't crawl when zoomed in.
+- **#2 Mirrored fuselage/decal text (SOLVED).** loadModel's single negate-Z (LH
+  .srm -> RH GL) is a REFLECTION -> mirrors text. Fix (baked): negate BOTH X and Z
+  (=180deg Y rotation, no mirror) + NORMAL winding + keep +180 yaw. Exterior is CCW,
+  so **Back-cull (cullMode=1)** is default/correct (Front-cull shows the interior).
+  `View>Model cull` / key **C** toggles cull; key **X** = debug flip (mirror is baked).
+- **Roads invisible in live app (SOLVED).** `buildOverlays` was missing from the
+  scene-dirty rebuild (only --shot called it). Added -> roads/decals/apron fills show.
+- **Picking (improved).** `Viewport3D::pickModel` picks by projected model AABB (via
+  `pickAny`) so big models are clickable anywhere + hover tracks the right model.
+- **#3 Place-on-click.** With a browser prototype selected + the **Place** tool
+  active (Object/Unit/Ambient), left-click on terrain drops a grounded copy
+  (`activeToolIsPlace()` + `placeDuplicateAt()`, main.cpp; reuses `terrainHit` +
+  `add_entity_native`). Panel button relabelled "Place at view center".
+- **#4 Thick highlight lines.** New geometry-shader program `thickProg` expands
+  GL_LINES into screen-space quads (`drawThickLines`, viewport3d.h) — real px width
+  despite GL 3.3 core clamping glLineWidth to 1. Used by hover/selection boxes +
+  brush ring. Added `GL_GEOMETRY_SHADER` to glcore.h + a 3-arg `glProgram`.
+- **#1 Road width — Ghidra-RE'd + rewritten.** Roads are texture-projected STRIPS
+  (engine `FUN_004d7a10`); width = road-texture SHORT dim (across-road px) x WPT.
+  Rewrite: `overlays.cpp` stores centrelines in `Scene::roadSplines`; `viewport3d.h
+  buildOverlays` extrudes them using `resolveTexDims()` — strip textures (1024x128
+  narrow / 1024x256 wide / 1024x512 Dwide) give exact proportional widths
+  (2.56/5.12/10.24 full), square textures (cobblestone/runway) fall back to name.
+  WPT=0.02 (calibrated, not the engine's exact runtime const). `resolveTexKey` skips
+  corner/cross/junc pieces so roads pick the tiling strip. Full RE writeup:
+  `N:\gamePAKdata\re\ROADS_RESULT.md`, memory [[cpcw-road-groa]]. Overlay z-fighting
+  fixed (depth-write off, roads-then-decals 2 passes); purple decals fixed (aux/normal
+  maps excluded in fallback). Area fills (apron/plaza concrete) still centroid-fan
+  triangulated in `overlays.cpp`. TUNE: WPT if widths look off; verify tiling/other maps.
 
 ## Verified-working (leave alone unless regressing)
 Textured terrain, road/decal decode+render, THMB thumbnails, category browser,

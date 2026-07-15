@@ -23,6 +23,7 @@ typedef ptrdiff_t GLintptr;
 #define GL_DYNAMIC_DRAW              0x88E8
 #define GL_FRAGMENT_SHADER           0x8B30
 #define GL_VERTEX_SHADER             0x8B31
+#define GL_GEOMETRY_SHADER           0x8DD9
 #define GL_COMPILE_STATUS            0x8B81
 #define GL_LINK_STATUS               0x8B82
 #define GL_VERTEX_PROGRAM_POINT_SIZE 0x8642
@@ -43,6 +44,15 @@ typedef ptrdiff_t GLintptr;
 #endif
 #ifndef GL_POLYGON_OFFSET_FILL
 #define GL_POLYGON_OFFSET_FILL       0x8037
+#endif
+#ifndef GL_LINEAR_MIPMAP_LINEAR
+#define GL_LINEAR_MIPMAP_LINEAR      0x2703
+#endif
+#ifndef GL_TEXTURE_MAX_ANISOTROPY
+#define GL_TEXTURE_MAX_ANISOTROPY    0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY 0x84FF
 #endif
 
 #define GL_FUNCS(X) \
@@ -72,6 +82,7 @@ typedef ptrdiff_t GLintptr;
     X(void,   glDeleteBuffers, (GLsizei, const GLuint*)) \
     X(void,   glBindBuffer, (GLenum, GLuint)) \
     X(void,   glBufferData, (GLenum, GLsizeiptr, const void*, GLenum)) \
+    X(void,   glGenerateMipmap, (GLenum)) \
     X(void,   glGenVertexArrays, (GLsizei, GLuint*)) \
     X(void,   glDeleteVertexArrays, (GLsizei, const GLuint*)) \
     X(void,   glBindVertexArray, (GLuint)) \
