@@ -394,8 +394,8 @@ Embedded within the GTRD post-layer region is the **terrain elevation grid**:
   (0.0), matching the in-game look. Reconstructing the terrain mesh from this
   grid reproduces the game's hills/valleys exactly.
 
-`GROL`, `GDCL`, `GRVL` (siblings under GTRN) are much smaller — ground roles /
-decals / (reveal?) — and do not carry the elevation.
+`GROL`, `GDCL`, `GRVL` (siblings under GTRN) are much smaller — road ribbons /
+decals / (vestigial) — and do not carry the elevation. See §9 (now decoded).
 
 ---
 
@@ -442,24 +442,63 @@ Non-trivial cell values (512, 1280, 1285, 2816, 8448, 8449, etc.) likely encode:
 
 ---
 
-## 9. GROL / GROA — Ground Roles
+## 9. GROL / GROA (roads) & GDCL / GDEC (decals) — Terrain overlays — SOLVED
 
-Defines gameplay property zones overlaid on the terrain.
+`GROL`, `GDCL` (and the vestigial `GRVL`) are siblings of `GTRD` under `GTRN`.
+They hold the **road/sidewalk and decal overlay geometry** drawn on top of the
+terrain with `Terrain/Road/*` and `Terrain/Decal/*` materials — **not** physics
+"ground role" zones (an earlier guess). Present in all 45 CPCW maps. Decoded by
+`mapeditor/src/overlays.cpp` (`parse_overlays`) and rendered as textured,
+terrain-projected overlays; `cpcw_mapeditor --overlaytest <map>` dumps counts.
 
-### GROL Header
+### Container layout (GROL and GDCL share it)
 
 ```
-0x00    4     tag     "GROL"
-0x04    4     uint32  Content size
-0x08    ...           Header values (counts, dimensions as uint32)
-                      Then GROA sub-chunk
+0x00    4     tag       "GROL" / "GDCL"
+0x04    4     uint32    Content size
+--- content ---
+0x00    4     uint32    Record count (# GROA / GDEC records)
+0x04    20    bytes     5 more header dwords (24-byte header total)
+0x18    ...             Records: each = a short per-record prefix
+                        (9 or 18 bytes: idx u32 + flag u32 + u8, sometimes padded)
+                        followed by a "GROA" / "GDEC" chunk (tag + u32 size + body)
 ```
+Because the inter-record prefix length varies, a robust reader scans forward for
+the next `GROA`/`GDEC` tag after each chunk rather than assuming a fixed stride.
 
-### GROA
+### GROA — road/sidewalk ribbon
 
-Contains an array of role entries with float3 bounding boxes (world-space
-coordinates) linking terrain areas to physics/gameplay properties such as
-cover, concealment, and movement speed modifiers.
+```
+0x00    4     uint32    Type (observed 11)
+0x04    4     uint32    Node count N
+0x08    N×36  nodes     Per node (36 bytes = 9 floats):
+                          float x, y, z   world-space centreline point (y≈0)
+                          float ×6        segment length, tangent dx/dz, ...
+        ...   bytes      Trailer: a 4×4 transform matrix / bbox
+        var   string     Material path (u16 len), first "Terrain/Road/..." string
+        var   string     Shader (u16 len, e.g. ".../BumpDisplace", ".../AlphaBlend")
+```
+The N nodes trace the road centreline; extrude ±half-width along the segment
+normal for a ribbon, projecting Y onto the heightmap (§7.4).
+
+### GDEC — decal quad
+
+```
+0x00    4     uint32    Field count (observed 6)
+0x04    4     float     Center X    (world)
+0x08    4     float     Center Z    (world)
+0x0C    4     float     Size X
+0x10    4     float     Size Y
+0x14    4     float     Rotation    (radians, about the up axis)
+        ...             flag + padding
+        var   string    Material path (first "Terrain/Decal/..." string)
+```
+One rotated, terrain-projected textured quad (mud/water/grass-dry/sidewalk-piece).
+
+### GRVL
+
+24 bytes, effectively empty (sentinel `0xFFFFFFFF` fill) in every observed map —
+vestigial; not rendered.
 
 ---
 

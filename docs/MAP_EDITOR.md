@@ -124,8 +124,23 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       native `mapeditor/src/thumb.cpp load_thmb()` (verified byte-identical, 2087/2087).
       The prototype browser now shows each model's baked preview as a thumbnail grid
       (lazy-decoded + GL-cached).
+- [x] **M9 — game-accurate terrain + roads/decals + browser polish**:
+      - **Real splat-textured terrain**: composites the actual ground-layer `.dds`
+        (grass/dirt/gritty/cobblestone/…) blended by the per-vertex splatmap and
+        tiled by uv_scale, replacing the flat keyword palette. `scene.h` stores
+        `terrainLayers` + `splatWeights`; `viewport3d.h` `terrainTexProg` +
+        `buildSplatTextures`/`resolveLayerTex` (map-prefix-stripping stem index).
+        View > Terrain: Textured / Palette / Height.
+      - **Roads & decals decoded and rendered** (`overlays.cpp`, `MAP_FORMAT.md`
+        §9): GROL/GROA road ribbons + GDCL/GDEC decal quads, projected onto the
+        terrain, textured + alpha-blended. Verified 45/45 CPCW maps (3932 roads +
+        4109 decals, 0 unresolved materials). View > Roads / Decals; `--overlaytest`.
+      - **Browser**: THMB thumbnails flipped upright, grouped by category
+        (Vehicles/Buildings/Objects/Nature…), placement grounded on the terrain +
+        auto-selected (view-preserving reload).
 - [ ] **Remaining**: placing prototypes not already on the map (needs OBJT
-      construction from the schema); confirm the model handedness axis vs the game.
+      construction from the schema); confirm the model handedness axis vs the game;
+      roads/decals are view-only (not yet editable).
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).
