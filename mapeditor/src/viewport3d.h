@@ -85,8 +85,9 @@ static inline GLuint glProgram(const char* vs, const char* fs) {
 
 class Viewport3D {
     struct Part { int off=0, count=0; GLuint tex=0; };   // index range + diffuse tex
-    struct GLModel { GLuint vao=0, vbo=0, ebo=0; std::vector<Part> parts; };
-    struct ModelInst { GLModel* model; M4 xf; };
+    struct GLModel { GLuint vao=0, vbo=0, ebo=0; std::vector<Part> parts;
+                     V3 bmin{1e9f,1e9f,1e9f}, bmax{-1e9f,-1e9f,-1e9f}; };  // local AABB
+    struct ModelInst { GLModel* model; M4 xf; int entIdx=-1; };
 public:
     void init() {
         terrainProg = glProgram(
@@ -227,7 +228,8 @@ public:
         std::string protoPath = vfs_resolve("ProtoDB.bin", dataRoot);
         auto index = protodb_model_index(protoPath);
         if (index.empty()) return;
-        for (const Entity& e : s.entities) {
+        for (int ei = 0; ei < (int)s.entities.size(); ei++) {
+            const Entity& e = s.entities[ei];
             if (e.proto.empty()) continue;
             std::string g; for (char c : e.proto) g += (char)tolower((unsigned char)c);
             auto it = index.find(g); if (it == index.end()) continue;
@@ -239,7 +241,7 @@ public:
             // model is converted to RH at load (negate Z); place with a plain yaw.
             float yaw = e.dir * 3.14159265f / 180.0f;
             M4 xf = mul(translate(wp), rotY(yaw));
-            instances.push_back({ gm, xf });
+            instances.push_back({ gm, xf, ei });
         }
     }
     int modelInstanceCount() const { return (int)instances.size(); }
@@ -341,6 +343,8 @@ public:
                     verts.push_back(v.x); verts.push_back(v.y); verts.push_back(-v.z);
                     verts.push_back(v.nx); verts.push_back(v.ny); verts.push_back(-v.nz);
                     verts.push_back(v.u); verts.push_back(v.v);
+                    gm.bmin.x=std::min(gm.bmin.x,v.x); gm.bmin.y=std::min(gm.bmin.y,v.y); gm.bmin.z=std::min(gm.bmin.z,-v.z);
+                    gm.bmax.x=std::max(gm.bmax.x,v.x); gm.bmax.y=std::max(gm.bmax.y,v.y); gm.bmax.z=std::max(gm.bmax.z,-v.z);
                 }
                 for (size_t t = 0; t + 2 < rm.indices.size(); t += 3) {
                     idx.push_back(base + rm.indices[t]);
@@ -575,8 +579,35 @@ public:
         modelCache.clear(); instances.clear(); texCache.clear(); modelsBuilt = false;
     }
 
+    // wireframe AABB of `inst` (transformed by its xf), drawn depth-off so the
+    // highlight is always visible. Used for selected/hovered entities.
+    void drawHiliteBox(const M4& mvp, const ModelInst& inst, float r, float g, float b) {
+        V3 lo = inst.model->bmin, hi = inst.model->bmax;
+        if (lo.x > hi.x) return;
+        V3 c[8] = {{lo.x,lo.y,lo.z},{hi.x,lo.y,lo.z},{hi.x,lo.y,hi.z},{lo.x,lo.y,hi.z},
+                   {lo.x,hi.y,lo.z},{hi.x,hi.y,lo.z},{hi.x,hi.y,hi.z},{lo.x,hi.y,hi.z}};
+        V3 w[8]; const float* m = inst.xf.m;
+        for (int i=0;i<8;i++){
+            w[i].x=m[0]*c[i].x+m[4]*c[i].y+m[8]*c[i].z+m[12];
+            w[i].y=m[1]*c[i].x+m[5]*c[i].y+m[9]*c[i].z+m[13];
+            w[i].z=m[2]*c[i].x+m[6]*c[i].y+m[10]*c[i].z+m[14];
+        }
+        static const int E[24]={0,1,1,2,2,3,3,0, 4,5,5,6,6,7,7,4, 0,4,1,5,2,6,3,7};
+        std::vector<float> ln; ln.reserve(24*3);
+        for (int i=0;i<24;i++){ ln.push_back(w[E[i]].x); ln.push_back(w[E[i]].y); ln.push_back(w[E[i]].z); }
+        if (!ringVAO){ glGenVertexArrays(1,&ringVAO); glGenBuffers(1,&ringVBO); }
+        glBindVertexArray(ringVAO); glBindBuffer(GL_ARRAY_BUFFER,ringVBO);
+        glBufferData(GL_ARRAY_BUFFER, ln.size()*sizeof(float), ln.data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(lineProg); glUniformMatrix4fv(uLineMVP,1,GL_FALSE,mvp.m);
+        float col[3]={r,g,b}; glUniform3fv(uLineColor,1,col);
+        glDrawArrays(GL_LINES,0,24);
+        glEnable(GL_DEPTH_TEST);
+    }
+
     void render(const Camera& cam, float aspect, bool wireframe, int selected,
-                bool showModels = true, bool showDots = true) {
+                bool showModels = true, bool showDots = true, int hovered = -1) {
         M4 mvp = cam.viewProj(aspect);
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
@@ -598,6 +629,12 @@ public:
                 }
             }
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            // hover (cyan) + selection (yellow) highlight boxes on model entities
+            if (hovered >= 0 || selected >= 0)
+                for (auto& inst : instances) {
+                    if (inst.entIdx == selected)     drawHiliteBox(mvp, inst, 1.0f, 0.85f, 0.15f);
+                    else if (inst.entIdx == hovered) drawHiliteBox(mvp, inst, 0.30f, 0.90f, 1.0f);
+                }
         }
         if (terrainCount) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);

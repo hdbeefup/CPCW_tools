@@ -68,7 +68,7 @@ static Scene      g_scene;
 static Camera     g_cam;
 static Viewport3D g_vp;
 static bool  g_glReady = false, g_sceneDirty = false;
-static int   g_mode = 0, g_activeTool = 0, g_selected = -1;
+static int   g_mode = 0, g_activeTool = 0, g_selected = -1, g_hovered = -1;
 static float g_brushSize = 2.0f, g_brushHeight = 0.0f, g_brushPress = 0.5f;
 static bool  g_wireframe = false;
 static bool  g_showModes = true, g_showPanel = true, g_showProps = true,
@@ -769,6 +769,29 @@ static void applyTerrainBrush(float cx, float cy, int tool) {
     g_scene.terrainEdited = true; g_terrainDirty = true;
 }
 
+// Nearest entity to a screen point (by projected origin, within a pixel radius),
+// respecting the category show/hide toggles. -1 if none.
+static int pickEntity(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax) {
+    float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
+    if (W <= 1 || H <= 1 || !g_scene.loaded) return -1;
+    M4 vp = g_cam.viewProj(W / H);
+    float best = 18.0f; int bi = -1;
+    for (int i = 0; i < (int)g_scene.entities.size(); i++) {
+        const Entity& e = g_scene.entities[i];
+        if (g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2] == false) continue;
+        V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
+        float cx = vp.m[0]*wp.x + vp.m[4]*wp.y + vp.m[8]*wp.z + vp.m[12];
+        float cy = vp.m[1]*wp.x + vp.m[5]*wp.y + vp.m[9]*wp.z + vp.m[13];
+        float cw = vp.m[3]*wp.x + vp.m[7]*wp.y + vp.m[11]*wp.z + vp.m[15];
+        if (cw <= 0.001f) continue;
+        float sx = cmin.x + (cx/cw*0.5f + 0.5f) * W;
+        float sy = cmin.y + (1.0f - (cy/cw*0.5f + 0.5f)) * H;
+        float d = fabsf(sx - mp.x) + fabsf(sy - mp.y);
+        if (d < best) { best = d; bi = i; }
+    }
+    return bi;
+}
+
 // camera navigation over the central viewport region
 static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     ImGuiIO& io = ImGui::GetIO();
@@ -811,11 +834,11 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     // Terrain mode + a brush tool (Raise/Lower/Smooth) => left-drag brushes the
     // heightmap instead of selecting entities.
     bool brushing = (g_mode == 0 && (g_activeTool == 1 || g_activeTool == 2 || g_activeTool == 6));
-    // Brush cursor ring: show the exact terrain area the brush will modify while
-    // hovering with a brush tool (matches applyTerrainBrush's radius).
+    // Brush cursor ring: show the terrain area the brush covers whenever hovering
+    // in Vertex/Terrain mode (any tool), matching applyTerrainBrush's radius.
     {
         float gx, gy;
-        if (over && brushing && g_scene.loaded && terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
+        if (over && g_mode == 0 && g_scene.loaded && terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
             const int N = 48; float rad = g_brushSize * 4.0f;
             std::vector<float> ring; ring.reserve(N * 3);
             for (int k = 0; k < N; k++) {
@@ -834,28 +857,13 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) applyTerrainBrush(gx, gy, g_activeTool);
         return;   // don't pick/move entities while brushing
     }
+    // Hover highlight: track the entity under the cursor each frame (not while
+    // brushing/dragging), so the viewport shows what a click would select.
+    g_hovered = (over && !brushing && !g_draggingEnt) ? pickEntity(io.MousePos, cmin, cmax) : -1;
     // Left-click picks the nearest entity by screen-space projection.
     if (over && ImGui::IsMouseClicked(0) && g_scene.loaded) {
-        float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
-        if (W > 1 && H > 1) {
-            M4 vp = g_cam.viewProj(W / H);
-            ImVec2 mp = io.MousePos;
-            float best = 16.0f; int bi = -1;
-            for (int i = 0; i < (int)g_scene.entities.size(); i++) {
-                const Entity& e = g_scene.entities[i];
-                if (g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2] == false) continue;
-                V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
-                float cx = vp.m[0]*wp.x + vp.m[4]*wp.y + vp.m[8]*wp.z + vp.m[12];
-                float cy = vp.m[1]*wp.x + vp.m[5]*wp.y + vp.m[9]*wp.z + vp.m[13];
-                float cw = vp.m[3]*wp.x + vp.m[7]*wp.y + vp.m[11]*wp.z + vp.m[15];
-                if (cw <= 0.001f) continue;
-                float sx = cmin.x + (cx/cw*0.5f + 0.5f) * W;
-                float sy = cmin.y + (1.0f - (cy/cw*0.5f + 0.5f)) * H;
-                float d = fabsf(sx - mp.x) + fabsf(sy - mp.y);
-                if (d < best) { best = d; bi = i; }
-            }
-            if (bi >= 0) { g_selected = bi; g_draggingEnt = true; snapEntity(bi); }
-        }
+        int bi = pickEntity(io.MousePos, cmin, cmax);
+        if (bi >= 0) { g_selected = bi; g_draggingEnt = true; snapEntity(bi); }
     }
     // Left-drag moves the selected entity along the ground plane.
     if (g_draggingEnt && ImGui::IsMouseDown(0) && g_selected >= 0 &&
@@ -1152,7 +1160,7 @@ int main(int argc, char** argv) {
             glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             g_vp.render(g_cam, (float)vw / (float)vh, g_wireframe, g_selected,
-                        g_showModels, g_showDots);
+                        g_showModels, g_showDots, g_hovered);
             glDisable(GL_SCISSOR_TEST);
             glViewport(0, 0, fbw, fbh);
         }
