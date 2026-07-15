@@ -238,11 +238,18 @@ public:
             GLModel* gm = loadModel(mp);
             if (!gm || gm->parts.empty() || gm->vao == 0) continue;
             V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
-            // model is converted to RH at load (negate Z); place with a plain yaw.
-            float yaw = e.dir * 3.14159265f / 180.0f;
+            // model is RH at load (negate Z); +180 aligns the facing with the game.
+            float yaw = (e.dir + 180.0f) * 3.14159265f / 180.0f;
             M4 xf = mul(translate(wp), rotY(yaw));
             instances.push_back({ gm, xf, ei });
         }
+    }
+    // Live-update one entity's model transform (fast: just its matrix, no rebuild)
+    // so drag-move is smooth. Keep in sync with buildModels' transform.
+    void moveInstance(int entIdx, const V3& wp, float yawDeg) {
+        float yaw = (yawDeg + 180.0f) * 3.14159265f / 180.0f;   // +180: match in-game facing
+        M4 xf = mul(translate(wp), rotY(yaw));
+        for (auto& inst : instances) if (inst.entIdx == entIdx) { inst.xf = xf; break; }
     }
     int modelInstanceCount() const { return (int)instances.size(); }
     bool modelsAreBuilt() const { return modelsBuilt; }
@@ -600,9 +607,11 @@ public:
         glBufferData(GL_ARRAY_BUFFER, ln.size()*sizeof(float), ln.data(), GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
         glDisable(GL_DEPTH_TEST);
+        glLineWidth(2.5f);
         glUseProgram(lineProg); glUniformMatrix4fv(uLineMVP,1,GL_FALSE,mvp.m);
         float col[3]={r,g,b}; glUniform3fv(uLineColor,1,col);
         glDrawArrays(GL_LINES,0,24);
+        glLineWidth(1.0f);
         glEnable(GL_DEPTH_TEST);
     }
 

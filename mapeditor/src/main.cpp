@@ -721,9 +721,9 @@ static void drawProperties() {
     ImGui::End();
 }
 
-// Ray from the camera through the mouse, intersected with a horizontal plane at
-// the camera target height -> terrain grid cell (gx,gy). Approximate (flat plane)
-// but fine for brushing. Returns false if the ray doesn't hit.
+// Ray from the camera through the mouse, intersected with the ACTUAL terrain by
+// raymarching the heightmap (so the hit tracks the cursor over hills, not a flat
+// plane). Falls back to a plane at the target height. Returns (gx,gy) = world XZ.
 static bool terrainHit(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
                        float& gx, float& gy) {
     float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
@@ -734,11 +734,30 @@ static bool terrainHit(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
     V3 right = norm(cross(fwd, V3{0,1,0})), up = cross(right, fwd);
     float th = std::tan(0.45f), aspect = W / H;
     V3 dir = norm(fwd + right * (ndcx * th * aspect) + up * (ndcy * th));
+    auto rayAt = [&](float t){ return V3{ eye.x+dir.x*t, eye.y+dir.y*t, eye.z+dir.z*t }; };
+    // march downward toward the terrain, then bisect the crossing
+    if (dir.y < -1e-5f && g_scene.loaded && !g_scene.heights.empty()) {
+        float tMax = g_cam.dist * 3.0f + 500.0f;
+        float step = std::max(0.5f, g_cam.dist * 0.005f);
+        float tPrev = 0.0f; bool above = (eye.y > terrainHeightAt(eye.x, eye.z));
+        for (float t = step; t < tMax; t += step) {
+            V3 p = rayAt(t);
+            bool a = (p.y > terrainHeightAt(p.x, p.z));
+            if (above && !a) {
+                float t0 = tPrev, t1 = t;
+                for (int b = 0; b < 24; b++) {
+                    float tm = (t0+t1)*0.5f; V3 pm = rayAt(tm);
+                    if (pm.y > terrainHeightAt(pm.x, pm.z)) t0 = tm; else t1 = tm;
+                }
+                V3 pf = rayAt((t0+t1)*0.5f); gx = pf.x; gy = pf.z; return true;
+            }
+            tPrev = t; above = a;
+        }
+    }
     if (std::fabs(dir.y) < 1e-5f) return false;
     float d = (g_cam.target.y - eye.y) / dir.y;
     if (d < 0) return false;
-    gx = eye.x + dir.x * d;   // world X = grid i
-    gy = eye.z + dir.z * d;   // world Z = grid j
+    gx = eye.x + dir.x * d; gy = eye.z + dir.z * d;
     return true;
 }
 
@@ -865,20 +884,19 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         int bi = pickEntity(io.MousePos, cmin, cmax);
         if (bi >= 0) { g_selected = bi; g_draggingEnt = true; snapEntity(bi); }
     }
-    // Left-drag moves the selected entity along the ground plane.
+    // Left-drag: the selected entity follows the cursor on the terrain (grounded).
+    // Only its own model instance is updated (no full rebuild), so it's smooth.
     if (g_draggingEnt && ImGui::IsMouseDown(0) && g_selected >= 0 &&
         g_selected < (int)g_scene.entities.size()) {
-        if (fabsf(io.MouseDelta.x) > 0 || fabsf(io.MouseDelta.y) > 0) {
-            V3 fwd = norm(g_cam.target - g_cam.eye()); fwd.y = 0; fwd = norm(fwd);
-            V3 right = norm(cross(fwd, V3{0, 1, 0}));
-            float k = g_cam.dist * 0.0016f + 0.02f;
+        float gx, gy;
+        if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
             Entity& e = g_scene.entities[g_selected];
-            e.pos[0] += right.x * io.MouseDelta.x * k - fwd.x * io.MouseDelta.y * k;  // world X = pos0
-            e.pos[1] += right.z * io.MouseDelta.x * k - fwd.z * io.MouseDelta.y * k;  // world Z = pos1
-            g_edited.insert(e.id); g_entDirty = true;   // live marker; model on release
+            e.pos[0] = gx; e.pos[1] = gy; e.pos[2] = terrainHeightAt(gx, gy);
+            g_edited.insert(e.id); g_entDirty = true;
+            g_vp.moveInstance(g_selected, V3{ gx, e.pos[2], gy }, e.dir);   // live model follow
         }
     }
-    if (g_draggingEnt && !ImGui::IsMouseDown(0)) { g_draggingEnt = false; g_modelsDirty = true; commitEntity(); }
+    if (g_draggingEnt && !ImGui::IsMouseDown(0)) { g_draggingEnt = false; commitEntity(); }
     // finalize a terrain brush stroke into one undo command
     if (g_strokeActive && !ImGui::IsMouseDown(0)) {
         EditCmd c; c.terrain = true;
