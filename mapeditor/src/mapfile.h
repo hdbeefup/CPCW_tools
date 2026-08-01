@@ -60,6 +60,13 @@ bool insert_objt_at_index(Scene& s, int entIndex, const std::vector<unsigned cha
 // Erase `len` bytes of OBJT starting at `pos`. Undo of an add.
 bool erase_objt_bytes(Scene& s, long pos, long len);
 
+// ---- chunk outline (read-only inspector) ------------------------------------
+// A flat, depth-tagged walk of the SCEN chunk tree. Lets the editor show what a
+// map actually contains — including the chunks nobody has decoded yet (WTHR
+// weather/lighting, CAMS, PATH, water) — without pretending to interpret them.
+struct ChunkNode { int depth; std::string tag; long offset; long size; };
+bool map_chunk_outline(const std::vector<unsigned char>& raw, std::vector<ChunkNode>& out);
+
 // ---- file wrappers (dev harnesses) -----------------------------------------
 bool delete_entity_native(const Scene& s, long id, const std::string& outPath);
 bool add_entity_native(const Scene& s, long srcId, const float pos[3], long newId,

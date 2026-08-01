@@ -632,6 +632,20 @@ bool add_entity_bytes(Scene& s, long srcId, const float pos[3], long newId,
     return insert_objt_at_index(s, -1, blob);   // append before SCHD
 }
 
+// ---- chunk outline ----------------------------------------------------------
+static void flatten_chunks(const Chunk& c, int depth, std::vector<ChunkNode>& out) {
+    out.push_back({ depth, c.tag, (long)c.offset, (long)c.size });
+    for (const auto& ch : c.children) flatten_chunks(ch, depth + 1, out);
+}
+bool map_chunk_outline(const std::vector<unsigned char>& raw, std::vector<ChunkNode>& out) {
+    out.clear();
+    if (raw.empty()) return false;
+    Parser P;
+    if (!P.loadBytes(raw)) return false;   // copies; the inspector is not a hot path
+    flatten_chunks(P.root, 0, out);
+    return true;
+}
+
 // ---- file wrappers (dev harnesses --addtest / --deltest keep working) --------
 static bool write_all(const std::string& path, const std::vector<unsigned char>& b) {
     std::ofstream f(path, std::ios::binary);
@@ -703,6 +717,23 @@ void apply_edits_inplace(const Scene& s, const std::vector<long>& editedIds,
         bool haveMask = s.heightDirty.size() == s.heights.size();
         for (size_t i = 0; i < s.heights.size(); i++)
             if (!haveMask || s.heightDirty[i]) putf(s.heightOff + (long)i*4, s.heights[i]);
+    }
+    // painted splat layers: one uint8 opacity grid per layer, laid out back to back
+    // from splatOff. Fixed-size, so writing them keeps the file byte-faithful; only
+    // cells the brush touched are written.
+    if (s.splatEdited && s.splatOff >= 0 && !s.splatWeights.empty()) {
+        size_t need = (size_t)s.grid_w * s.grid_h;
+        bool haveMask = s.splatDirty.size() == s.splatWeights.size();
+        for (size_t L = 0; L < s.splatWeights.size(); L++) {
+            const auto& g = s.splatWeights[L];
+            if (g.size() != need) continue;
+            long base = s.splatOff + (long)(L * need);
+            for (size_t i = 0; i < need; i++) {
+                if (haveMask && !s.splatDirty[L][i]) continue;
+                long o = base + (long)i;
+                if (o >= 0 && o < (long)b.size()) b[o] = g[i];
+            }
+        }
     }
     for (long id : editedIds) {
         const Entity* e=nullptr;

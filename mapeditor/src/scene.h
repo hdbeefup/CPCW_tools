@@ -68,7 +68,10 @@ struct Scene {
     long splatOff = -1;                 // byte offset of the per-layer uint8 weight
                                         // grids (layer i at splatOff + i*grid_w*grid_h)
     bool terrainEdited = false;         // heights changed -> write them on save
+    bool splatEdited = false;           // layer opacities painted -> write them on save
     std::vector<unsigned char> heightDirty;  // per-cell: brush-touched (save only these)
+    // per-layer, per-cell mask of painted splat weights (same shape as splatWeights)
+    std::vector<std::vector<unsigned char>> splatDirty;
     // structural edits: size-field byte offsets of EVERY container that holds the
     // entities (SCEN, WRLD, ..., UNTS, OBJS), plus the OBJS absolute schema_offset.
     std::vector<long> containerSizeOffs;

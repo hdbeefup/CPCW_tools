@@ -74,7 +74,7 @@ static int   g_mode = 0, g_activeTool = 0, g_selected = -1, g_hovered = -1;
 static float g_brushSize = 2.0f, g_brushHeight = 0.0f, g_brushPress = 0.5f;
 static bool  g_wireframe = false;
 static bool  g_showModes = true, g_showPanel = true, g_showProps = true,
-             g_showEntities = true, g_showChanges = false;
+             g_showEntities = true, g_showChanges = false, g_showChunks = false;
 static char  g_mapPath[512] = "(no map loaded)";
 static char  g_openPath[512] = "";
 static bool  g_openPopup = false;
@@ -88,6 +88,18 @@ static bool  g_showKind[3] = {true, true, true};   // doodad / building / effect
 static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
 static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
+static bool  g_splatTexDirty = false;   // painted layers -> re-upload the weight textures
+
+// Vertex/Terrain tool indices, matching kModes[0].tools word for word.
+enum { TT_GRAB=0, TT_RAISE, TT_LOWER, TT_SETPLANE, TT_RAISE_TO_PLANE,
+       TT_LOWER_TO_PLANE, TT_SMOOTH, TT_BLEND, TT_TILEFILL, TT_AREA };
+static bool toolIsHeight(int t) {
+    return t==TT_GRAB || t==TT_RAISE || t==TT_LOWER || t==TT_SETPLANE ||
+           t==TT_RAISE_TO_PLANE || t==TT_LOWER_TO_PLANE || t==TT_SMOOTH;
+}
+static bool toolIsPaint(int t) { return t==TT_BLEND || t==TT_TILEFILL; }
+
+static int g_paintLayer = -1;   // Scene::terrainLayers index that Blend/TileFill paints
 
 // Before-and-after state of one entity, for batched undo (gizmo, group ops).
 struct EntSnap { long id = 0; float pos0[3]{}, pos1[3]{}; float dir0 = 0, dir1 = 0; };
@@ -956,6 +968,7 @@ static void drawMenuBar() {
         ImGui::MenuItem("Mode tools", nullptr, &g_showPanel);
         ImGui::MenuItem("Entities", nullptr, &g_showEntities);
         ImGui::MenuItem("Changes since save", nullptr, &g_showChanges);
+        ImGui::MenuItem("Map chunks (raw)", nullptr, &g_showChunks);
         ImGui::MenuItem("Properties", nullptr, &g_showProps);
         ImGui::Separator();
         ImGui::MenuItem("3D models", nullptr, &g_showModels);
@@ -1167,12 +1180,63 @@ static void drawModePanel() {
         for (char* tok = strtok(buf, " "); tok; tok = strtok(nullptr, " "), idx++)
             if (ImGui::Selectable(tok, g_activeTool == idx)) g_activeTool = idx;
         ImGui::SeparatorText("Parameters");
+        // Modes whose data the format work has not reached yet get an honest note
+        // and a pointer at what IS available, instead of controls that do nothing.
+        if (g_mode != 0 && g_mode != 2 && g_mode != 3 && g_mode != 4) {
+            const char* why = nullptr;
+            switch (g_mode) {
+                case 1: why = "Splines (rivers) are not decoded yet."; break;
+                case 5: why = "Roads (GROA) and decals (GDEC) are decoded and rendered, "
+                              "but read-only — the write path is not built yet. "
+                              "View > Roads / Decals toggles them."; break;
+                case 6: why = "Lake/water data is not decoded yet."; break;
+                case 7: why = "The WTHR weather/lighting block is not decoded yet."; break;
+                case 8: why = "Triggers hold Lua bodies; the trigger system is not decoded yet."; break;
+                default: why = "Not implemented yet."; break;
+            }
+            ImGui::TextWrapped("%s", why);
+            ImGui::Spacing();
+            if (ImGui::Button("Open the raw chunk inspector")) g_showChunks = true;
+            ImGui::TextDisabled("Inspect the bytes rather than guess at fields.");
+            ImGui::End();
+            return;
+        }
         if (m.focus[0] == 't') {
             ImGui::SliderFloat("Size", &g_brushSize, 0.5f, 8.0f);
             float rad = g_brushSize * 4.0f;
             ImGui::TextDisabled("diameter %.0f world units  (radius %.1f)", rad * 2.0f, rad);
             ImGui::SliderFloat("Height", &g_brushHeight, -50.0f, 50.0f);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Target altitude for SetPlane / Raise>Plane / Lower>Plane.");
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
+            if (g_mode == 0) {
+                if (toolIsHeight(g_activeTool))
+                    ImGui::TextDisabled("Hold Ctrl to invert raise/lower.");
+                if (g_activeTool == TT_GRAB)
+                    ImGui::TextDisabled("Grab: drag up/down to pull the surface.");
+            }
+            // Texture-blend layer picker (Blend / TileFill paint the chosen layer)
+            if (g_mode == 0 && !g_scene.terrainLayers.empty()) {
+                ImGui::SeparatorText("Terrain layers");
+                if (g_scene.splatOff < 0)
+                    ImGui::TextColored(ImVec4(1,0.5f,0.3f,1),
+                        "No splat grids located in this map — painting is disabled.");
+                for (int i = 0; i < (int)g_scene.terrainLayers.size(); i++) {
+                    const Scene::TerrainLayer& L = g_scene.terrainLayers[i];
+                    if (!L.active) continue;
+                    const char* leaf = L.path.c_str();
+                    if (const char* sl = strrchr(leaf, '/')) leaf = sl + 1;
+                    char lbl[160];
+                    snprintf(lbl, sizeof(lbl), "%d  %s%s##L%d", i, leaf,
+                             i == 0 ? "   (base)" : "", i);
+                    if (ImGui::Selectable(lbl, g_paintLayer == i)) g_paintLayer = i;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L.path.c_str());
+                }
+                if (toolIsPaint(g_activeTool)) {
+                    if (g_paintLayer < 0) ImGui::TextDisabled("Pick a layer to paint.");
+                    else ImGui::TextDisabled("Ctrl-drag erases the layer instead.");
+                }
+            }
         } else {
             drawPrototypeBrowser();
         }
@@ -1229,6 +1293,57 @@ static void drawChanges() {
                     if (g_cam.dist > 120.0f) g_cam.dist = 120.0f;
                 }
             }
+    }
+    ImGui::End();
+}
+
+// Read-only inspector over the raw chunk tree. The Lake/Water and Light modes have
+// nothing to edit yet because GTRD water and the WTHR weather/lighting block are
+// still undecoded (docs/MAP_FORMAT.md) — so show what is actually there, with a hex
+// preview, instead of a panel of invented fields. This is the decode-first step.
+static void drawChunkInspector() {
+    if (!g_showChunks) return;
+    static std::vector<ChunkNode> nodes;
+    static size_t builtFor = (size_t)-1;
+    static int sel = -1;
+    if (builtFor != g_scene.raw.size()) {
+        nodes.clear(); sel = -1;
+        if (!g_scene.raw.empty()) map_chunk_outline(g_scene.raw, nodes);
+        builtFor = g_scene.raw.size();
+    }
+    if (ImGui::Begin("Map chunks", &g_showChunks)) {
+        if (nodes.empty()) ImGui::TextDisabled("No .map loaded.");
+        ImGui::TextDisabled("Raw SCEN tree. WTHR (weather/light), CAMS and the water "
+                            "data are not decoded yet — inspect, don't guess.");
+        ImGui::Separator();
+        ImGui::BeginChild("tree", ImVec2(0, 240));
+        for (int i = 0; i < (int)nodes.size(); i++) {
+            const ChunkNode& n = nodes[i];
+            char lbl[160];
+            snprintf(lbl, sizeof(lbl), "%*s%s   @%ld  %ld bytes##ck%d",
+                     n.depth * 2, "", n.tag.c_str(), n.offset, n.size, i);
+            if (ImGui::Selectable(lbl, sel == i)) sel = i;
+        }
+        ImGui::EndChild();
+        if (sel >= 0 && sel < (int)nodes.size() && !g_scene.raw.empty()) {
+            const ChunkNode& n = nodes[sel];
+            ImGui::SeparatorText(n.tag.c_str());
+            long start = n.offset + 8;
+            long len = n.size < 256 ? n.size : 256;
+            ImGui::TextDisabled("first %ld bytes of payload", len);
+            ImGui::BeginChild("hex", ImVec2(0, 160), ImGuiChildFlags_None,
+                              ImGuiWindowFlags_HorizontalScrollbar);
+            for (long r = 0; r < len; r += 16) {
+                char line[128]; int p = snprintf(line, sizeof(line), "%06lX  ", start + r);
+                for (long c = 0; c < 16 && r + c < len; c++) {
+                    long o = start + r + c;
+                    if (o >= 0 && o < (long)g_scene.raw.size())
+                        p += snprintf(line + p, sizeof(line) - p, "%02X ", g_scene.raw[o]);
+                }
+                ImGui::TextUnformatted(line);
+            }
+            ImGui::EndChild();
+        }
     }
     ImGui::End();
 }
@@ -1392,12 +1507,21 @@ static bool terrainHit(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
     return true;
 }
 
-// Raise/Lower/Smooth the heightmap around (cx,cy) with radial falloff.
-static void applyTerrainBrush(float cx, float cy, int tool) {
+// Sculpt the heightmap around (cx,cy) with a radial falloff. `invert` (Ctrl) flips
+// raise<->lower and raise-to-plane<->lower-to-plane. `drag` carries the vertical
+// mouse motion for the Grab tool. The "plane" tools all work against the panel's
+// Height slider, which is what makes it a target altitude rather than dead UI.
+static void applyTerrainBrush(float cx, float cy, int tool, bool invert, float drag) {
     int W = g_scene.grid_w, H = g_scene.grid_h;
     if (W < 2 || H < 2 || (int)g_scene.heights.size() != W * H) return;
     float radius = g_brushSize * 4.0f;
     float strength = (g_brushPress * 1.8f + 0.2f);
+    const float plane = g_brushHeight;
+    if (invert) {
+        if (tool == TT_RAISE) tool = TT_LOWER; else if (tool == TT_LOWER) tool = TT_RAISE;
+        else if (tool == TT_RAISE_TO_PLANE) tool = TT_LOWER_TO_PLANE;
+        else if (tool == TT_LOWER_TO_PLANE) tool = TT_RAISE_TO_PLANE;
+    }
     int i0 = std::max(0, (int)(cx - radius)), i1 = std::min(W - 1, (int)(cx + radius));
     int j0 = std::max(0, (int)(cy - radius)), j1 = std::min(H - 1, (int)(cy + radius));
     std::vector<float>& h = g_scene.heights;
@@ -1408,15 +1532,74 @@ static void applyTerrainBrush(float cx, float cy, int tool) {
         float w = 1.0f - r / radius; w *= w;
         size_t gi = (size_t)j * W + i;
         g_scene.heightDirty[gi] = 1;
-        if (tool == 1)      h[gi] += strength * w;              // Raise
-        else if (tool == 2) h[gi] -= strength * w;              // Lower
-        else {                                                  // Smooth
-            float a = (h[(size_t)j*W + std::max(0,i-1)] + h[(size_t)j*W + std::min(W-1,i+1)] +
-                       h[(size_t)std::max(0,j-1)*W + i] + h[(size_t)std::min(H-1,j+1)*W + i]) * 0.25f;
-            h[gi] += (a - h[gi]) * w * 0.5f;
+        switch (tool) {
+            case TT_GRAB:  h[gi] += drag * w; break;
+            case TT_RAISE: h[gi] += strength * w; break;
+            case TT_LOWER: h[gi] -= strength * w; break;
+            case TT_SETPLANE:                       // ease toward the target altitude
+                h[gi] += (plane - h[gi]) * w * (g_brushPress * 0.9f + 0.1f);
+                break;
+            case TT_RAISE_TO_PLANE:                 // raise, but never past the plane
+                if (h[gi] < plane) h[gi] = std::min(plane, h[gi] + strength * w);
+                break;
+            case TT_LOWER_TO_PLANE:                 // lower, but never past the plane
+                if (h[gi] > plane) h[gi] = std::max(plane, h[gi] - strength * w);
+                break;
+            default: {                              // Smooth
+                float a = (h[(size_t)j*W + std::max(0,i-1)] + h[(size_t)j*W + std::min(W-1,i+1)] +
+                           h[(size_t)std::max(0,j-1)*W + i] + h[(size_t)std::min(H-1,j+1)*W + i]) * 0.25f;
+                h[gi] += (a - h[gi]) * w * 0.5f;
+                break;
+            }
         }
     }
     g_scene.terrainEdited = true; g_terrainDirty = true;
+}
+
+// --- splat layer painting ----------------------------------------------------
+// GTRD stores one uint8 opacity grid per layer, composited in file order over the
+// first active layer. Painting layer L therefore means raising L's own opacity AND
+// clearing the layers drawn ON TOP of it, or the paint stays hidden. All of it is
+// size-preserving (the grids are fixed-size), so the save stays byte-faithful.
+
+static void ensureSplatDirty() {
+    size_t n = (size_t)g_scene.grid_w * g_scene.grid_h;
+    if (g_scene.splatDirty.size() != g_scene.splatWeights.size()) {
+        g_scene.splatDirty.assign(g_scene.splatWeights.size(), std::vector<unsigned char>());
+        for (auto& d : g_scene.splatDirty) d.assign(n, 0);
+    }
+}
+static void applySplatBrush(float cx, float cy, bool fill, bool erase) {
+    int W = g_scene.grid_w, H = g_scene.grid_h;
+    if (W < 2 || H < 2) return;
+    if (g_paintLayer < 0 || g_paintLayer >= (int)g_scene.splatWeights.size()) return;
+    if (g_scene.splatOff < 0) return;                       // nowhere to write it back
+    ensureSplatDirty();
+    float radius = g_brushSize * 4.0f;
+    float rate = fill ? 1.0f : (g_brushPress * 0.5f + 0.05f);
+    int i0 = std::max(0, (int)(cx - radius)), i1 = std::min(W - 1, (int)(cx + radius));
+    int j0 = std::max(0, (int)(cy - radius)), j1 = std::min(H - 1, (int)(cy + radius));
+    for (int j = j0; j <= j1; j++) for (int i = i0; i <= i1; i++) {
+        float dx = i - cx, dy = j - cy, r = std::sqrt(dx*dx + dy*dy);
+        if (r > radius) continue;
+        float w = fill ? 1.0f : (1.0f - r / radius);
+        size_t gi = (size_t)j * W + i;
+        auto blend = [&](int layer, float target) {
+            if (layer < 0 || layer >= (int)g_scene.splatWeights.size()) return;
+            auto& g = g_scene.splatWeights[layer];
+            if (gi >= g.size()) return;
+            float cur = g[gi] / 255.0f;
+            float nv = cur + (target - cur) * w * rate;
+            unsigned char b = (unsigned char)(std::min(1.0f, std::max(0.0f, nv)) * 255.0f + 0.5f);
+            if (b != g[gi]) { g[gi] = b; g_scene.splatDirty[layer][gi] = 1; }
+        };
+        blend(g_paintLayer, erase ? 0.0f : 1.0f);
+        if (!erase)                                  // uncover it: clear what is on top
+            for (int L = g_paintLayer + 1; L < (int)g_scene.splatWeights.size(); L++)
+                if (g_scene.terrainLayers.size() > (size_t)L && g_scene.terrainLayers[L].active)
+                    blend(L, 0.0f);
+    }
+    g_scene.splatEdited = true; g_splatTexDirty = true;
 }
 
 // Nearest entity to a screen point (by projected origin, within a pixel radius),
@@ -1664,9 +1847,9 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
             g_cam.target = g_cam.target + (gp - g_cam.target) * f;
         }
     }
-    // Terrain mode + a brush tool (Raise/Lower/Smooth) => left-drag brushes the
-    // heightmap instead of selecting entities.
-    bool brushing = (g_mode == 0 && (g_activeTool == 1 || g_activeTool == 2 || g_activeTool == 6));
+    // Terrain mode + a sculpt or paint tool => left-drag brushes the terrain
+    // instead of selecting entities.
+    bool brushing = (g_mode == 0 && (toolIsHeight(g_activeTool) || toolIsPaint(g_activeTool)));
     // Brush cursor ring: show the terrain area the brush covers whenever hovering
     // in Vertex/Terrain mode (any tool), matching applyTerrainBrush's radius.
     {
@@ -1685,9 +1868,20 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         }
     }
     if (over && brushing && ImGui::IsMouseDown(0)) {
-        if (!g_strokeActive) { g_strokeH0 = g_scene.heights; g_strokeActive = true; }
         float gx, gy;
-        if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) applyTerrainBrush(gx, gy, g_activeTool);
+        if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
+            if (toolIsPaint(g_activeTool)) {
+                // Blend eases the active layer in; TileFill slams it to full opacity.
+                // Ctrl erases instead of painting.
+                applySplatBrush(gx, gy, g_activeTool == TT_TILEFILL, io.KeyCtrl);
+            } else {
+                if (!g_strokeActive) { g_strokeH0 = g_scene.heights; g_strokeActive = true; }
+                // Grab drags the surface with vertical mouse motion; the others use
+                // the panel's strength/height. Ctrl inverts raise<->lower.
+                float drag = -io.MouseDelta.y * 0.25f;
+                applyTerrainBrush(gx, gy, g_activeTool, io.KeyCtrl, drag);
+            }
+        }
         return;   // don't pick/move entities while brushing
     }
     // Place-on-click: with a browser prototype selected and the Place tool active
@@ -1777,6 +1971,49 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         if (!c.cells.empty()) pushCmd(std::move(c));
         g_strokeActive = false; g_strokeH0.clear();
     }
+}
+
+// dev: paint a splat cell, save, reload; only that byte may change, and the layer
+// grids must be located where we think they are.
+static int splatTest(const char* mapPath, const char* outPath) {
+    Scene s;
+    if (!load_map_native(mapPath, s)) { printf("splattest: load failed\n"); return 2; }
+    if (s.splatOff < 0 || s.splatWeights.empty()) { printf("splattest: no splat grids\n"); return 2; }
+    size_t need = (size_t)s.grid_w * s.grid_h;
+    // pick an overlay layer (not the base) with a full-size grid
+    int layer = -1;
+    for (size_t L = 1; L < s.splatWeights.size(); L++)
+        if (s.splatWeights[L].size() == need &&
+            L < s.terrainLayers.size() && s.terrainLayers[L].active) { layer = (int)L; break; }
+    if (layer < 0) { printf("splattest: no paintable overlay layer\n"); return 2; }
+    size_t cell = need / 2;
+    unsigned char before = s.splatWeights[layer][cell];
+    unsigned char want = (unsigned char)(before ^ 0xFF);
+    long expectOff = s.splatOff + (long)(layer * need + cell);
+    printf("splattest layer %d '%s' cell %zu  %u -> %u  (offset %ld)\n",
+           layer, s.terrainLayers[layer].path.c_str(), cell, before, want, expectOff);
+
+    s.splatDirty.assign(s.splatWeights.size(), std::vector<unsigned char>());
+    for (auto& d : s.splatDirty) d.assign(need, 0);
+    s.splatWeights[layer][cell] = want;
+    s.splatDirty[layer][cell] = 1;
+    s.splatEdited = true;
+
+    std::vector<unsigned char> bytes = s.raw;
+    apply_edits_inplace(s, {}, bytes);
+    int diff = 0, outside = 0;
+    for (size_t i = 0; i < bytes.size(); i++)
+        if (bytes[i] != s.raw[i]) { diff++; if ((long)i != expectOff) outside++; }
+    { std::ofstream f(outPath, std::ios::binary); f.write((const char*)bytes.data(), (std::streamsize)bytes.size()); }
+    Scene s2;
+    if (!load_map_native(outPath, s2)) { printf("splattest: reload failed\n"); return 3; }
+    unsigned char got = (layer < (int)s2.splatWeights.size() && cell < s2.splatWeights[layer].size())
+                      ? s2.splatWeights[layer][cell] : 0;
+    bool ok = diff == 1 && outside == 0 && got == want &&
+              s2.raw.size() == s.raw.size() && s2.splatOff == s.splatOff;
+    printf("splattest bytesChanged=%d outsideCell=%d readback=%u %s\n",
+           diff, outside, got, ok ? "OK" : "FAIL");
+    return ok ? 0 : 3;
 }
 
 // dev: place a prototype the map does NOT already use, by cloning a record of the
@@ -1932,6 +2169,9 @@ int main(int argc, char** argv) {
             std::string tmp = vfs_resolve(argv[i+2], "");
             if (!tmp.empty()) loadPath = tmp;
             i += 2;
+        }
+        else if (!strcmp(argv[i], "--splattest") && i + 2 < argc) {
+            return splatTest(argv[i+1], argv[i+2]);
         }
         else if (!strcmp(argv[i], "--protoplacetest") && i + 3 < argc) {
             return protoPlaceTest(argv[i+1], argv[i+2], argv[i+3]);
@@ -2246,6 +2486,7 @@ int main(int argc, char** argv) {
         drawModePanel();
         drawEntities();
         drawChanges();
+        drawChunkInspector();
         drawProperties();
 
         // central viewport region (empty dock node -> 3D shows through)
@@ -2327,6 +2568,9 @@ int main(int argc, char** argv) {
         }
         if (g_terrainDirty && g_glReady) {  // after a terrain brush stroke
             g_vp.buildTerrain(g_scene); g_terrainDirty = false;
+        }
+        if (g_splatTexDirty && g_glReady) { // after a texture-blend stroke
+            g_vp.refreshSplatWeights(g_scene); g_splatTexDirty = false;
         }
 
         ImGui::Render();

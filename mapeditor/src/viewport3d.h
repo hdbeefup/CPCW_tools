@@ -657,8 +657,31 @@ public:
             glBindTexture(GL_TEXTURE_2D,0);
         };
         up(splatW0,w0); up(splatW1,w1);
+        splatActive = act;
         splatGridInv[0]=1.0f/W; splatGridInv[1]=1.0f/H;
         splatReady = (resolved>0);   // only use textured path if at least one layer resolved
+    }
+    // Re-upload just the two weight textures after painting — the layer .dds files
+    // and the resolve work are unchanged, so a paint stroke costs one upload, not a
+    // full rebuild.
+    void refreshSplatWeights(const Scene& s) {
+        if (!splatReady || splatActive.empty()) return;
+        int W=s.grid_w, H=s.grid_h; if (W<2||H<2) return;
+        size_t need=(size_t)W*H;
+        std::vector<unsigned char> w0(need*4,0), w1(need*4,0);
+        for (int k=0;k<(int)splatActive.size() && k<8;k++){
+            const std::vector<unsigned char>& g = s.splatWeights[splatActive[k]];
+            if (g.size()<need) continue;
+            std::vector<unsigned char>& dst = (k<4)?w0:w1; int ch=k%4;
+            for (size_t gi=0;gi<need;gi++) dst[gi*4+ch]=g[gi];
+        }
+        auto up=[&](GLuint tex, const std::vector<unsigned char>& d){
+            if(!tex) return;
+            glBindTexture(GL_TEXTURE_2D,tex);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,d.data());
+            glBindTexture(GL_TEXTURE_2D,0);
+        };
+        up(splatW0,w0); up(splatW1,w1);
     }
     bool splatIsReady() const { return splatReady; }
 
@@ -1168,6 +1191,7 @@ private:
     int   splatLayerCount=0;
     GLuint splatLayerTex[8]={0}; float splatUv[8]={0}; int splatHasTex[8]={0};
     float splatFallback[24]={0}; GLuint splatW0=0, splatW1=0; float splatGridInv[2]={0,0};
+    std::vector<int> splatActive;   // scene layer index of each packed weight channel
     bool  splatReady=false;
 
     // road/decal overlays
