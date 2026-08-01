@@ -95,6 +95,8 @@ typedef ptrdiff_t GLintptr;
     X(void,   glBindRenderbuffer, (GLenum, GLuint)) \
     X(void,   glRenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) \
     X(void,   glFramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint)) \
+    X(void,   glDeleteFramebuffers, (GLsizei, const GLuint*)) \
+    X(void,   glDeleteRenderbuffers, (GLsizei, const GLuint*)) \
     X(GLenum, glCheckFramebufferStatus, (GLenum))
 
 #define GL_DECL(ret, name, args) typedef ret (APIENTRY *PFN_##name) args; inline PFN_##name name = nullptr;

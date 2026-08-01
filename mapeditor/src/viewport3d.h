@@ -13,6 +13,7 @@
 #include <cctype>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -59,10 +60,11 @@ struct Camera {
         return target + V3{std::cos(pitch)*std::sin(yaw), std::sin(pitch),
                            std::cos(pitch)*std::cos(yaw)} * dist;
     }
-    M4 viewProj(float aspect) const {
-        return mul(perspective(0.9f, aspect, 0.5f, 8000.0f),
-                   lookAt(eye(), target, {0,1,0}));
-    }
+    // Kept separate as well as combined: ImGuizmo wants view and projection as two
+    // column-major float[16]s (the same layout glUniformMatrix4fv takes).
+    M4 view() const { return lookAt(eye(), target, {0,1,0}); }
+    M4 proj(float aspect) const { return perspective(0.9f, aspect, 0.5f, 8000.0f); }
+    M4 viewProj(float aspect) const { return mul(proj(aspect), view()); }
 };
 
 // --------------------------------------------------------------- renderer ----
@@ -205,6 +207,44 @@ public:
         glUniform1i(glGetUniformLocation(terrainTexProg,"uW0"),8);
         glUniform1i(glGetUniformLocation(terrainTexProg,"uW1"),9);
         glUseProgram(0);
+
+        // colour-code pick pass: flat per-entity id, alpha-cut respected so foliage
+        // is picked by its leaves and not by its quad. Shares the model VAO layout
+        // (loc0 pos / loc1 normal / loc2 uv) and the terrain VAO's loc0.
+        pickProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; layout(location=2) in vec2 aUV;\n"
+            "uniform mat4 uMVP; out vec2 vUV;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vUV=aUV; }\n",
+            "#version 330 core\n"
+            "uniform vec3 uCode; uniform sampler2D uTex;\n"
+            "uniform int uAlphaTest; uniform int uHasTex;\n"
+            "in vec2 vUV; out vec4 o;\n"
+            "void main(){\n"
+            "   if(uAlphaTest==1 && uHasTex==1 && texture(uTex,vUV).a < 0.5) discard;\n"
+            "   o = vec4(uCode, 1.0);\n"
+            "}\n");
+        uPkMVP=glGetUniformLocation(pickProg,"uMVP");
+        uPkCode=glGetUniformLocation(pickProg,"uCode");
+        uPkAlphaTest=glGetUniformLocation(pickProg,"uAlphaTest");
+        uPkHasTex=glGetUniformLocation(pickProg,"uHasTex");
+        uPkTex=glGetUniformLocation(pickProg,"uTex");
+        // entity dots in the pick pass: gl_VertexID IS the entity index, so the
+        // code needs no extra vertex attribute. Hidden entities have size 0.
+        pickPointProg = glProgram(
+            "#version 330 core\n"
+            "layout(location=0) in vec3 aPos; layout(location=2) in float aSize;\n"
+            "uniform mat4 uMVP; flat out vec3 vCode;\n"
+            "void main(){\n"
+            "   gl_Position=uMVP*vec4(aPos,1.0);\n"
+            "   gl_PointSize = aSize>0.0 ? aSize+3.0 : 0.0;\n"
+            "   int id = gl_VertexID + 1;\n"
+            "   vCode = vec3(float(id & 255), float((id>>8) & 255), float((id>>16) & 255))/255.0;\n"
+            "}\n",
+            "#version 330 core\n"
+            "flat in vec3 vCode; out vec4 o;\n"
+            "void main(){ o = vec4(vCode, 1.0); }\n");
+        uPpMVP=glGetUniformLocation(pickPointProg,"uMVP");
 
         // road/decal overlays: textured, alpha-blended, terrain-projected
         overlayProg = glProgram(
@@ -788,11 +828,14 @@ public:
             }
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             if (cullMode) glDisable(GL_CULL_FACE);
-            // hover (cyan) + selection (yellow) highlight boxes on model entities
-            if (hovered >= 0 || selected >= 0)
+            // hover (cyan) + selection highlight boxes. The primary selection is
+            // yellow (it is what the Properties panel and the gizmo act on); the
+            // rest of a multi-selection is a dimmer orange.
+            if (hovered >= 0 || selected >= 0 || !selectionSet.empty())
                 for (auto& inst : instances) {
-                    if (inst.entIdx == selected)     drawHiliteBox(mvp, inst, 1.0f, 0.85f, 0.15f);
-                    else if (inst.entIdx == hovered) drawHiliteBox(mvp, inst, 0.30f, 0.90f, 1.0f);
+                    if (inst.entIdx == selected)                 drawHiliteBox(mvp, inst, 1.0f, 0.85f, 0.15f);
+                    else if (selectionSet.count(inst.entIdx))    drawHiliteBox(mvp, inst, 0.95f, 0.55f, 0.12f);
+                    else if (inst.entIdx == hovered)             drawHiliteBox(mvp, inst, 0.30f, 0.90f, 1.0f);
                 }
         }
         if (terrainCount) {
@@ -850,6 +893,12 @@ public:
             glUniform1i(uEntWhite,0); glUniform1f(uEntSize,0.0f);  // 0 => per-vertex size
             glBindVertexArray(entVAO);
             glDrawArrays(GL_POINTS, 0, entCount);
+            if (!selectionSet.empty()) {          // whole selection, incl. model-less
+                glUniform1i(uEntWhite,1); glUniform1f(uEntSize,10.0f);
+                for (int si : selectionSet)
+                    if (si >= 0 && si < entCount && si != selected)
+                        glDrawArrays(GL_POINTS, si, 1);
+            }
             if (selected >= 0 && selected < entCount) {
                 glUniform1i(uEntWhite,1); glUniform1f(uEntSize,13.0f);
                 glDrawArrays(GL_POINTS, selected, 1);
@@ -878,10 +927,145 @@ public:
     int entityCount() const { return entCount; }
     V3 debugEye(const Camera& c) const { return c.eye(); }
 
+    // ---- GPU colour-code picking ---------------------------------------------
+    // Every pickable entity is redrawn into an offscreen buffer flat-shaded with
+    // its own index packed into RGB; reading a pixel back names the entity under
+    // the cursor exactly — occlusion, alpha-cut foliage and overlapping models all
+    // resolve for free, which a projected-AABB test cannot do. Reading a whole
+    // rectangle back and collecting the unique codes gives rubber-band select.
+    // The terrain draws as code 0, so it occludes anything behind it.
+    //
+    // This runs on demand (click / marquee), not every frame: doubling the model
+    // pass on a 3400-entity map is not worth it for the hover highlight, which
+    // keeps using the cheap CPU AABB test in pickModel().
+    bool pickPassReady() const { return pickProg != 0; }
+
+    // World-space AABB centre + radius of every model instance. Used by the
+    // --picktest harness to verify the colour-code buffer without a mouse.
+    struct InstProbe { int entIdx; V3 center; float radius; };
+    void instanceProbes(std::vector<InstProbe>& out) const {
+        out.clear(); out.reserve(instances.size());
+        for (const auto& inst : instances) {
+            V3 lo = inst.model->bmin, hi = inst.model->bmax;
+            if (lo.x > hi.x) continue;
+            V3 c{ (lo.x+hi.x)*0.5f, (lo.y+hi.y)*0.5f, (lo.z+hi.z)*0.5f };
+            const float* m = inst.xf.m;
+            V3 w{ m[0]*c.x + m[4]*c.y + m[8]*c.z + m[12],
+                  m[1]*c.x + m[5]*c.y + m[9]*c.z + m[13],
+                  m[2]*c.x + m[6]*c.y + m[10]*c.z + m[14] };
+            float ex = (hi.x-lo.x)*0.5f, ey = (hi.y-lo.y)*0.5f, ez = (hi.z-lo.z)*0.5f;
+            float sc = std::sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);   // uniform scale
+            out.push_back({ inst.entIdx, w, std::sqrt(ex*ex+ey*ey+ez*ez) * (sc>0?sc:1.0f) });
+        }
+    }
+
+    void renderPickBuffer(const Camera& cam, int w, int h, bool showModels, bool showDots) {
+        if (w < 1 || h < 1 || !pickProg) return;
+        ensurePickTarget(w, h);
+        if (!pickFBO) return;
+        GLint prevFBO = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prevFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, pickFBO);
+        glViewport(0, 0, w, h);
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE);
+        glClearColor(0, 0, 0, 1);                     // 0 = nothing / terrain
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        M4 mvp = cam.viewProj((float)w / (float)h);
+
+        // terrain first, as code 0 — it must occlude entities behind hills
+        if (terrainCount) {
+            glUseProgram(pickProg);
+            glUniformMatrix4fv(uPkMVP, 1, GL_FALSE, mvp.m);
+            float zero[3] = {0, 0, 0};
+            glUniform3fv(uPkCode, 1, zero);
+            glUniform1i(uPkAlphaTest, 0); glUniform1i(uPkHasTex, 0);
+            glBindVertexArray(terrainVAO);
+            glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
+        }
+        if (showModels) {
+            glUseProgram(pickProg);
+            glActiveTexture(GL_TEXTURE0);
+            glUniform1i(uPkTex, 0);
+            for (auto& inst : instances) {
+                if (inst.entIdx < 0) continue;
+                M4 xf = flipModelX ? mul(inst.xf, scaleM(-1,1,1)) : inst.xf;
+                M4 mvpM = mul(mvp, xf);
+                glUniformMatrix4fv(uPkMVP, 1, GL_FALSE, mvpM.m);
+                float code[3]; codeOf(inst.entIdx, code);
+                glUniform3fv(uPkCode, 1, code);
+                glBindVertexArray(inst.model->vao);
+                for (auto& part : inst.model->parts) {
+                    glUniform1i(uPkAlphaTest, part.alphaTest ? 1 : 0);
+                    glUniform1i(uPkHasTex, part.tex ? 1 : 0);
+                    if (part.tex) glBindTexture(GL_TEXTURE_2D, part.tex);
+                    glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT,
+                                   (void*)(size_t)(part.off * sizeof(unsigned)));
+                }
+            }
+        }
+        // entity dots: entities with no model are only pickable this way. gl_VertexID
+        // is the entity index, so the code needs no per-point attribute.
+        if (showDots && entCount && pickPointProg) {
+            glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+            glUseProgram(pickPointProg);
+            glUniformMatrix4fv(uPpMVP, 1, GL_FALSE, mvp.m);
+            glBindVertexArray(entVAO);
+            glDrawArrays(GL_POINTS, 0, entCount);
+        }
+        glBindVertexArray(0); glUseProgram(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFBO);
+    }
+
+    // Entity index under buffer pixel (px, py) — origin bottom-left, i.e. already
+    // flipped from ImGui's top-left screen space. -1 = terrain / empty.
+    int pickBufferAt(int px, int py) const {
+        if (!pickFBO || px < 0 || py < 0 || px >= pickW || py >= pickH) return -1;
+        GLint prevFBO = 0; glGetIntegerv(0x8CA6, &prevFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, pickFBO);
+        unsigned char px4[4] = {0,0,0,0};
+        glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px4);
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFBO);
+        return decodeCode(px4);
+    }
+
+    // Raw RGB copy of the pick buffer (debug: dump it and look at it).
+    bool readPickBufferRGB(std::vector<unsigned char>& rgb, int& w, int& h) const {
+        if (!pickFBO) return false;
+        w = pickW; h = pickH;
+        rgb.assign((size_t)w * h * 3, 0);
+        GLint prevFBO = 0; glGetIntegerv(0x8CA6, &prevFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, pickFBO);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFBO);
+        return true;
+    }
+
+    // Unique entity indices covered by a buffer-space rectangle.
+    void pickBufferRect(int x, int y, int w, int h, std::vector<int>& out) const {
+        out.clear();
+        if (!pickFBO || w < 1 || h < 1) return;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > pickW) w = pickW - x;
+        if (y + h > pickH) h = pickH - y;
+        if (w < 1 || h < 1) return;
+        GLint prevFBO = 0; glGetIntegerv(0x8CA6, &prevFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, pickFBO);
+        std::vector<unsigned char> buf((size_t)w * h * 4);
+        glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFBO);
+        std::set<int> uniq;
+        for (size_t i = 0; i + 3 < buf.size(); i += 4) {
+            int id = decodeCode(&buf[i]);
+            if (id >= 0) uniq.insert(id);
+        }
+        out.assign(uniq.begin(), uniq.end());
+    }
+
     // Pick the model instance under screen point mp: the one nearest the camera
-    // whose projected AABB contains the point. Returns entIdx (-1 if none). Uses
-    // the whole model footprint so big models are clickable anywhere on their body,
-    // not just near their origin (which the dot-based pickEntity required).
+    // whose projected AABB contains the point. Returns entIdx (-1 if none). Cheap
+    // and approximate — used for the per-frame hover highlight. Click selection
+    // goes through the exact colour-code buffer above.
     int pickModel(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
                   const Camera& cam) const {
         float W = cmax.x-cmin.x, H = cmax.y-cmin.y;
@@ -922,6 +1106,46 @@ public:
     }
 
 private:
+    // ---- colour-code pick target --------------------------------------------
+    static void codeOf(int entIdx, float out[3]) {
+        unsigned id = (unsigned)entIdx + 1;             // 0 is reserved for "nothing"
+        out[0] = ( id        & 0xFF) / 255.0f;
+        out[1] = ((id >> 8)  & 0xFF) / 255.0f;
+        out[2] = ((id >> 16) & 0xFF) / 255.0f;
+    }
+    static int decodeCode(const unsigned char* rgba) {
+        unsigned id = (unsigned)rgba[0] | ((unsigned)rgba[1] << 8) | ((unsigned)rgba[2] << 16);
+        return id ? (int)id - 1 : -1;
+    }
+    void ensurePickTarget(int w, int h) {
+        if (pickFBO && w == pickW && h == pickH) return;
+        if (pickTex)   { glDeleteTextures(1, &pickTex); pickTex = 0; }
+        if (pickDepth) { glDeleteRenderbuffers(1, &pickDepth); pickDepth = 0; }
+        if (pickFBO)   { glDeleteFramebuffers(1, &pickFBO); pickFBO = 0; }
+        pickW = w; pickH = h;
+        glGenFramebuffers(1, &pickFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, pickFBO);
+        glGenTextures(1, &pickTex);
+        glBindTexture(GL_TEXTURE_2D, pickTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        // NEAREST: the code must never be filtered/interpolated into a wrong id
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pickTex, 0);
+        glGenRenderbuffers(1, &pickDepth);
+        glBindRenderbuffer(GL_RENDERBUFFER, pickDepth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, pickDepth);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            fprintf(stderr, "pick FBO incomplete (%dx%d) — click select falls back to AABB\n", w, h);
+            glDeleteFramebuffers(1, &pickFBO); pickFBO = 0;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    GLuint pickProg=0, pickPointProg=0, pickFBO=0, pickTex=0, pickDepth=0;
+    GLint uPkMVP=-1, uPkCode=-1, uPkAlphaTest=-1, uPkHasTex=-1, uPkTex=-1, uPpMVP=-1;
+    int pickW=0, pickH=0;
+
     std::map<std::string, GLModel> modelCache;
     std::vector<ModelInst> instances;
     GLuint modelProg=0;
@@ -983,4 +1207,5 @@ public:
     // hides the hull interior. Toggle: View>Model cull, or key C.
     int   cullMode=1;
     bool  flipModelX=false;       // reflect models in local X (mirror-text experiment, key X)
+    std::set<int> selectionSet;   // every selected entity index (primary passed to render)
 };

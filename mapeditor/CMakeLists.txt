@@ -21,6 +21,16 @@ FetchContent_Declare(imgui
     GIT_TAG docking)
 FetchContent_MakeAvailable(imgui)
 
+# --- ImGuizmo (3D translate/rotate handles) ----------------------------------
+# ImGuizmo ships a CMakeLists that also builds GraphEditor/ImSequencer/... which
+# we don't want; SOURCE_SUBDIR points at a directory with no CMakeLists so this
+# is a download-only dependency and we compile the one file we need into `imgui`.
+FetchContent_Declare(imguizmo
+    GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
+    GIT_TAG master
+    SOURCE_SUBDIR do-not-configure)
+FetchContent_MakeAvailable(imguizmo)
+
 # --- nlohmann/json (scene bridge; header-only) ------------------------------
 FetchContent_Declare(json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
@@ -40,9 +50,10 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+    ${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp
 )
 target_include_directories(imgui PUBLIC
-    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends ${imguizmo_SOURCE_DIR}/src)
 target_link_libraries(imgui PUBLIC glfw)
 
 # --- editor ------------------------------------------------------------------

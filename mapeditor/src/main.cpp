@@ -27,6 +27,7 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F   // GL 1.2; absent from the ancient Windows gl.h
 #endif
+#include <ImGuizmo.h>
 #include <nlohmann/json.hpp>
 #include <iterator>
 #include <algorithm>
@@ -88,18 +89,43 @@ static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
 static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
 
+// Before-and-after state of one entity, for batched undo (gizmo, group ops).
+struct EntSnap { long id = 0; float pos0[3]{}, pos1[3]{}; float dir0 = 0, dir1 = 0; };
+
+// --- selection ---------------------------------------------------------------
+// g_selected is the PRIMARY selection (what Properties edits and what the gizmo
+// pivots on when it is the only one); g_selection is the full set.
+static std::set<int> g_selection;
+// --- gizmo / snapping --------------------------------------------------------
+static bool  g_gizmoOn = true;
+static int   g_gizmoOp = 0;               // 0 translate, 1 rotate (yaw only)
+static bool  g_gizmoLocal = false;        // world vs local axes
+static bool  g_snapOn = false;            // held Shift also forces snapping on
+static float g_snapGrid = 1.0f, g_snapAngle = 15.0f;
+static bool  g_gizmoDragging = false;
+// Set once per frame by drawGizmo. Don't call ImGuizmo::IsOver() directly from the
+// input code: when no gizmo was drawn this frame it answers from stale state.
+static bool  g_gizmoHot = false;
+static float g_gizmoMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+static float g_gizmoPivot0[3] = {0,0,0};  // pivot when the drag began (GL world)
+static std::vector<EntSnap> g_gizmoStart; // per-entity state when the drag began
+// --- rubber-band select ------------------------------------------------------
+static bool   g_marquee = false;
+static ImVec2 g_marqueeA{0,0};
+
 // --- undo/redo -------------------------------------------------------------
 // Commands are keyed by entity ID, never by index: a structural insert/delete
 // renumbers every later index, so an index-keyed stack would undo onto the wrong
 // entity. Structural commands carry the exact OBJT bytes, so both directions are
 // byte-exact.
-enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE };
+enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH };
 struct EditCmd {
     int  kind = CMD_ENTITY;
     long entId = 0;
     float pos0[3]{}, pos1[3]{}; float dir0 = 0, dir1 = 0; int pl0 = 0, pl1 = 0;
     std::vector<int> cells; std::vector<float> h0, h1;   // CMD_TERRAIN
     std::vector<unsigned char> objt; int entIndex = -1;  // CMD_ADD / CMD_DELETE
+    std::vector<EntSnap> ents;                           // CMD_BATCH (gizmo, group ops)
 };
 static std::vector<EditCmd> g_undo, g_redo;
 static bool g_snapActive = false; static EditCmd g_snap;   // pending entity snapshot
@@ -116,6 +142,42 @@ static int entityIndexById(long id) {
         if (g_scene.entities[i].id == id) return i;
     return -1;
 }
+
+// --- selection helpers -------------------------------------------------------
+static void syncSelection() { g_vp.selectionSet = g_selection; }
+static void selectNone() { g_selection.clear(); g_selected = -1; syncSelection(); }
+static void selectOnly(int idx) {
+    g_selection.clear();
+    if (idx >= 0) g_selection.insert(idx);
+    g_selected = idx; syncSelection();
+}
+static void selectToggle(int idx) {
+    if (idx < 0) return;
+    if (g_selection.count(idx)) {
+        g_selection.erase(idx);
+        if (g_selected == idx) g_selected = g_selection.empty() ? -1 : *g_selection.begin();
+    } else {
+        g_selection.insert(idx); g_selected = idx;
+    }
+    syncSelection();
+}
+static void selectAdd(const std::vector<int>& idxs, bool replace) {
+    if (replace) g_selection.clear();
+    for (int i : idxs)
+        if (i >= 0 && i < (int)g_scene.entities.size()) g_selection.insert(i);
+    if (g_selected < 0 || !g_selection.count(g_selected))
+        g_selected = g_selection.empty() ? -1 : *g_selection.begin();
+    syncSelection();
+}
+static void selectAllVisible() {
+    g_selection.clear();
+    for (int i = 0; i < (int)g_scene.entities.size(); i++) {
+        const Entity& e = g_scene.entities[i];
+        if (g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2]) g_selection.insert(i);
+    }
+    g_selected = g_selection.empty() ? -1 : *g_selection.begin();
+    syncSelection();
+}
 // Flush every pending in-memory field edit into Scene::raw. MUST run before any
 // structural edit — those rewrite the byte buffer, and anything not yet in it is
 // lost (this was a silent data-loss bug: place one object, lose ten moves).
@@ -129,7 +191,7 @@ static void flushEditsToRaw() {
 // ID and mark only the entity/model buffers dirty (terrain and overlays are
 // untouched by an entity insert/erase).
 static void afterStructural(long selectId) {
-    g_selected = selectId >= 0 ? entityIndexById(selectId) : -1;
+    selectOnly(selectId >= 0 ? entityIndexById(selectId) : -1);
     g_hovered = -1;
     g_entDirty = true; g_modelsDirty = true;
 }
@@ -142,6 +204,18 @@ static void applyCmd(const EditCmd& c, bool useNew) {
         g_scene.terrainEdited = true; g_terrainDirty = true;
         if (g_scene.heightDirty.size() == g_scene.heights.size())
             for (int ci : c.cells) g_scene.heightDirty[ci] = 1;
+        return;
+    }
+    if (c.kind == CMD_BATCH) {
+        for (const EntSnap& es : c.ents) {
+            int i = entityIndexById(es.id);
+            if (i < 0) continue;
+            Entity& e = g_scene.entities[i];
+            for (int k = 0; k < 3; k++) e.pos[k] = useNew ? es.pos1[k] : es.pos0[k];
+            e.dir = useNew ? es.dir1 : es.dir0;
+            g_edited.insert(e.id);
+        }
+        g_entDirty = true; g_modelsDirty = true;
         return;
     }
     if (c.kind == CMD_ADD || c.kind == CMD_DELETE) {
@@ -343,6 +417,7 @@ static bool parseScene(const std::string& txt, const std::string& baseDir, Scene
 }
 
 static void resetThumbCache();   // defined below; clears the prototype-thumb GL cache
+static void groundSelection();   // defined below; drops the selection onto the heightmap
 
 // Load a scene. `preserveView` keeps the current camera + data root (used when
 // reloading the temp work-map after a structural edit, so the view doesn't jump
@@ -363,7 +438,9 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
             return false;
         }
     }
-    g_scene = std::move(s); g_selected = -1; g_hovered = -1; g_sceneDirty = true;
+    g_scene = std::move(s); g_hovered = -1; g_sceneDirty = true;
+    g_selection.clear(); g_selected = -1; syncSelection();
+    g_gizmoDragging = false; g_gizmoStart.clear(); g_marquee = false;
     g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
     if (!preserveView)
         g_dataRoot = g_srcMap.empty() ? std::string() : findDataRoot(g_srcMap);
@@ -377,7 +454,7 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     if (!preserveView) snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
     if (selectId >= 0)
         for (int i = 0; i < (int)g_scene.entities.size(); i++)
-            if (g_scene.entities[i].id == selectId) { g_selected = i; break; }
+            if (g_scene.entities[i].id == selectId) { selectOnly(i); break; }
     if (preserveView) return true;   // keep camera; skip the reframe below
     // frame the camera on the loaded terrain
     float W = g_scene.world_w > 0 ? (float)g_scene.world_w : 512.0f;
@@ -692,6 +769,10 @@ static void drawMenuBar() {
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !g_redo.empty())) redoEdit();
         ImGui::Separator();
         bool hasSel = g_selected >= 0 && g_selected < (int)g_scene.entities.size();
+        if (ImGui::MenuItem("Select all", "Ctrl+A", false, g_scene.loaded)) selectAllVisible();
+        if (ImGui::MenuItem("Select none", "Ctrl+Shift+A", false, !g_selection.empty())) selectNone();
+        if (ImGui::MenuItem("Drop to ground", "G", false, !g_selection.empty())) groundSelection();
+        ImGui::Separator();
         if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, hasSel)) {
             const Entity& e = g_scene.entities[g_selected];
             float p[3] = { e.pos[0] + 8.0f, e.pos[1] + 8.0f, e.pos[2] };
@@ -727,6 +808,24 @@ static void drawMenuBar() {
             ImGui::EndMenu();
         }
         ImGui::MenuItem("Flip model X (debug)", "X", &g_vp.flipModelX);   // mirror now baked in
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Transform")) {
+        ImGui::MenuItem("Show gizmo", "T", &g_gizmoOn);
+        if (ImGui::MenuItem("Translate", "R toggles", g_gizmoOp == 0)) g_gizmoOp = 0;
+        if (ImGui::MenuItem("Rotate (yaw)", "R toggles", g_gizmoOp == 1)) g_gizmoOp = 1;
+        ImGui::Separator();
+        if (ImGui::MenuItem("World axes", nullptr, !g_gizmoLocal)) g_gizmoLocal = false;
+        if (ImGui::MenuItem("Local axes", nullptr, g_gizmoLocal)) g_gizmoLocal = true;
+        ImGui::Separator();
+        ImGui::MenuItem("Snap (hold Shift)", nullptr, &g_snapOn);
+        ImGui::SetNextItemWidth(120);
+        ImGui::DragFloat("Grid step", &g_snapGrid, 0.1f, 0.1f, 64.0f, "%.2f");
+        ImGui::SetNextItemWidth(120);
+        ImGui::DragFloat("Angle step", &g_snapAngle, 1.0f, 1.0f, 90.0f, "%.0f deg");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Drop selection to ground", "G", false, !g_selection.empty()))
+            groundSelection();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Mode")) {
@@ -861,7 +960,15 @@ static void drawEntities() {
                 char lbl[160];
                 snprintf(lbl, sizeof(lbl), "%ld  %s  p%d##e%d", e.id, e.type.c_str(), e.player, i);
                 ImGui::PushStyleColor(ImGuiCol_Text, playerColor(e.player));
-                if (ImGui::Selectable(lbl, g_selected == i)) g_selected = i;
+                if (ImGui::Selectable(lbl, g_selection.count(i) != 0)) {
+                    ImGuiIO& lio = ImGui::GetIO();
+                    if (lio.KeyCtrl) selectToggle(i);
+                    else if (lio.KeyShift && g_selected >= 0) {   // range-add
+                        int a = std::min(g_selected, i), b = std::max(g_selected, i);
+                        for (int k = a; k <= b; k++) g_selection.insert(k);
+                        g_selected = i; syncSelection();
+                    } else selectOnly(i);
+                }
                 ImGui::PopStyleColor();
             }
     }
@@ -995,16 +1102,179 @@ static int pickEntity(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax) 
 
 // Pick under the cursor: prefer a real model footprint (easy to click big models),
 // fall back to the projected-origin dot pick for model-less entities (effects).
+// Approximate but cheap — this is the per-frame hover path.
 static int pickAny(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax) {
     int mi = g_vp.pickModel(mp, cmin, cmax, g_cam);
     if (mi >= 0) return mi;
     return pickEntity(mp, cmin, cmax);
 }
 
+// ImGui screen point -> pick-buffer pixel (buffer origin is bottom-left).
+static void screenToPickBuffer(const ImVec2& p, const ImVec2& cmin, const ImVec2& cmax,
+                               int& bx, int& by) {
+    ImGuiIO& io = ImGui::GetIO();
+    float sx = io.DisplaySize.x > 0 ? io.DisplayFramebufferScale.x : 1.0f;
+    float sy = io.DisplaySize.y > 0 ? io.DisplayFramebufferScale.y : 1.0f;
+    if (sx <= 0) sx = 1.0f; if (sy <= 0) sy = 1.0f;
+    bx = (int)((p.x - cmin.x) * sx);
+    by = (int)((cmax.y - p.y) * sy);
+}
+static void pickBufferSize(const ImVec2& cmin, const ImVec2& cmax, int& w, int& h) {
+    ImGuiIO& io = ImGui::GetIO();
+    float sx = io.DisplayFramebufferScale.x > 0 ? io.DisplayFramebufferScale.x : 1.0f;
+    float sy = io.DisplayFramebufferScale.y > 0 ? io.DisplayFramebufferScale.y : 1.0f;
+    w = (int)((cmax.x - cmin.x) * sx);
+    h = (int)((cmax.y - cmin.y) * sy);
+}
+
+// Exact pick under the cursor via the colour-code buffer (occlusion- and
+// alpha-cut-correct). Falls back to the AABB test if the FBO is unavailable.
+static int pickExact(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax) {
+    int w, h; pickBufferSize(cmin, cmax, w, h);
+    if (!g_vp.pickPassReady() || w < 1 || h < 1) return pickAny(mp, cmin, cmax);
+    g_vp.renderPickBuffer(g_cam, w, h, g_showModels, g_showDots);
+    int bx, by; screenToPickBuffer(mp, cmin, cmax, bx, by);
+    int id = g_vp.pickBufferAt(bx, by);
+    if (id >= 0 && id < (int)g_scene.entities.size()) {
+        const Entity& e = g_scene.entities[id];
+        if (!g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2]) return -1;
+    }
+    return id;
+}
+
+// Commit whatever the gizmo (or any group move) changed as ONE undo command.
+static void commitBatch(std::vector<EntSnap>& start) {
+    EditCmd c; c.kind = CMD_BATCH;
+    for (EntSnap& s : start) {
+        int i = entityIndexById(s.id);
+        if (i < 0) continue;
+        const Entity& e = g_scene.entities[i];
+        bool moved = e.dir != s.dir0;
+        for (int k = 0; k < 3; k++) { s.pos1[k] = e.pos[k]; if (e.pos[k] != s.pos0[k]) moved = true; }
+        s.dir1 = e.dir;
+        if (moved) c.ents.push_back(s);
+    }
+    if (!c.ents.empty()) pushCmd(std::move(c));
+    start.clear();
+}
+
+// 3D translate/rotate handles over the whole selection (ImGuizmo). Runs BEFORE
+// updateCamera each frame so IsOver()/IsUsing() can gate viewport input — a click
+// on a handle must not also pick or orbit.
+static void drawGizmo(const ImVec2& cmin, const ImVec2& cmax) {
+    g_gizmoHot = false;
+    if (!g_gizmoOn || !g_scene.loaded || g_selection.empty()) {
+        if (g_gizmoDragging) { commitBatch(g_gizmoStart); g_gizmoDragging = false; }
+        return;
+    }
+    float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
+    if (W <= 1 || H <= 1) return;
+    ImGuizmo::SetOrthographic(false);
+    ImGuizmo::SetDrawlist(ImGui::GetForegroundDrawList());
+    ImGuizmo::SetRect(cmin.x, cmin.y, W, H);
+    M4 view = g_cam.view(), proj = g_cam.proj(W / H);
+
+    // pivot = centroid of the selection, in GL world space {x, elevation, mapY}
+    float px = 0, py = 0, pz = 0; int n = 0;
+    for (int i : g_selection) {
+        if (i < 0 || i >= (int)g_scene.entities.size()) continue;
+        const Entity& e = g_scene.entities[i];
+        px += e.pos[0]; py += e.pos[2]; pz += e.pos[1]; n++;
+    }
+    if (n == 0) return;
+    px /= n; py /= n; pz /= n;
+    if (!g_gizmoDragging) {
+        float m[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, px,py,pz,1};
+        memcpy(g_gizmoMat, m, sizeof(m));
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    bool snap = g_snapOn || io.KeyShift;
+    float snapT[3] = { g_snapGrid, g_snapGrid, g_snapGrid };
+    float snapR[3] = { g_snapAngle, g_snapAngle, g_snapAngle };
+    ImGuizmo::OPERATION op = (g_gizmoOp == 0) ? ImGuizmo::TRANSLATE : ImGuizmo::ROTATE_Y;
+    ImGuizmo::MODE mode = g_gizmoLocal ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
+    ImGuizmo::Manipulate(view.m, proj.m, op, mode, g_gizmoMat, nullptr,
+                         snap ? (g_gizmoOp == 0 ? snapT : snapR) : nullptr);
+    g_gizmoHot = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
+
+    if (ImGuizmo::IsUsing()) {
+        if (!g_gizmoDragging) {                       // drag just began: snapshot
+            g_gizmoDragging = true;
+            g_gizmoPivot0[0] = px; g_gizmoPivot0[1] = py; g_gizmoPivot0[2] = pz;
+            g_gizmoStart.clear();
+            for (int i : g_selection) {
+                if (i < 0 || i >= (int)g_scene.entities.size()) continue;
+                const Entity& e = g_scene.entities[i];
+                EntSnap s; s.id = e.id; s.dir0 = e.dir;
+                for (int k = 0; k < 3; k++) s.pos0[k] = e.pos[k];
+                g_gizmoStart.push_back(s);
+            }
+        }
+        if (g_gizmoOp == 0) {
+            // translation delta in GL world -> entity space (x, mapY, elevation)
+            float dx = g_gizmoMat[12] - g_gizmoPivot0[0];
+            float dy = g_gizmoMat[13] - g_gizmoPivot0[1];
+            float dz = g_gizmoMat[14] - g_gizmoPivot0[2];
+            for (const EntSnap& s : g_gizmoStart) {
+                int i = entityIndexById(s.id); if (i < 0) continue;
+                Entity& e = g_scene.entities[i];
+                e.pos[0] = s.pos0[0] + dx;
+                e.pos[1] = s.pos0[1] + dz;
+                e.pos[2] = s.pos0[2] + dy;
+                g_edited.insert(e.id);
+            }
+        } else {
+            // pure-Y rotation: read it straight off the basis (m[0]=cos, m[8]=sin)
+            // rather than from an Euler decomposition, which is ambiguous past 90deg.
+            float th = std::atan2(g_gizmoMat[8], g_gizmoMat[0]);
+            float c = std::cos(th), sn = std::sin(th);
+            float thDeg = th * 180.0f / 3.14159265f;
+            for (const EntSnap& s : g_gizmoStart) {
+                int i = entityIndexById(s.id); if (i < 0) continue;
+                Entity& e = g_scene.entities[i];
+                // rotY: x' = c*x + s*z,  z' = -s*x + c*z   (GL x = pos[0], GL z = pos[1])
+                float rx = s.pos0[0] - g_gizmoPivot0[0], rz = s.pos0[1] - g_gizmoPivot0[2];
+                e.pos[0] = g_gizmoPivot0[0] + (c * rx + sn * rz);
+                e.pos[1] = g_gizmoPivot0[2] + (-sn * rx + c * rz);
+                e.dir = s.dir0 + thDeg;
+                g_edited.insert(e.id);
+            }
+        }
+        g_entDirty = true; g_modelsDirty = true;
+    } else if (g_gizmoDragging) {
+        commitBatch(g_gizmoStart);
+        g_gizmoDragging = false;
+    }
+}
+
+// Drop every selected entity onto the heightmap (undoable, one command).
+static void groundSelection() {
+    if (g_selection.empty()) return;
+    std::vector<EntSnap> start;
+    for (int i : g_selection) {
+        if (i < 0 || i >= (int)g_scene.entities.size()) continue;
+        const Entity& e = g_scene.entities[i];
+        EntSnap s; s.id = e.id; s.dir0 = e.dir;
+        for (int k = 0; k < 3; k++) s.pos0[k] = e.pos[k];
+        start.push_back(s);
+    }
+    for (const EntSnap& s : start) {
+        int i = entityIndexById(s.id); if (i < 0) continue;
+        Entity& e = g_scene.entities[i];
+        e.pos[2] = terrainHeightAt(e.pos[0], e.pos[1]);
+        g_edited.insert(e.id);
+    }
+    g_entDirty = true; g_modelsDirty = true;
+    commitBatch(start);
+}
+
 // camera navigation over the central viewport region
 static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     ImGuiIO& io = ImGui::GetIO();
-    bool over = ImGui::IsMouseHoveringRect(cmin, cmax, false) && !io.WantCaptureMouse;
+    // The gizmo owns the mouse while a handle is hovered or dragged — otherwise a
+    // click on an arrow would also pick an entity behind it, or start an orbit.
+    bool over = ImGui::IsMouseHoveringRect(cmin, cmax, false) && !io.WantCaptureMouse
+                && !g_gizmoHot;
 
     // WASD / arrow-key movement over the ground plane. Speed has a floor so it
     // does NOT crawl when zoomed in (was purely distance-scaled before).
@@ -1090,11 +1360,57 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     }
     // Hover highlight: track the entity under the cursor each frame (not while
     // brushing/dragging/placing), so the viewport shows what a click would select.
-    g_hovered = (over && !brushing && !placing && !g_draggingEnt) ? pickAny(io.MousePos, cmin, cmax) : -1;
-    // Left-click picks the nearest entity by screen-space projection.
+    // Deliberately the cheap AABB path — a full colour-code pass every frame would
+    // double the model draw cost on a 3400-entity map just to tint a box.
+    g_hovered = (over && !brushing && !placing && !g_draggingEnt && !g_marquee)
+              ? pickAny(io.MousePos, cmin, cmax) : -1;
+
+    // Left-click selects. Ctrl toggles, Shift adds. Clicking empty space starts a
+    // rubber-band; clicking an entity starts a drag-move.
     if (over && ImGui::IsMouseClicked(0) && g_scene.loaded) {
-        int bi = pickAny(io.MousePos, cmin, cmax);
-        if (bi >= 0) { g_selected = bi; g_draggingEnt = true; snapEntity(bi); }
+        int bi = pickExact(io.MousePos, cmin, cmax);
+        bool additive = io.KeyCtrl || io.KeyShift;
+        if (bi >= 0) {
+            if (io.KeyCtrl) selectToggle(bi);
+            else if (io.KeyShift) { g_selection.insert(bi); g_selected = bi; syncSelection(); }
+            else if (!g_selection.count(bi)) selectOnly(bi);
+            else g_selected = bi;                 // clicking inside a multi-selection keeps it
+            if (g_selection.count(bi)) { g_draggingEnt = true; snapEntity(bi); }
+        } else {
+            g_marquee = true; g_marqueeA = io.MousePos;
+            if (!additive) selectNone();
+        }
+    }
+    // Rubber-band: draw the box live, resolve it against the colour-code buffer on
+    // release so occluded entities behind terrain are never caught.
+    if (g_marquee) {
+        ImVec2 b = io.MousePos;
+        ImVec2 lo(std::min(g_marqueeA.x, b.x), std::min(g_marqueeA.y, b.y));
+        ImVec2 hi(std::max(g_marqueeA.x, b.x), std::max(g_marqueeA.y, b.y));
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        dl->AddRectFilled(lo, hi, IM_COL32(90, 160, 255, 40));
+        dl->AddRect(lo, hi, IM_COL32(120, 190, 255, 220));
+        if (!ImGui::IsMouseDown(0)) {
+            g_marquee = false;
+            if (hi.x - lo.x >= 3 && hi.y - lo.y >= 3) {
+                int w, h; pickBufferSize(cmin, cmax, w, h);
+                if (g_vp.pickPassReady() && w > 0 && h > 0) {
+                    g_vp.renderPickBuffer(g_cam, w, h, g_showModels, g_showDots);
+                    int x0, y0, x1, y1;
+                    screenToPickBuffer(lo, cmin, cmax, x0, y1);   // lo.y is the TOP edge
+                    screenToPickBuffer(hi, cmin, cmax, x1, y0);   // -> becomes the HIGH buffer row
+                    std::vector<int> hits;
+                    g_vp.pickBufferRect(x0, y0, x1 - x0, y1 - y0, hits);
+                    std::vector<int> keep;
+                    for (int i : hits) {
+                        if (i < 0 || i >= (int)g_scene.entities.size()) continue;
+                        const Entity& e = g_scene.entities[i];
+                        if (g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2]) keep.push_back(i);
+                    }
+                    selectAdd(keep, !(io.KeyCtrl || io.KeyShift));
+                }
+            }
+        }
     }
     // Left-drag: the selected entity follows the cursor on the terrain (grounded).
     // Only its own model instance is updated (no full rebuild), so it's smooth.
@@ -1165,11 +1481,15 @@ static int structTest(const char* mapPath, const char* outPath) {
 }
 
 int main(int argc, char** argv) {
-    std::string loadPath, shotPath; bool selftest = false;
+    std::string loadPath, shotPath, pickDump; bool selftest = false, pickTest = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
+        else if (!strcmp(argv[i], "--picktest")) {
+            pickTest = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') pickDump = argv[++i];
+        }
         else if (!strcmp(argv[i], "--pakmap") && i + 2 < argc) {   // mount dir, load a pak map
             vfs_mount_dir(argv[i+1]);
             std::string tmp = vfs_resolve(argv[i+2], "");
@@ -1363,6 +1683,97 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // headless check of the colour-code pick buffer (no mouse needed): render it,
+    // then for every model instance project its AABB centre and read the code back.
+    // A high self-hit rate means click-select resolves to the model you clicked.
+    if (pickTest) {
+        g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
+        g_vp.buildSplatTextures(g_scene, g_dataRoot);
+        g_vp.buildModels(g_scene, g_dataRoot);
+        const int W = 1360, H = 850;
+        if (!g_vp.pickPassReady()) { printf("picktest: pick program failed to build\n"); return 3; }
+        Camera wideCam = g_cam;
+        g_vp.renderPickBuffer(g_cam, W, H, true, true);
+        std::vector<Viewport3D::InstProbe> centers;
+        g_vp.instanceProbes(centers);
+        M4 vp = g_cam.viewProj((float)W / (float)H);
+        int tested = 0, self = 0, other = 0, empty = 0, offscreen = 0;
+        for (auto& c : centers) {
+            const V3& w = c.center;
+            float cx = vp.m[0]*w.x + vp.m[4]*w.y + vp.m[8]*w.z + vp.m[12];
+            float cy = vp.m[1]*w.x + vp.m[5]*w.y + vp.m[9]*w.z + vp.m[13];
+            float cw = vp.m[3]*w.x + vp.m[7]*w.y + vp.m[11]*w.z + vp.m[15];
+            if (cw <= 0.001f) { offscreen++; continue; }
+            int bx = (int)((cx/cw*0.5f + 0.5f) * W);
+            int by = (int)((cy/cw*0.5f + 0.5f) * H);   // buffer origin is bottom-left
+            if (bx < 0 || by < 0 || bx >= W || by >= H) { offscreen++; continue; }
+            tested++;
+            int got = g_vp.pickBufferAt(bx, by);
+            if (got == c.entIdx) self++;
+            else if (got >= 0) other++;
+            else empty++;
+        }
+        // Every non-self hit is a legitimate occlusion (a nearer model covering this
+        // one's centre in a top-down view of 3000+ models), so the wide pass is
+        // judged on "resolved to SOME entity".
+        int resolved = self + other;
+        printf("picktest instances=%zu tested=%d self=%d occluded=%d empty=%d offscreen=%d"
+               "  selfRate=%.1f%% resolvedRate=%.1f%%\n",
+               centers.size(), tested, self, other, empty, offscreen,
+               tested ? 100.0 * self / tested : 0.0,
+               tested ? 100.0 * resolved / tested : 0.0);
+
+        // Decisive check: frame individual models close up, at a distance scaled to
+        // each model's own size, and require the centre pixel to name that exact
+        // entity. No occlusion excuse here. Alpha-cut foliage is skipped — its
+        // centre pixel legitimately falls in a gap between leaves.
+        int closeTested = 0, closeHit = 0, closeMiss = 0;
+        for (size_t k = 0; k < centers.size() && closeTested < 24; k += centers.size()/24 + 1) {
+            const auto& pr = centers[k];
+            if (pr.radius < 0.5f) continue;
+            g_cam.target = pr.center;
+            g_cam.dist = pr.radius * 3.0f;      // always outside the model
+            g_cam.yaw = 0.7f; g_cam.pitch = 0.35f;
+            g_vp.renderPickBuffer(g_cam, W, H, true, true);
+            closeTested++;
+            // Sample the middle third of the frame rather than the single centre
+            // pixel: at 3x radius the model fills roughly that area, and an exact
+            // centre pixel can legitimately fall in a gap between alpha-cut leaves
+            // or through a hollow model. This asks the real question — "is this
+            // model pickable where it is drawn?"
+            std::vector<int> hits;
+            g_vp.pickBufferRect(W/3, H/3, W/3, H/3, hits);
+            bool found = false;
+            for (int id : hits) if (id == pr.entIdx) { found = true; break; }
+            if (found) closeHit++;
+            else {
+                closeMiss++;
+                printf("  close miss: ent %d r=%.1f  codes in frame=%d\n",
+                       pr.entIdx, pr.radius, (int)hits.size());
+            }
+        }
+        printf("picktest close-up %d/%d models pickable where drawn\n",
+               closeHit, closeTested);
+        if (!pickDump.empty()) {   // dump the wide-view pick buffer for eyeballing
+            g_cam = wideCam;
+            g_vp.renderPickBuffer(g_cam, W, H, true, true);
+            std::vector<unsigned char> rgb; int dw, dh;
+            if (g_vp.readPickBufferRGB(rgb, dw, dh)) {
+                // codes are near-black at low indices; amplify so shapes are visible
+                for (auto& b : rgb) b = (unsigned char)std::min(255, b * 3);
+                writeBMP(pickDump.c_str(), dw, dh, rgb.data());
+                printf("picktest wrote pick buffer -> %s\n", pickDump.c_str());
+            }
+        }
+        glfwDestroyWindow(win); glfwTerminate();
+        // Thresholds are deliberately loose on the close-up pass: the sample includes
+        // alpha-cut foliage whose silhouette is mostly holes, so a model can be
+        // correctly rendered and still not cover the middle third of the frame.
+        bool ok = tested > 0 && resolved * 10 >= tested * 9        // >=90% resolved
+                  && closeTested > 0 && closeHit * 3 >= closeTested * 2;   // >=66% close-up
+        return ok ? 0 : 3;
+    }
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
@@ -1375,6 +1786,13 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+        ImGuizmo::BeginFrame();
+        // Alt-Tabbing away mid-drag otherwise leaves a modifier or a drag latched.
+        if (!glfwGetWindowAttrib(win, GLFW_FOCUSED)) {
+            if (g_gizmoDragging) { commitBatch(g_gizmoStart); g_gizmoDragging = false; }
+            g_marquee = false; g_orbiting = false; g_panning = false;
+            if (g_draggingEnt) { g_draggingEnt = false; commitEntity(); }
+        }
 
         ImGuiID dsid = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
                             ImGuiDockNodeFlags_PassthruCentralNode);
@@ -1392,6 +1810,7 @@ int main(int argc, char** argv) {
             cmin = central->Pos;
             cmax = ImVec2(central->Pos.x + central->Size.x, central->Pos.y + central->Size.y);
         }
+        drawGizmo(cmin, cmax);   // before updateCamera: sets IsOver()/IsUsing()
         updateCamera(cmin, cmax);
 
         ImGuiIO& kio = ImGui::GetIO();
@@ -1399,11 +1818,22 @@ int main(int argc, char** argv) {
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) doOpen();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoEdit();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redoEdit();
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+            if (kio.KeyShift) selectNone(); else selectAllVisible();
+        }
         // C cycles model cull (Off -> Back -> Front); X flips model local-X (mirror text)
         if (!kio.WantCaptureKeyboard && !kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C))
             g_vp.cullMode = (g_vp.cullMode + 1) % 3;
         if (!kio.WantCaptureKeyboard && !kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X))
             g_vp.flipModelX = !g_vp.flipModelX;
+        // gizmo: T toggles, R switches translate/rotate, G drops to ground.
+        // (W/E/A/S/D are the camera; don't steal them.)
+        if (!kio.WantCaptureKeyboard && !kio.KeyCtrl) {
+            if (ImGui::IsKeyPressed(ImGuiKey_T)) g_gizmoOn = !g_gizmoOn;
+            if (ImGui::IsKeyPressed(ImGuiKey_R)) g_gizmoOp = 1 - g_gizmoOp;
+            if (ImGui::IsKeyPressed(ImGuiKey_G)) groundSelection();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) selectNone();
+        }
         // [ / ] rotate the selected entity 5 degrees (yaw)
         if (!kio.WantCaptureKeyboard && g_selected >= 0 &&
             g_selected < (int)g_scene.entities.size()) {
@@ -1426,8 +1856,12 @@ int main(int argc, char** argv) {
         if (ImGui::Begin("##status", nullptr,
                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav))
-            ImGui::Text("Mode: %s | Map: %s | %d entities | WASD/arrows move  MMB orbit  RMB pan  wheel zoom",
-                        kModes[g_mode].name, g_mapPath, (int)g_scene.entities.size());
+            ImGui::Text("Mode: %s | Map: %s | %d entities | %d selected%s | "
+                        "WASD move  MMB orbit  RMB pan  wheel zoom  drag-empty marquee  "
+                        "T gizmo  R rot/move  G ground",
+                        kModes[g_mode].name, g_mapPath, (int)g_scene.entities.size(),
+                        (int)g_selection.size(),
+                        (g_snapOn || ImGui::GetIO().KeyShift) ? "  [SNAP]" : "");
         ImGui::End();
 
         if (g_sceneDirty && g_glReady) {
