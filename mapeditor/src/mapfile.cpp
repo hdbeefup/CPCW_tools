@@ -72,8 +72,17 @@ struct Parser {
         std::ifstream f(path, std::ios::binary);
         if (!f) return false;
         f.seekg(0, std::ios::end); std::streamoff sz=f.tellg(); f.seekg(0);
-        buf.resize((size_t)sz); f.read((char*)buf.data(), sz);
+        std::vector<uint8_t> b((size_t)sz);
+        f.read((char*)b.data(), sz);
+        return loadBytes(std::move(b));
+    }
+
+    // Parse an already-resident buffer (structural edits reparse this way, so a
+    // place/delete never round-trips through a temp file).
+    bool loadBytes(std::vector<uint8_t> bytes) {
+        buf = std::move(bytes);
         D.d = buf.data(); D.n = buf.size();
+        root = Chunk{}; schemas.clear();
         if (!D.tag(0,"SCEN")) return false;
         size_t scenSize = D.u32(4);
         root = Chunk{"SCEN",0,scenSize,8};
@@ -381,6 +390,67 @@ static void collect_container_sizes(const Chunk& c, size_t es, size_t ee, std::v
     for (const auto& ch : c.children) collect_container_sizes(ch, es, ee, out);
 }
 
+// Lift the parsed field maps into the editor's Entity list (the fields the editor
+// edits, plus each one's byte offset so a save can overwrite it in place).
+static void lift_entities(const std::vector<Obj>& ents, std::vector<Entity>& out) {
+    out.clear(); out.reserve(ents.size());
+    for (auto& o : ents) {
+        Entity e;
+        auto it=o.find("_type"); e.type = (it!=o.end()&&it->second.kind==V_STR)?it->second.s:"?";
+        auto pr=o.find("Prototype"); if(pr!=o.end()&&pr->second.kind==V_STR) e.proto=pr->second.s;
+        auto ps=o.find("Pos"); if(ps!=o.end()&&ps->second.kind==V_VEC3){ e.pos[0]=(float)ps->second.v3[0]; e.pos[1]=(float)ps->second.v3[1]; e.pos[2]=(float)ps->second.v3[2]; e.posOff=ps->second.off; }
+        auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; e.dirOff=dr->second.off; }
+        auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT){ e.player=(int)pl->second.i; e.playerOff=pl->second.off; e.playerFtype=pl->second.ftype; }
+        auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT){ e.id=id->second.i; e.idOff=id->second.off; }
+        // SEntityDesc.Scale — uniform scale, mostly meaningful on doodads. Absent
+        // from some schemas, so default to 1 and only record an offset if present.
+        auto sc=o.find("Scale");
+        if (sc!=o.end() && sc->second.kind==V_FLOAT && sc->second.ftype==FT_FLOAT) {
+            float v=(float)sc->second.f;
+            if (v>0.0001f && v<1000.0f) e.scale=v;
+            e.scaleOff=sc->second.off;
+        }
+        auto os=o.find("_objtStart"); if(os!=o.end()) e.objtStart=os->second.i;
+        auto oe=o.find("_objtEnd");   if(oe!=o.end()) e.objtEnd=oe->second.i;
+        e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
+        out.push_back(std::move(e));
+    }
+}
+
+// Record the size-field offset of EVERY container that holds the entity OBJS
+// (SCEN, WRLD, ..., UNTS, OBJS) so a delete/insert can shrink/grow all of them,
+// plus the OBJS absolute schema_offset and the UNTS entity_count.
+static void lift_containers(const Parser& P, Scene& out) {
+    out.containerSizeOffs.clear();
+    out.objsSchemaOff = -1; out.untsCountOff = -1;
+    const Chunk* untsC = P.find(P.root, "UNTS");
+    const Chunk* objsC = untsC ? P.find(*untsC, "OBJS") : nullptr;
+    if (objsC) {
+        out.objsSchemaOff = (long)objsC->data_off;          // schema_offset u32
+        size_t es = objsC->offset, ee = objsC->offset + 8 + objsC->size;
+        collect_container_sizes(P.root, es, ee, out.containerSizeOffs);
+    }
+    if (untsC) out.untsCountOff = (long)untsC->offset + 12;  // entity_count u32
+}
+
+// Re-walk the entity table over a mutated Scene::raw. Terrain, splat and overlay
+// data are untouched by an entity insert/erase, so they are kept as-is (including
+// unsaved brush edits) — only their byte offsets shift, and only if they sit at or
+// after the edit point. `delta` is the signed byte change applied at `editPos`.
+static bool reparse_entities(Scene& s, long editPos, long delta) {
+    Parser P;
+    if (!P.loadBytes(std::move(s.raw))) { s.raw = std::move(P.buf); return false; }
+    std::vector<Obj> ents; P.parseEntities(ents);
+    lift_entities(ents, s.entities);
+    lift_containers(P, s);
+    if (delta != 0) {
+        if (s.heightOff >= editPos) s.heightOff += delta;
+        if (s.splatOff  >= editPos) s.splatOff  += delta;
+    }
+    s.raw = std::move(P.buf);
+    return true;
+}
+
 } // namespace
 
 bool load_map_native(const std::string& path, Scene& out) {
@@ -397,25 +467,14 @@ bool load_map_native(const std::string& path, Scene& out) {
     out.world_w=WW; out.world_h=WH;
     // entities
     std::vector<Obj> ents; P.parseEntities(ents);
-    for (auto& o : ents) {
-        Entity e;
-        auto it=o.find("_type"); e.type = (it!=o.end()&&it->second.kind==V_STR)?it->second.s:"?";
-        auto pr=o.find("Prototype"); if(pr!=o.end()&&pr->second.kind==V_STR) e.proto=pr->second.s;
-        auto ps=o.find("Pos"); if(ps!=o.end()&&ps->second.kind==V_VEC3){ e.pos[0]=(float)ps->second.v3[0]; e.pos[1]=(float)ps->second.v3[1]; e.pos[2]=(float)ps->second.v3[2]; e.posOff=ps->second.off; }
-        auto dr=o.find("Dir"); if(dr!=o.end()){ if(dr->second.kind==V_FLOAT)e.dir=(float)dr->second.f; else if(dr->second.kind==V_VEC3)e.dir=(float)dr->second.v3[0]; e.dirOff=dr->second.off; }
-        auto pl=o.find("Player"); if(pl!=o.end()&&pl->second.kind==V_INT){ e.player=(int)pl->second.i; e.playerOff=pl->second.off; e.playerFtype=pl->second.ftype; }
-        auto id=o.find("ID"); if(id!=o.end()&&id->second.kind==V_INT){ e.id=id->second.i; e.idOff=id->second.off; }
-        auto os=o.find("_objtStart"); if(os!=o.end()) e.objtStart=os->second.i;
-        auto oe=o.find("_objtEnd");   if(oe!=o.end()) e.objtEnd=oe->second.i;
-        e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
-        out.entities.push_back(std::move(e));
-    }
+    lift_entities(ents, out.entities);
     // heightmap + colormap
     if (WW>0 && WH>0) {
         int W=0,H=0;
         if (P.heightmap(WW,WH,ents,out.heights,W,H)) {
             out.grid_w=W; out.grid_h=H;
             out.heightOff = (long)P.heightOff;   // for native height save
+            out.splatOff  = (long)P.splatBase;   // per-layer uint8 weight grids
             P.colormap(out.colors);
             // real terrain paint: layer texture paths + uv scale + per-vertex opacity
             for (const auto& l : P.layers())
@@ -428,19 +487,9 @@ bool load_map_native(const std::string& path, Scene& out) {
             out.heights.assign((size_t)out.grid_w*out.grid_h, 0.0f);
         }
     }
-    // structural edits: record the size-field offset of EVERY container that
-    // holds the entity OBJS (SCEN, WRLD, ..., UNTS, OBJS) so a delete/insert can
-    // shrink/grow all of them, plus the OBJS absolute schema_offset.
-    const Chunk* untsC = P.find(P.root, "UNTS");
-    const Chunk* objsC = untsC ? P.find(*untsC, "OBJS") : nullptr;
-    if (objsC) {
-        out.objsSchemaOff = (long)objsC->data_off;          // schema_offset u32
-        size_t es = objsC->offset, ee = objsC->offset + 8 + objsC->size;
-        collect_container_sizes(P.root, es, ee, out.containerSizeOffs);
-    }
-    if (untsC) out.untsCountOff = (long)untsC->offset + 12;  // entity_count u32
+    lift_containers(P, out);
 
-    out.raw = P.buf;          // keep original bytes for native in-place save
+    out.raw = std::move(P.buf);   // keep the bytes for native in-place save
     out.srcPath = path;
     // roads (GROL/GROA) + decals (GDCL/GDEC) overlay geometry (needs heights set)
     parse_overlays(out.raw, out);
@@ -448,75 +497,134 @@ bool load_map_native(const std::string& path, Scene& out) {
     return true;
 }
 
-bool delete_entity_native(const Scene& s, long id, const std::string& outPath) {
-    if (s.raw.empty()) return false;
-    const Entity* e = nullptr;
-    for (const auto& en : s.entities) if (en.id == id) { e = &en; break; }
-    if (!e || e->objtStart < 0 || e->objtEnd <= e->objtStart) return false;
-    long start = e->objtStart, end = e->objtEnd, removed = end - start;
-    std::vector<unsigned char> b = s.raw;
-    if (end > (long)b.size()) return false;
-    b.erase(b.begin() + start, b.begin() + end);
-    auto patch = [&](long off) {
+// ---- structural edits (in memory) -------------------------------------------
+// All of these mutate Scene::raw directly and then re-walk the entity table.
+// Nothing round-trips through a file, so pending field edits already flushed into
+// `raw` survive, and a place/delete costs one entity walk instead of a full reload.
+
+namespace {
+
+inline uint32_t rd32(const std::vector<unsigned char>& b, long o) {
+    return (uint32_t)(b[o] | (b[o+1]<<8) | (b[o+2]<<16) | ((uint32_t)b[o+3]<<24));
+}
+inline void wr32(std::vector<unsigned char>& b, long o, uint32_t v) {
+    b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff;
+}
+
+// Adjust every ancestor container size + the OBJS schema_offset by `delta` bytes,
+// and the UNTS entity_count by `countDelta`. Every one of these offsets lies in a
+// chunk header *before* the entity region, so they stay valid across the edit.
+void patch_container_sizes(const Scene& s, std::vector<unsigned char>& b,
+                           long delta, int countDelta) {
+    auto bump = [&](long off) {
         if (off < 0 || off + 4 > (long)b.size()) return;
-        uint32_t v = b[off] | (b[off+1]<<8) | (b[off+2]<<16) | ((uint32_t)b[off+3]<<24);
-        v -= (uint32_t)removed;
-        b[off]=v&0xff; b[off+1]=(v>>8)&0xff; b[off+2]=(v>>16)&0xff; b[off+3]=(v>>24)&0xff;
+        wr32(b, off, (uint32_t)((int64_t)rd32(b, off) + delta));
     };
-    for (long off : s.containerSizeOffs) patch(off);   // SCEN, WRLD, ..., UNTS, OBJS
-    patch(s.objsSchemaOff);   // SCHD sits after the deleted entity -> shifts earlier
-    if (s.untsCountOff >= 0 && s.untsCountOff + 4 <= (long)b.size()) {   // entity_count -= 1
-        long o = s.untsCountOff;
-        uint32_t v = b[o] | (b[o+1]<<8) | (b[o+2]<<16) | ((uint32_t)b[o+3]<<24);
-        if (v > 0) v -= 1;
-        b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff;
+    for (long off : s.containerSizeOffs) bump(off);
+    bump(s.objsSchemaOff);   // SCHD sits after the entity region -> it shifts too
+    if (countDelta && s.untsCountOff >= 0 && s.untsCountOff + 4 <= (long)b.size()) {
+        int64_t v = (int64_t)rd32(b, s.untsCountOff) + countDelta;
+        if (v < 0) v = 0;
+        wr32(b, s.untsCountOff, (uint32_t)v);
     }
-    std::ofstream f(outPath, std::ios::binary);
+}
+
+// Absolute offset of the SCHD that terminates the entity region — i.e. where a new
+// OBJT is appended.
+long schd_pos(const Scene& s) {
+    if (s.objsSchemaOff < 0 || s.objsSchemaOff + 4 > (long)s.raw.size()) return -1;
+    long p = (long)rd32(s.raw, s.objsSchemaOff);
+    return (p >= 0 && p <= (long)s.raw.size()) ? p : -1;
+}
+
+} // namespace
+
+bool erase_objt_bytes(Scene& s, long pos, long len) {
+    if (s.raw.empty() || pos < 0 || len <= 0 || pos + len > (long)s.raw.size()) return false;
+    s.raw.erase(s.raw.begin() + pos, s.raw.begin() + pos + len);
+    patch_container_sizes(s, s.raw, -len, -1);
+    return reparse_entities(s, pos, -len);
+}
+
+bool insert_objt_at_index(Scene& s, int entIndex, const std::vector<unsigned char>& objt) {
+    if (s.raw.empty() || objt.empty()) return false;
+    long pos;
+    if (entIndex >= 0 && entIndex < (int)s.entities.size())
+        pos = s.entities[entIndex].objtStart;   // restore the original slot
+    else
+        pos = schd_pos(s);                      // append at the end of the list
+    if (pos < 0 || pos > (long)s.raw.size()) return false;
+    s.raw.insert(s.raw.begin() + pos, objt.begin(), objt.end());
+    patch_container_sizes(s, s.raw, (long)objt.size(), +1);
+    return reparse_entities(s, pos, (long)objt.size());
+}
+
+bool delete_entity_bytes(Scene& s, long id, std::vector<unsigned char>* outBytes,
+                         int* outIndex) {
+    int idx = -1;
+    for (size_t i = 0; i < s.entities.size(); i++) if (s.entities[i].id == id) { idx=(int)i; break; }
+    if (idx < 0) return false;
+    const Entity& e = s.entities[idx];
+    if (e.objtStart < 0 || e.objtEnd <= e.objtStart || e.objtEnd > (long)s.raw.size()) return false;
+    if (outBytes) outBytes->assign(s.raw.begin() + e.objtStart, s.raw.begin() + e.objtEnd);
+    if (outIndex) *outIndex = idx;
+    return erase_objt_bytes(s, e.objtStart, e.objtEnd - e.objtStart);
+}
+
+// Build the OBJT blob for a clone of `srcId` with a new ID and position. Returns
+// false if the source has no usable OBJT range.
+bool build_entity_clone(const Scene& s, long srcId, const float pos[3], long newId,
+                        std::vector<unsigned char>& out) {
+    const Entity* src = nullptr;
+    for (const auto& en : s.entities) if (en.id == srcId) { src = &en; break; }
+    if (!src || src->objtStart < 0 || src->objtEnd <= src->objtStart ||
+        src->objtEnd > (long)s.raw.size()) return false;
+    long ss = src->objtStart;
+    out.assign(s.raw.begin() + ss, s.raw.begin() + src->objtEnd);
+    if (src->posOff >= ss && src->posOff + 12 <= src->objtEnd) {
+        long r = src->posOff - ss;
+        for (int k = 0; k < 3; k++) { uint32_t v; std::memcpy(&v, &pos[k], 4); wr32(out, r + k*4, v); }
+    }
+    if (src->idOff >= ss && src->idOff + 4 <= src->objtEnd)
+        wr32(out, src->idOff - ss, (uint32_t)newId);
+    return true;
+}
+
+bool add_entity_bytes(Scene& s, long srcId, const float pos[3], long newId,
+                      std::vector<unsigned char>* outBytes) {
+    std::vector<unsigned char> blob;
+    if (!build_entity_clone(s, srcId, pos, newId, blob)) return false;
+    if (outBytes) *outBytes = blob;
+    return insert_objt_at_index(s, -1, blob);   // append before SCHD
+}
+
+// ---- file wrappers (dev harnesses --addtest / --deltest keep working) --------
+static bool write_all(const std::string& path, const std::vector<unsigned char>& b) {
+    std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     f.write((const char*)b.data(), (std::streamsize)b.size());
-    return true;
+    return (bool)f;
+}
+
+bool delete_entity_native(const Scene& s, long id, const std::string& outPath) {
+    Scene tmp = s;
+    if (!delete_entity_bytes(tmp, id, nullptr, nullptr)) return false;
+    return write_all(outPath, tmp.raw);
 }
 
 bool add_entity_native(const Scene& s, long srcId, const float pos[3], long newId,
                        const std::string& outPath) {
-    if (s.raw.empty()) return false;
-    const Entity* src = nullptr;
-    for (const auto& en : s.entities) if (en.id == srcId) { src = &en; break; }
-    if (!src || src->objtStart < 0 || src->objtEnd <= src->objtStart) return false;
-    long ss = src->objtStart, se = src->objtEnd, added = se - ss;
-    std::vector<unsigned char> copy(s.raw.begin() + ss, s.raw.begin() + se);
-    auto w32 = [&](std::vector<unsigned char>& v, long o, uint32_t x){ v[o]=x&0xff; v[o+1]=(x>>8)&0xff; v[o+2]=(x>>16)&0xff; v[o+3]=(x>>24)&0xff; };
-    if (src->posOff >= ss) { long r = src->posOff - ss;               // new Pos
-        for (int k=0;k<3;k++){ uint32_t v; std::memcpy(&v,&pos[k],4); w32(copy, r+k*4, v); } }
-    if (src->idOff >= ss)  w32(copy, src->idOff - ss, (uint32_t)newId); // new ID
-    long insertPos = -1;
-    if (s.objsSchemaOff >= 0 && s.objsSchemaOff + 4 <= (long)s.raw.size())
-        insertPos = s.raw[s.objsSchemaOff] | (s.raw[s.objsSchemaOff+1]<<8) |
-                    (s.raw[s.objsSchemaOff+2]<<16) | ((uint32_t)s.raw[s.objsSchemaOff+3]<<24);
-    if (insertPos < 0 || insertPos > (long)s.raw.size()) return false;
-    std::vector<unsigned char> b = s.raw;
-    b.insert(b.begin() + insertPos, copy.begin(), copy.end());   // before SCHD
-    auto grow = [&](long off){ if(off<0||off+4>(long)b.size())return; uint32_t v=b[off]|(b[off+1]<<8)|(b[off+2]<<16)|((uint32_t)b[off+3]<<24); v+=(uint32_t)added; w32(b,off,v); };
-    for (long off : s.containerSizeOffs) grow(off);
-    grow(s.objsSchemaOff);   // SCHD shifted later by `added`
-    if (s.untsCountOff >= 0 && s.untsCountOff + 4 <= (long)b.size()) {
-        long o = s.untsCountOff; uint32_t v = b[o]|(b[o+1]<<8)|(b[o+2]<<16)|((uint32_t)b[o+3]<<24);
-        w32(b, o, v + 1);
-    }
-    std::ofstream f(outPath, std::ios::binary);
-    if (!f) return false;
-    f.write((const char*)b.data(), (std::streamsize)b.size());
-    return true;
+    Scene tmp = s;
+    if (!add_entity_bytes(tmp, srcId, pos, newId, nullptr)) return false;
+    return write_all(outPath, tmp.raw);
 }
 
 // FT ids needed by the saver (must match the enum above)
 enum { SAVE_FT_INT32=0x0001, SAVE_FT_UINT8=0x0017, SAVE_FT_INT16=0x0019,
        SAVE_FT_IID=0x0013, SAVE_FT_ENTREF=0x0014 };
 
-bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
-                     const std::string& outPath) {
-    if (s.raw.empty()) return false;
-    std::vector<unsigned char> b = s.raw;   // copy; overwrite only edited fields
+void apply_edits_inplace(const Scene& s, const std::vector<long>& editedIds,
+                         std::vector<unsigned char>& b) {
     auto put32=[&](long off, uint32_t v){ if(off<0||off+4>(long)b.size())return; b[off]=v&0xff; b[off+1]=(v>>8)&0xff; b[off+2]=(v>>16)&0xff; b[off+3]=(v>>24)&0xff; };
     auto putf =[&](long off, float f){ uint32_t v; std::memcpy(&v,&f,4); put32(off,v); };
     // edited terrain heights: write ONLY brush-touched cells (keeps NaN sentinels
@@ -532,6 +640,7 @@ bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
         if (!e) continue;
         if (e->posOff>=0) { putf(e->posOff,e->pos[0]); putf(e->posOff+4,e->pos[1]); putf(e->posOff+8,e->pos[2]); }
         if (e->dirOff>=0) putf(e->dirOff, e->dir);   // Dir yaw = first float
+        if (e->scaleOff>=0) putf(e->scaleOff, e->scale);
         if (e->playerOff>=0) {
             long o=e->playerOff; uint32_t v=(uint32_t)e->player;
             switch (e->playerFtype) {
@@ -541,8 +650,12 @@ bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
             }
         }
     }
-    std::ofstream f(outPath, std::ios::binary);
-    if (!f) return false;
-    f.write((const char*)b.data(), b.size());
-    return true;
+}
+
+bool save_map_native(const Scene& s, const std::vector<long>& editedIds,
+                     const std::string& outPath) {
+    if (s.raw.empty()) return false;
+    std::vector<unsigned char> b = s.raw;   // copy; overwrite only edited fields
+    apply_edits_inplace(s, editedIds, b);
+    return write_all(outPath, b);
 }

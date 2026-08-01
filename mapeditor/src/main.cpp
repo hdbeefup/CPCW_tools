@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -88,10 +89,17 @@ static bool  g_showModels = true, g_showDots = true;
 static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
 
 // --- undo/redo -------------------------------------------------------------
+// Commands are keyed by entity ID, never by index: a structural insert/delete
+// renumbers every later index, so an index-keyed stack would undo onto the wrong
+// entity. Structural commands carry the exact OBJT bytes, so both directions are
+// byte-exact.
+enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE };
 struct EditCmd {
-    bool terrain = false;
-    int idx = -1; float pos0[3]{}, pos1[3]{}; float dir0 = 0, dir1 = 0; int pl0 = 0, pl1 = 0;
-    std::vector<int> cells; std::vector<float> h0, h1;   // terrain stroke
+    int  kind = CMD_ENTITY;
+    long entId = 0;
+    float pos0[3]{}, pos1[3]{}; float dir0 = 0, dir1 = 0; int pl0 = 0, pl1 = 0;
+    std::vector<int> cells; std::vector<float> h0, h1;   // CMD_TERRAIN
+    std::vector<unsigned char> objt; int entIndex = -1;  // CMD_ADD / CMD_DELETE
 };
 static std::vector<EditCmd> g_undo, g_redo;
 static bool g_snapActive = false; static EditCmd g_snap;   // pending entity snapshot
@@ -103,49 +111,116 @@ static char  g_saveStatus[256] = "";
 
 static void glfwError(int e, const char* d) { fprintf(stderr, "GLFW %d: %s\n", e, d); }
 
+static int entityIndexById(long id) {
+    for (int i = 0; i < (int)g_scene.entities.size(); i++)
+        if (g_scene.entities[i].id == id) return i;
+    return -1;
+}
+// Flush every pending in-memory field edit into Scene::raw. MUST run before any
+// structural edit — those rewrite the byte buffer, and anything not yet in it is
+// lost (this was a silent data-loss bug: place one object, lose ten moves).
+static void flushEditsToRaw() {
+    if (g_scene.raw.empty()) return;
+    std::vector<long> ids(g_edited.begin(), g_edited.end());
+    if (ids.empty() && !g_scene.terrainEdited) return;
+    apply_edits_inplace(g_scene, ids, g_scene.raw);
+}
+// After a structural edit the entity list is rebuilt: re-anchor the selection by
+// ID and mark only the entity/model buffers dirty (terrain and overlays are
+// untouched by an entity insert/erase).
+static void afterStructural(long selectId) {
+    g_selected = selectId >= 0 ? entityIndexById(selectId) : -1;
+    g_hovered = -1;
+    g_entDirty = true; g_modelsDirty = true;
+}
+
 static void applyCmd(const EditCmd& c, bool useNew) {
-    if (c.terrain) {
+    if (c.kind == CMD_TERRAIN) {
         for (size_t i = 0; i < c.cells.size(); i++)
             if (c.cells[i] >= 0 && c.cells[i] < (int)g_scene.heights.size())
                 g_scene.heights[c.cells[i]] = useNew ? c.h1[i] : c.h0[i];
         g_scene.terrainEdited = true; g_terrainDirty = true;
         if (g_scene.heightDirty.size() == g_scene.heights.size())
             for (int ci : c.cells) g_scene.heightDirty[ci] = 1;
-    } else if (c.idx >= 0 && c.idx < (int)g_scene.entities.size()) {
-        Entity& e = g_scene.entities[c.idx];
-        for (int k = 0; k < 3; k++) e.pos[k] = useNew ? c.pos1[k] : c.pos0[k];
-        e.dir = useNew ? c.dir1 : c.dir0; e.player = useNew ? c.pl1 : c.pl0;
-        g_edited.insert(e.id); g_entDirty = true; g_modelsDirty = true;
+        return;
     }
+    if (c.kind == CMD_ADD || c.kind == CMD_DELETE) {
+        // CMD_ADD's "new" state is the entity present; CMD_DELETE's is absent.
+        bool wantPresent = (c.kind == CMD_ADD) == useNew;
+        flushEditsToRaw();
+        if (wantPresent) {
+            if (insert_objt_at_index(g_scene, c.entIndex, c.objt)) afterStructural(c.entId);
+        } else {
+            if (delete_entity_bytes(g_scene, c.entId, nullptr, nullptr)) afterStructural(-1);
+        }
+        return;
+    }
+    int idx = entityIndexById(c.entId);
+    if (idx < 0) return;                       // entity no longer exists — skip
+    Entity& e = g_scene.entities[idx];
+    for (int k = 0; k < 3; k++) e.pos[k] = useNew ? c.pos1[k] : c.pos0[k];
+    e.dir = useNew ? c.dir1 : c.dir0; e.player = useNew ? c.pl1 : c.pl0;
+    g_edited.insert(e.id); g_entDirty = true; g_modelsDirty = true;
 }
 static void undoEdit() {
     if (g_undo.empty()) return;
-    EditCmd c = g_undo.back(); g_undo.pop_back(); applyCmd(c, false); g_redo.push_back(c);
+    EditCmd c = g_undo.back(); g_undo.pop_back(); applyCmd(c, false); g_redo.push_back(std::move(c));
 }
 static void redoEdit() {
     if (g_redo.empty()) return;
-    EditCmd c = g_redo.back(); g_redo.pop_back(); applyCmd(c, true); g_undo.push_back(c);
+    EditCmd c = g_redo.back(); g_redo.pop_back(); applyCmd(c, true); g_undo.push_back(std::move(c));
 }
+static void pushCmd(EditCmd c) { g_undo.push_back(std::move(c)); g_redo.clear(); }
+
 // snapshot the selected entity's state before an edit begins
 static void snapEntity(int idx) {
     if (idx < 0 || idx >= (int)g_scene.entities.size()) { g_snapActive = false; return; }
     const Entity& e = g_scene.entities[idx];
-    g_snap = EditCmd{}; g_snap.idx = idx;
+    g_snap = EditCmd{}; g_snap.kind = CMD_ENTITY; g_snap.entId = e.id;
     for (int k = 0; k < 3; k++) g_snap.pos0[k] = e.pos[k];
     g_snap.dir0 = e.dir; g_snap.pl0 = e.player; g_snapActive = true;
 }
 // commit the snapshot as an undo command if the entity actually changed
 static void commitEntity() {
-    if (!g_snapActive || g_snap.idx < 0 || g_snap.idx >= (int)g_scene.entities.size()) { g_snapActive = false; return; }
-    const Entity& e = g_scene.entities[g_snap.idx];
+    if (!g_snapActive) { g_snapActive = false; return; }
+    int idx = entityIndexById(g_snap.entId);
+    if (idx < 0) { g_snapActive = false; return; }
+    const Entity& e = g_scene.entities[idx];
     bool changed = e.dir != g_snap.dir0 || e.player != g_snap.pl0;
     for (int k = 0; k < 3; k++) if (e.pos[k] != g_snap.pos0[k]) changed = true;
     if (changed) {
         for (int k = 0; k < 3; k++) g_snap.pos1[k] = e.pos[k];
         g_snap.dir1 = e.dir; g_snap.pl1 = e.player;
-        g_undo.push_back(g_snap); g_redo.clear();
+        pushCmd(g_snap);
     }
     g_snapActive = false;
+}
+
+// --- structural edits (in memory; no temp file, no full reload) --------------
+// Returns the new entity's ID, or -1.
+static long placeEntityClone(long srcId, const float pos[3]) {
+    if (g_scene.raw.empty() || g_srcMap.empty()) return -1;
+    long newId = 1;
+    for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
+    flushEditsToRaw();
+    std::vector<unsigned char> blob;
+    if (!add_entity_bytes(g_scene, srcId, pos, newId, &blob)) return -1;
+    afterStructural(newId);
+    EditCmd c; c.kind = CMD_ADD; c.entId = newId; c.objt = std::move(blob);
+    c.entIndex = entityIndexById(newId);
+    pushCmd(std::move(c));
+    return newId;
+}
+static bool deleteEntityById(long id) {
+    if (g_scene.raw.empty() || g_srcMap.empty()) return false;
+    flushEditsToRaw();
+    std::vector<unsigned char> blob; int idx = -1;
+    if (!delete_entity_bytes(g_scene, id, &blob, &idx)) return false;
+    afterStructural(-1);
+    g_edited.erase(id);
+    EditCmd c; c.kind = CMD_DELETE; c.entId = id; c.objt = std::move(blob); c.entIndex = idx;
+    pushCmd(std::move(c));
+    return true;
 }
 
 // write a 24-bit BMP from an RGB framebuffer read (rows bottom-up, as GL gives)
@@ -288,11 +363,16 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
             return false;
         }
     }
-    g_scene = std::move(s); g_selected = -1; g_sceneDirty = true;
+    g_scene = std::move(s); g_selected = -1; g_hovered = -1; g_sceneDirty = true;
     g_srcMap = endsWithI(path, ".json") ? std::string() : path;  // Save needs the .map
     if (!preserveView)
         g_dataRoot = g_srcMap.empty() ? std::string() : findDataRoot(g_srcMap);
     g_edited.clear(); g_saveStatus[0] = '\0';
+    // a different map means different entities and different assets: an undo
+    // command from the old scene must never be replayed onto the new one, and the
+    // model/texture GL caches would otherwise grow with every load.
+    g_undo.clear(); g_redo.clear(); g_snapActive = false; g_strokeActive = false;
+    if (g_glReady) { g_vp.clearModels(); g_vp.clearOverlays(); }
     resetThumbCache();
     if (!preserveView) snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
     if (selectId >= 0)
@@ -313,24 +393,96 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     return true;
 }
 
-// Save edited entity fields natively (no Python): overwrite Pos/Player in place
-// in a copy of the loaded bytes and write <map>_edited.map (byte-faithful).
-static void doSave() {
+// Write `bytes` to `path` without ever leaving a truncated map behind: write a
+// sibling .tmp first, and only once that has fully landed move any existing file
+// aside to .bak and rename the temp into place. A failure at any point leaves the
+// original untouched.
+static bool writeMapAtomic(const std::string& path, const std::vector<unsigned char>& bytes,
+                           bool keepBackup, std::string& err) {
+    std::error_code ec;
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) { err = "cannot create " + tmp; return false; }
+        f.write((const char*)bytes.data(), (std::streamsize)bytes.size());
+        f.flush();
+        if (!f) { f.close(); std::filesystem::remove(tmp, ec); err = "write failed (disk full?)"; return false; }
+    }
+    bool hadOriginal = std::filesystem::exists(path, ec);
+    std::string bak = path + ".bak";
+    if (hadOriginal) {
+        if (keepBackup) {
+            std::filesystem::remove(bak, ec);
+            std::filesystem::rename(path, bak, ec);
+            if (ec) { std::filesystem::remove(tmp, ec); err = "cannot back up the original"; return false; }
+        } else {
+            std::filesystem::remove(path, ec);
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        if (hadOriginal && keepBackup) std::filesystem::rename(bak, path, ec);   // roll back
+        err = "cannot replace the target file";
+        return false;
+    }
+    return true;
+}
+
+// Save every pending edit into a copy of the loaded bytes (byte-faithful: only the
+// edited fields' bytes change) and write it out.
+static void doSaveTo(const std::string& out, bool keepBackup) {
     if (g_scene.raw.empty() || g_srcMap.empty()) {
         snprintf(g_saveStatus, sizeof(g_saveStatus),
                  "Save needs a .map source (open a .map, not a .json)."); return;
     }
-    if (g_edited.empty() && !g_scene.terrainEdited) {
-        snprintf(g_saveStatus, sizeof(g_saveStatus), "No edits to save."); return;
-    }
     std::vector<long> ids(g_edited.begin(), g_edited.end());
-    std::string out = g_srcMap.substr(0, g_srcMap.size() - 4) + "_edited.map";
-    if (save_map_native(g_scene, ids, out))
-        snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved %d edit(s) -> %s",
-                 (int)g_edited.size(), out.c_str());
-    else
-        snprintf(g_saveStatus, sizeof(g_saveStatus), "Save failed.");
+    std::vector<unsigned char> bytes = g_scene.raw;
+    apply_edits_inplace(g_scene, ids, bytes);
+    std::string err;
+    if (writeMapAtomic(out, bytes, keepBackup, err)) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved -> %s%s", out.c_str(),
+                 keepBackup ? "  (previous kept as .bak)" : "");
+        g_edited.clear(); g_scene.terrainEdited = false;
+        if (!g_scene.heightDirty.empty())
+            std::fill(g_scene.heightDirty.begin(), g_scene.heightDirty.end(), (unsigned char)0);
+    } else {
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "Save failed: %s", err.c_str());
+    }
 }
+
+// Default save: alongside the source as <map>_edited.map, never over the original.
+static void doSave() {
+    if (g_srcMap.empty()) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus),
+                 "Save needs a .map source (open a .map, not a .json)."); return;
+    }
+    doSaveTo(g_srcMap.substr(0, g_srcMap.size() - 4) + "_edited.map", true);
+}
+
+// Save As: OS picker on Windows, <map>_edited.map elsewhere.
+static void doSaveAs() {
+    if (g_srcMap.empty()) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus),
+                 "Save needs a .map source (open a .map, not a .json)."); return;
+    }
+#ifdef _WIN32
+    char file[1024] = {0};
+    snprintf(file, sizeof(file), "%s", (g_srcMap.substr(0, g_srcMap.size()-4) + "_edited.map").c_str());
+    OPENFILENAMEA ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_win ? glfwGetWin32Window(g_win) : nullptr;
+    ofn.lpstrFilter = "CPCW map\0*.map\0All files\0*.*\0";
+    ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
+    ofn.lpstrDefExt = "map";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameA(&ofn) && file[0]) doSaveTo(file, true);
+#else
+    doSave();
+#endif
+}
+
+// Overwrite the map that was opened, keeping the previous bytes as <map>.bak.
+static void doSaveOverOriginal() { if (!g_srcMap.empty()) doSaveTo(g_srcMap, true); }
 
 // Open via the OS native file picker (Windows explorer); text-field fallback else.
 static void doOpen() {
@@ -411,15 +563,13 @@ static float terrainHeightAt(float x, float y) {
     return a * (1 - ty) + b * ty;
 }
 
-// Place a copy of entity srcId at world XZ (wx,wy), grounded on the terrain
-// (structural insert + reload; keeps the view and selects the new entity).
+// Place a copy of entity srcId at world XZ (wx,wy), grounded on the terrain.
+// In-memory structural insert: the view, the terrain and every pending edit stay
+// exactly as they were, and the new entity is selected.
 static void placeDuplicateAt(long srcId, float wx, float wy) {
     if (srcId < 0 || g_srcMap.empty()) return;
-    long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
     float p[3] = { wx, wy, terrainHeightAt(wx, wy) };   // ground on the heightmap
-    const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
-    std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
-    if (add_entity_native(g_scene, srcId, p, newId, work)) loadScene(work, true, newId);
+    placeEntityClone(srcId, p);
 }
 // Convenience: place at the current camera target (used by the panel button).
 static void placeDuplicate(long srcId) { placeDuplicateAt(srcId, g_cam.target.x, g_cam.target.z); }
@@ -526,17 +676,29 @@ static void drawMenuBar() {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) doOpen();
         if (ImGui::MenuItem("Open from .pak...")) doOpenPak();
-        ImGui::MenuItem("New");
+        ImGui::Separator();
         if (ImGui::MenuItem("Save edits", "Ctrl+S", false, !g_srcMap.empty())) doSave();
-        ImGui::Separator(); ImGui::MenuItem("Exit");
+        if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, !g_srcMap.empty())) doSaveAs();
+        if (ImGui::MenuItem("Overwrite original", nullptr, false, !g_srcMap.empty()))
+            doSaveOverOriginal();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Writes over the map you opened.\nThe previous bytes are kept as <map>.bak.");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Exit")) glfwSetWindowShouldClose(g_win, 1);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
         if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !g_undo.empty())) undoEdit();
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !g_redo.empty())) redoEdit();
         ImGui::Separator();
-        ImGui::MenuItem("Cut", "Ctrl+X"); ImGui::MenuItem("Copy", "Ctrl+C");
-        ImGui::MenuItem("Paste", "Ctrl+V"); ImGui::MenuItem("Delete", "Ctrl+Del");
+        bool hasSel = g_selected >= 0 && g_selected < (int)g_scene.entities.size();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, hasSel)) {
+            const Entity& e = g_scene.entities[g_selected];
+            float p[3] = { e.pos[0] + 8.0f, e.pos[1] + 8.0f, e.pos[2] };
+            placeEntityClone(e.id, p);
+        }
+        if (ImGui::MenuItem("Delete", "Del", false, hasSel))
+            deleteEntityById(g_scene.entities[g_selected].id);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -943,20 +1105,63 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
             Entity& e = g_scene.entities[g_selected];
             e.pos[0] = gx; e.pos[1] = gy; e.pos[2] = terrainHeightAt(gx, gy);
             g_edited.insert(e.id); g_entDirty = true;
-            g_vp.moveInstance(g_selected, V3{ gx, e.pos[2], gy }, e.dir);   // live model follow
+            g_vp.moveInstance(g_selected, V3{ gx, e.pos[2], gy }, e.dir, e.scale);   // live model follow
         }
     }
     if (g_draggingEnt && !ImGui::IsMouseDown(0)) { g_draggingEnt = false; commitEntity(); }
     // finalize a terrain brush stroke into one undo command
     if (g_strokeActive && !ImGui::IsMouseDown(0)) {
-        EditCmd c; c.terrain = true;
+        EditCmd c; c.kind = CMD_TERRAIN;
         for (size_t i = 0; i < g_scene.heights.size() && i < g_strokeH0.size(); i++)
             if (g_scene.heights[i] != g_strokeH0[i]) {
                 c.cells.push_back((int)i); c.h0.push_back(g_strokeH0[i]); c.h1.push_back(g_scene.heights[i]);
             }
-        if (!c.cells.empty()) { g_undo.push_back(c); g_redo.clear(); }
+        if (!c.cells.empty()) pushCmd(std::move(c));
         g_strokeActive = false; g_strokeH0.clear();
     }
+}
+
+// dev: end-to-end check that a structural edit no longer eats pending field edits
+// and that undo/redo of add+delete round-trips the byte buffer exactly.
+static int structTest(const char* mapPath, const char* outPath) {
+    Scene s;
+    if (!load_map_native(mapPath, s)) { printf("structtest: load failed\n"); return 2; }
+    if (s.entities.size() < 2) { printf("structtest: too few entities\n"); return 2; }
+    const size_t n0 = s.entities.size();
+    const std::vector<unsigned char> raw0 = s.raw;
+
+    // 1. an unsaved field edit on entity[0]
+    long editId = s.entities[0].id, srcId = s.entities[1].id;
+    s.entities[0].pos[0] += 123.5f;
+    float wantX = s.entities[0].pos[0];
+    apply_edits_inplace(s, {editId}, s.raw);          // what the editor now flushes
+
+    // 2. a structural insert on top of it
+    long newId = 1; for (const auto& e : s.entities) if (e.id >= newId) newId = e.id + 1;
+    float p[3] = { s.entities[1].pos[0] + 8.0f, s.entities[1].pos[1] + 8.0f, s.entities[1].pos[2] };
+    std::vector<unsigned char> blob;
+    if (!add_entity_bytes(s, srcId, p, newId, &blob)) { printf("structtest: add failed\n"); return 3; }
+    size_t nAdd = s.entities.size();
+
+    // 3. the field edit must have survived the insert
+    float gotX = 0; bool found = false;
+    for (const auto& e : s.entities) if (e.id == editId) { gotX = e.pos[0]; found = true; }
+    bool editKept = found && std::fabs(gotX - wantX) < 0.01f;
+
+    // 4. undo the add (erase by id) -> byte-identical to the pre-insert buffer
+    std::vector<unsigned char> afterAdd = s.raw;
+    if (!delete_entity_bytes(s, newId, nullptr, nullptr)) { printf("structtest: del failed\n"); return 3; }
+    bool undoExact = (s.raw.size() == raw0.size()) && s.entities.size() == n0;
+
+    // 5. redo the insert -> byte-identical to step 2
+    if (!insert_objt_at_index(s, -1, blob)) { printf("structtest: reinsert failed\n"); return 3; }
+    bool redoExact = (s.raw == afterAdd);
+
+    bool ok = editKept && undoExact && redoExact && nAdd == n0 + 1;
+    printf("structtest ents %zu->%zu  fieldEditKept=%d undoByteExact=%d redoByteExact=%d\n",
+           n0, nAdd, (int)editKept, (int)undoExact, (int)redoExact);
+    if (outPath) { std::ofstream f(outPath, std::ios::binary); f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size()); }
+    return ok ? 0 : 3;
 }
 
 int main(int argc, char** argv) {
@@ -970,6 +1175,10 @@ int main(int argc, char** argv) {
             std::string tmp = vfs_resolve(argv[i+2], "");
             if (!tmp.empty()) loadPath = tmp;
             i += 2;
+        }
+        else if (!strcmp(argv[i], "--structtest") && i + 1 < argc) {
+            const char* out = (i + 2 < argc && argv[i+2][0] != '-') ? argv[i+2] : nullptr;
+            return structTest(argv[i+1], out);
         }
         else if (!strcmp(argv[i], "--paktest") && i + 1 < argc) {
             PakArchive pak;
@@ -1083,10 +1292,16 @@ int main(int argc, char** argv) {
     }
     if (!loadPath.empty()) loadScene(loadPath);
     if (selftest) {
-        printf("selftest: map=%s loaded=%d entities=%d terrain=%dx%d grid=%dx%d heights=%zu\n",
+        int withScale = 0, nonUnit = 0;
+        for (const auto& e : g_scene.entities) {
+            if (e.scaleOff >= 0) withScale++;
+            if (e.scale != 1.0f) nonUnit++;
+        }
+        printf("selftest: map=%s loaded=%d entities=%d terrain=%dx%d grid=%dx%d heights=%zu"
+               " scaleField=%d scaled=%d splatOff=%ld\n",
                g_scene.name.c_str(), (int)g_scene.loaded, (int)g_scene.entities.size(),
                g_scene.world_w, g_scene.world_h, g_scene.grid_w, g_scene.grid_h,
-               g_scene.heights.size());
+               g_scene.heights.size(), withScale, nonUnit, g_scene.splatOff);
         return g_scene.loaded ? 0 : 2;
     }
 
@@ -1180,7 +1395,7 @@ int main(int argc, char** argv) {
         updateCamera(cmin, cmax);
 
         ImGuiIO& kio = ImGui::GetIO();
-        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) doSave();
+        if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) { if (kio.KeyShift) doSaveAs(); else doSave(); }
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) doOpen();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoEdit();
         if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redoEdit();
@@ -1193,19 +1408,17 @@ int main(int argc, char** argv) {
         if (!kio.WantCaptureKeyboard && g_selected >= 0 &&
             g_selected < (int)g_scene.entities.size()) {
             Entity& e = g_scene.entities[g_selected];
+            const long selId = e.id;
+            const float selPos[3] = { e.pos[0], e.pos[1], e.pos[2] };
             if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { snapEntity(g_selected); e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { snapEntity(g_selected); e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
-            const char* tmp = getenv("TEMP"); if (!tmp) tmp = getenv("TMP"); if (!tmp) tmp = ".";
-            std::string work = std::string(tmp) + "/cpcw_mapedit_work.map";
-            // Delete: remove the entity (structural) and reload the shortened map
-            if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !g_srcMap.empty()) {
-                if (delete_entity_native(g_scene, e.id, work)) loadScene(work, true);
-            }
-            // Ctrl+D: duplicate the selected entity nearby (structural insert)
-            if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D) && !g_srcMap.empty()) {
-                long newId = 1; for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
-                float p[3] = { e.pos[0] + 8.0f, e.pos[1] + 8.0f, e.pos[2] };
-                if (add_entity_native(g_scene, e.id, p, newId, work)) loadScene(work, true, newId);
+            // Delete / Ctrl+D: structural, in memory, undoable. Both rebuild the
+            // entity list, so `e` must not be touched afterwards.
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+                deleteEntityById(selId);
+            } else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
+                float p[3] = { selPos[0] + 8.0f, selPos[1] + 8.0f, selPos[2] };
+                placeEntityClone(selId, p);
             }
         }
 

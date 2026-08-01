@@ -7,6 +7,7 @@ struct Entity {
     std::string type, proto;
     float pos[3] = {0, 0, 0};   // world: x, y (horizontal plane), z (elevation)
     float dir = 0;
+    float scale = 1.0f;   // SEntityDesc.Scale (uniform); 1.0 when the field is absent
     int player = 0;
     long id = 0;
     int kind = 0;         // 0 doodad, 1 building/unit, 2 effect/sound/deformer
@@ -15,6 +16,7 @@ struct Entity {
     long dirOff = -1;         // Dir yaw = first float at this offset
     long idOff = -1;          // ID (u32) offset
     long playerOff = -1;
+    long scaleOff = -1;       // Scale (f32) offset, -1 if this schema has none
     unsigned playerFtype = 0; // schema field type of Player (write size)
     long objtStart = -1, objtEnd = -1;   // byte range of this entity's OBJT in raw
 };
@@ -46,6 +48,8 @@ struct Scene {
     std::vector<unsigned char> raw;     // original .map bytes (for native save), or empty
     std::string srcPath;                // original .map path, or empty (loaded from .json)
     long heightOff = -1;                // byte offset of the heightmap grid in raw
+    long splatOff = -1;                 // byte offset of the per-layer uint8 weight
+                                        // grids (layer i at splatOff + i*grid_w*grid_h)
     bool terrainEdited = false;         // heights changed -> write them on save
     std::vector<unsigned char> heightDirty;  // per-cell: brush-touched (save only these)
     // structural edits: size-field byte offsets of EVERY container that holds the

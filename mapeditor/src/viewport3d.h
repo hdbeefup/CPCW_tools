@@ -284,17 +284,22 @@ public:
             GLModel* gm = loadModel(mp);
             if (!gm || gm->parts.empty() || gm->vao == 0) continue;
             V3 wp{ e.pos[0], e.pos[2], e.pos[1] };
-            // model is RH at load (negate Z); +180 aligns the facing with the game.
-            float yaw = (e.dir + 180.0f) * 3.14159265f / 180.0f;
-            M4 xf = mul(translate(wp), rotY(yaw));
-            instances.push_back({ gm, xf, ei });
+            instances.push_back({ gm, entityXform(wp, e.dir, e.scale), ei });
         }
     }
-    // Live-update one entity's model transform (fast: just its matrix, no rebuild)
-    // so drag-move is smooth. Keep in sync with buildModels' transform.
-    void moveInstance(int entIdx, const V3& wp, float yawDeg) {
-        float yaw = (yawDeg + 180.0f) * 3.14159265f / 180.0f;   // +180: match in-game facing
+    // World transform of an entity's model. The model is RH at load (negate X and
+    // Z), so +180 deg of yaw aligns the facing with the game; SEntityDesc.Scale is
+    // a uniform scale applied in model space (doodads use it heavily).
+    static M4 entityXform(const V3& wp, float yawDeg, float scale) {
+        float yaw = (yawDeg + 180.0f) * 3.14159265f / 180.0f;
         M4 xf = mul(translate(wp), rotY(yaw));
+        if (scale > 0.0f && scale != 1.0f) xf = mul(xf, scaleM(scale, scale, scale));
+        return xf;
+    }
+    // Live-update one entity's model transform (fast: just its matrix, no rebuild)
+    // so drag-move is smooth.
+    void moveInstance(int entIdx, const V3& wp, float yawDeg, float scale = 1.0f) {
+        M4 xf = entityXform(wp, yawDeg, scale);
         for (auto& inst : instances) if (inst.entIdx == entIdx) { inst.xf = xf; break; }
     }
     int modelInstanceCount() const { return (int)instances.size(); }
