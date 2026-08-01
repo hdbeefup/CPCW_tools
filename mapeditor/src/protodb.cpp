@@ -25,7 +25,8 @@ struct Schema { std::string name; std::vector<Field> fields; };
 struct DB {
     std::vector<uint8_t> b; size_t n=0;
     std::map<uint16_t, Schema> schemas;
-    std::map<std::string,std::string>* out=nullptr;
+    std::map<std::string,std::string>* out=nullptr;       // guid -> model (legacy)
+    std::map<std::string,ProtoInfo>* full=nullptr;        // guid -> everything
 
     uint8_t  u8 (size_t p){ return p<n?b[p]:0; }
     uint16_t u16(size_t p){ return p+2<=n?(b[p]|(b[p+1]<<8)):0; }
@@ -90,25 +91,34 @@ struct DB {
         for(uint32_t k=0;k<cnt;k++){ if(p>=arrEnd)break; if(tag(p,"OBJT")){ size_t e; parseObjt(p,e); p=e; } else break; }
         return arrEnd;
     }
+    struct Lift;
     size_t readInline(size_t p, size_t limit){
         if(tag(p,"OBJT")){ size_t e; parseObjt(p,e); return e; }
-        if(tag(p,"VOBJ")){ std::string g,m; size_t e; parseVobj(p,e,g,m); return e; }
+        if(tag(p,"VOBJ")){ size_t e; skipVobj(p,e); return e; }
         if(tag(p,"ARRY")) return readArray(p,limit);
         return p;
     }
-    void parseVobj(size_t pos, size_t& endOut, std::string& guid, std::string& model){
+    void skipVobj(size_t pos, size_t& endOut){
+        endOut = tag(pos,"VOBJ") ? pos+8+u32(pos+4) : pos;
+    }
+    // Fields lifted out of one prototype object.
+    struct Lift { std::string guid, model, name, schema; };
+
+    void parseVobj(size_t pos, size_t& endOut, Lift& L){
         if(!tag(pos,"VOBJ")){ endOut=pos; return; }
         size_t contentEnd=pos+8+u32(pos+4); uint16_t typeId=u16(pos+8);
         auto it=schemas.find(typeId);
         size_t p=pos+10; endOut=contentEnd;
         if(p+2>contentEnd) return; p+=2;   // version
         if(it!=schemas.end()){
+            if(L.schema.empty()) L.schema=it->second.name;
             for(auto& fl:it->second.fields){
                 if(p>=contentEnd) break;
                 std::string sv; p=readField(p,fl.type,fl.size,contentEnd,sv);
                 if(!sv.empty()){
-                    if(fl.name=="GUID") guid=sv;
-                    else if(fl.name=="ModelName" || (model.empty()&&fl.name=="MarketModelName")) model=sv;
+                    if(fl.name=="GUID") L.guid=sv;
+                    else if(fl.name=="Name") { if(L.name.empty()) L.name=sv; }
+                    else if(fl.name=="ModelName" || (L.model.empty()&&fl.name=="MarketModelName")) L.model=sv;
                 }
             }
         }
@@ -116,13 +126,25 @@ struct DB {
     void parseObjt(size_t pos, size_t& endOut){
         if(!tag(pos,"OBJT")){ endOut=pos; return; }
         size_t contentEnd=pos+8+u32(pos+4);
-        std::string guid, model; size_t ve; parseVobj(pos+10, ve, guid, model);
+        Lift L; size_t ve; parseVobj(pos+10, ve, L);
         size_t p=ve;
-        while(p+10<=contentEnd && tag(p,"VOBJ")){ std::string g,m; size_t te; parseVobj(p,te,g,m); if(!g.empty())guid=g; if(!m.empty()&&model.empty())model=m; p=te; }
-        if(!guid.empty() && !model.empty()){
-            std::string gl; for(char c:guid) gl+=(char)tolower((unsigned char)c);
-            std::string mp; for(char c:model) mp+=(c=='\\'?'/':c);
-            (*out)[gl]=mp;
+        // trailing VOBJs extend the same object (derived schemas); merge them
+        while(p+10<=contentEnd && tag(p,"VOBJ")){
+            Lift x; size_t te; parseVobj(p,te,x); p=te;
+            if(!x.guid.empty()) L.guid=x.guid;
+            if(!x.name.empty() && L.name.empty()) L.name=x.name;
+            if(!x.model.empty() && L.model.empty()) L.model=x.model;
+        }
+        if(!L.guid.empty()){
+            std::string gl; for(char c:L.guid) gl+=(char)tolower((unsigned char)c);
+            std::string mp; for(char c:L.model) mp+=(c=='\\'?'/':c);
+            if(out && !mp.empty()) (*out)[gl]=mp;
+            if(full){
+                ProtoInfo& pi=(*full)[gl];
+                if(pi.model.empty()) pi.model=mp;
+                if(pi.name.empty())  pi.name=L.name;
+                if(pi.schema.empty())pi.schema=L.schema;
+            }
         }
         endOut=contentEnd;
     }
@@ -136,4 +158,20 @@ std::map<std::string,std::string> protodb_model_index(const std::string& path){
     if(!db.load(path)) return idx;
     size_t e; db.parseObjt(12, e);   // root OBJT at offset 12
     return idx;
+}
+
+std::map<std::string,ProtoInfo> protodb_full_index(const std::string& path){
+    std::map<std::string,ProtoInfo> idx;
+    DB db; db.full=&idx;
+    if(!db.load(path)) return idx;
+    size_t e; db.parseObjt(12, e);
+    return idx;
+}
+
+// ProtoDB prototype schemas and .map entity schemas are the same names in two
+// dialects: "SP<X>" there, "S<X>Desc" here. SPDoodad -> SDoodadDesc,
+// SPVehicleUnit -> SVehicleUnitDesc, SPBuildingUnit -> SBuildingUnitDesc.
+std::string protodb_map_schema(const std::string& schema){
+    if(schema.size()<3 || schema[0]!='S' || schema[1]!='P') return "";
+    return "S" + schema.substr(2) + "Desc";
 }

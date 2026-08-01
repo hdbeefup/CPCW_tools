@@ -3,6 +3,21 @@
 #include <string>
 #include <vector>
 
+// One schema field of an entity, with the byte offset it lives at so the editor
+// can overwrite it in place. Every field the schema declares is kept, not just the
+// four the viewport needs — that is what makes the Properties panel schema-driven
+// (SUnitDesc HP/Level/XP/Ammo/armour, SBuildingUnitDesc PlayerHQ/garrison, ...).
+enum { FK_NONE = 0, FK_INT, FK_FLOAT, FK_VEC3, FK_STR };
+struct EntityField {
+    std::string name;
+    unsigned ftype = 0;       // schema field type id (drives the write size)
+    long off = -1;            // byte offset in Scene::raw
+    int  kind = FK_NONE;
+    long i = 0; double f = 0; float v3[3] = {0,0,0}; std::string s;
+    bool mirrored = false;    // Pos/Dir/Player/Scale — edited through the Entity fields
+    bool dirty = false;       // changed in the UI; only dirty fields are written back
+};
+
 struct Entity {
     std::string type, proto;
     float pos[3] = {0, 0, 0};   // world: x, y (horizontal plane), z (elevation)
@@ -18,7 +33,9 @@ struct Entity {
     long playerOff = -1;
     long scaleOff = -1;       // Scale (f32) offset, -1 if this schema has none
     unsigned playerFtype = 0; // schema field type of Player (write size)
+    long protoOff = -1;       // Prototype GUID string (u16 len + bytes)
     long objtStart = -1, objtEnd = -1;   // byte range of this entity's OBJT in raw
+    std::vector<EntityField> fields;     // every schema field, in declaration order
 };
 
 struct Scene {

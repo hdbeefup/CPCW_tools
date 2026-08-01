@@ -10,6 +10,10 @@
 // Load a .map into `out`. Returns false on error (out.loaded stays false).
 bool load_map_native(const std::string& path, Scene& out);
 
+// Can this schema field type be overwritten in place (fixed width)? Strings and
+// containers cannot — they would resize the record.
+bool field_is_writable(unsigned ftype);
+
 // Overwrite `editedIds` entities' fields (and any brush-dirty terrain heights)
 // into `b` in place — byte-faithful, only the edited fields' bytes change. `b` is
 // normally a copy of Scene::raw, or Scene::raw itself when flushing pending edits
@@ -35,12 +39,19 @@ bool delete_entity_bytes(Scene& s, long id,
                          int* outIndex = nullptr);
 
 // Clone entity `srcId`'s OBJT with a new ID + position and append it before SCHD.
+// `protoGuid`, when given, replaces the clone's Prototype — that is how a model
+// the map has never used gets placed, by borrowing an existing record of the right
+// entity schema as a byte template. GUIDs are a fixed 36 chars, so it is
+// size-preserving; a differently-sized GUID makes the call fail rather than
+// corrupt the record.
 bool add_entity_bytes(Scene& s, long srcId, const float pos[3], long newId,
-                      std::vector<unsigned char>* outBytes = nullptr);
+                      std::vector<unsigned char>* outBytes = nullptr,
+                      const std::string& protoGuid = std::string());
 
 // Build a clone blob without inserting it (for batched paste).
 bool build_entity_clone(const Scene& s, long srcId, const float pos[3], long newId,
-                        std::vector<unsigned char>& out);
+                        std::vector<unsigned char>& out,
+                        const std::string& protoGuid = std::string());
 
 // Insert a ready-made OBJT blob so it becomes entity number `entIndex`
 // (entIndex < 0 or past the end -> appended just before SCHD). Undo of a delete.

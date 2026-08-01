@@ -410,9 +410,28 @@ static void lift_entities(const std::vector<Obj>& ents, std::vector<Entity>& out
             if (v>0.0001f && v<1000.0f) e.scale=v;
             e.scaleOff=sc->second.off;
         }
+        if (pr!=o.end() && pr->second.kind==V_STR) e.protoOff = pr->second.off;
         auto os=o.find("_objtStart"); if(os!=o.end()) e.objtStart=os->second.i;
         auto oe=o.find("_objtEnd");   if(oe!=o.end()) e.objtEnd=oe->second.i;
         e.kind = e.type=="SBuildingUnitDesc"?1 : (e.type=="SDoodadDesc"?0:2);
+        // keep every schema field so the Properties panel is schema-driven; the four
+        // the viewport mirrors (Pos/Dir/Player/Scale) are flagged, not duplicated
+        for (auto& kv : o) {
+            if (kv.first.empty() || kv.first[0]=='_') continue;   // _type/_objtStart/...
+            const Value& v = kv.second;
+            if (v.kind == V_NONE || v.off < 0) continue;
+            EntityField f;
+            f.name = kv.first; f.ftype = v.ftype; f.off = v.off;
+            switch (v.kind) {
+                case V_INT:   f.kind=FK_INT;   f.i=v.i; break;
+                case V_FLOAT: f.kind=FK_FLOAT; f.f=v.f; break;
+                case V_VEC3:  f.kind=FK_VEC3;  for(int k=0;k<3;k++) f.v3[k]=(float)v.v3[k]; break;
+                case V_STR:   f.kind=FK_STR;   f.s=v.s; break;
+                default: continue;
+            }
+            f.mirrored = (f.name=="Pos"||f.name=="Dir"||f.name=="Player"||f.name=="Scale");
+            e.fields.push_back(std::move(f));
+        }
         out.push_back(std::move(e));
     }
 }
@@ -571,10 +590,17 @@ bool delete_entity_bytes(Scene& s, long id, std::vector<unsigned char>* outBytes
     return erase_objt_bytes(s, e.objtStart, e.objtEnd - e.objtStart);
 }
 
-// Build the OBJT blob for a clone of `srcId` with a new ID and position. Returns
-// false if the source has no usable OBJT range.
+// Build the OBJT blob for a clone of `srcId` with a new ID and position, and
+// optionally a different Prototype GUID.
+//
+// Swapping the prototype is what lets the editor place a model the map has never
+// used, without constructing an OBJT from the schema: clone a record of the right
+// entity schema and point it at another prototype. Every CPCW prototype GUID is
+// exactly 36 characters (verified: 2017/2017 in ProtoDB, 3427/3427 on M_01), so
+// the swap is size-preserving and the record never moves. If a GUID of a different
+// length ever turns up, refuse rather than corrupt the record.
 bool build_entity_clone(const Scene& s, long srcId, const float pos[3], long newId,
-                        std::vector<unsigned char>& out) {
+                        std::vector<unsigned char>& out, const std::string& protoGuid) {
     const Entity* src = nullptr;
     for (const auto& en : s.entities) if (en.id == srcId) { src = &en; break; }
     if (!src || src->objtStart < 0 || src->objtEnd <= src->objtStart ||
@@ -587,13 +613,21 @@ bool build_entity_clone(const Scene& s, long srcId, const float pos[3], long new
     }
     if (src->idOff >= ss && src->idOff + 4 <= src->objtEnd)
         wr32(out, src->idOff - ss, (uint32_t)newId);
+    if (!protoGuid.empty()) {
+        if (src->protoOff < ss) return false;
+        long r = src->protoOff - ss;
+        if (r + 2 > (long)out.size()) return false;
+        size_t len = (size_t)(out[r] | (out[r+1] << 8));
+        if (len != protoGuid.size() || r + 2 + (long)len > (long)out.size()) return false;
+        std::memcpy(&out[r + 2], protoGuid.data(), len);
+    }
     return true;
 }
 
 bool add_entity_bytes(Scene& s, long srcId, const float pos[3], long newId,
-                      std::vector<unsigned char>* outBytes) {
+                      std::vector<unsigned char>* outBytes, const std::string& protoGuid) {
     std::vector<unsigned char> blob;
-    if (!build_entity_clone(s, srcId, pos, newId, blob)) return false;
+    if (!build_entity_clone(s, srcId, pos, newId, blob, protoGuid)) return false;
     if (outBytes) *outBytes = blob;
     return insert_objt_at_index(s, -1, blob);   // append before SCHD
 }
@@ -620,8 +654,44 @@ bool add_entity_native(const Scene& s, long srcId, const float pos[3], long newI
 }
 
 // FT ids needed by the saver (must match the enum above)
-enum { SAVE_FT_INT32=0x0001, SAVE_FT_UINT8=0x0017, SAVE_FT_INT16=0x0019,
-       SAVE_FT_IID=0x0013, SAVE_FT_ENTREF=0x0014 };
+enum { SAVE_FT_INT32=0x0001, SAVE_FT_FLOAT=0x0002, SAVE_FT_BOOL=0x0003,
+       SAVE_FT_FLOAT64=0x0005, SAVE_FT_VEC3=0x0006, SAVE_FT_IID=0x0013,
+       SAVE_FT_ENTREF=0x0014, SAVE_FT_UINT8=0x0017, SAVE_FT_COLOR=0x0018,
+       SAVE_FT_INT16=0x0019 };
+
+// Is this field type fixed-width, so the Properties panel can edit it in place
+// without changing the record size? Strings are not — they would resize the OBJT.
+bool field_is_writable(unsigned ftype) {
+    switch (ftype) {
+        case SAVE_FT_INT32: case SAVE_FT_FLOAT: case SAVE_FT_BOOL:
+        case SAVE_FT_FLOAT64: case SAVE_FT_VEC3: case SAVE_FT_IID:
+        case SAVE_FT_ENTREF: case SAVE_FT_UINT8: case SAVE_FT_COLOR:
+        case SAVE_FT_INT16:
+            return true;
+        default: return false;
+    }
+}
+
+// Overwrite one schema field in place. Size-preserving by construction — the write
+// width comes from the schema's own field type, so the record never moves.
+static void write_field(std::vector<unsigned char>& b, const EntityField& f) {
+    long o = f.off;
+    if (o < 0) return;
+    auto put32=[&](long p, uint32_t v){ if(p<0||p+4>(long)b.size())return; b[p]=v&0xff; b[p+1]=(v>>8)&0xff; b[p+2]=(v>>16)&0xff; b[p+3]=(v>>24)&0xff; };
+    auto putf =[&](long p, float x){ uint32_t v; std::memcpy(&v,&x,4); put32(p,v); };
+    switch (f.ftype) {
+        case SAVE_FT_FLOAT:   putf(o, (float)f.f); break;
+        case SAVE_FT_VEC3:    putf(o, f.v3[0]); putf(o+4, f.v3[1]); putf(o+8, f.v3[2]); break;
+        case SAVE_FT_FLOAT64: { double d=f.f; uint64_t v; std::memcpy(&v,&d,8);
+                                put32(o,(uint32_t)(v&0xFFFFFFFFu)); put32(o+4,(uint32_t)(v>>32)); } break;
+        case SAVE_FT_BOOL:
+        case SAVE_FT_UINT8:   if (o < (long)b.size()) b[o] = (unsigned char)(f.i & 0xff); break;
+        case SAVE_FT_INT16:   if (o+2 <= (long)b.size()) { b[o]=f.i&0xff; b[o+1]=(f.i>>8)&0xff; } break;
+        case SAVE_FT_INT32: case SAVE_FT_IID: case SAVE_FT_ENTREF: case SAVE_FT_COLOR:
+                              put32(o, (uint32_t)f.i); break;
+        default: break;       // strings and containers are not edited in place
+    }
+}
 
 void apply_edits_inplace(const Scene& s, const std::vector<long>& editedIds,
                          std::vector<unsigned char>& b) {
@@ -641,6 +711,11 @@ void apply_edits_inplace(const Scene& s, const std::vector<long>& editedIds,
         if (e->posOff>=0) { putf(e->posOff,e->pos[0]); putf(e->posOff+4,e->pos[1]); putf(e->posOff+8,e->pos[2]); }
         if (e->dirOff>=0) putf(e->dirOff, e->dir);   // Dir yaw = first float
         if (e->scaleOff>=0) putf(e->scaleOff, e->scale);
+        // schema fields edited in the Properties panel (everything but the four the
+        // viewport mirrors). Only dirty ones are written, so a read->write round trip
+        // can never perturb a field the user did not touch.
+        for (const EntityField& f : e->fields)
+            if (f.dirty && !f.mirrored) write_field(b, f);
         if (e->playerOff>=0) {
             long o=e->playerOff; uint32_t v=(uint32_t)e->player;
             switch (e->playerFtype) {

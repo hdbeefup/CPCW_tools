@@ -74,7 +74,7 @@ static int   g_mode = 0, g_activeTool = 0, g_selected = -1, g_hovered = -1;
 static float g_brushSize = 2.0f, g_brushHeight = 0.0f, g_brushPress = 0.5f;
 static bool  g_wireframe = false;
 static bool  g_showModes = true, g_showPanel = true, g_showProps = true,
-             g_showEntities = true;
+             g_showEntities = true, g_showChanges = false;
 static char  g_mapPath[512] = "(no map loaded)";
 static char  g_openPath[512] = "";
 static bool  g_openPopup = false;
@@ -136,6 +136,8 @@ static std::set<long> g_edited;                    // ids with pending field edi
 static char  g_saveStatus[256] = "";
 
 static void glfwError(int e, const char* d) { fprintf(stderr, "GLFW %d: %s\n", e, d); }
+
+static float terrainHeightAt(float x, float y);   // defined below; bilinear heightmap
 
 static int entityIndexById(long id) {
     for (int i = 0; i < (int)g_scene.entities.size(); i++)
@@ -285,6 +287,106 @@ static long placeEntityClone(long srcId, const float pos[3]) {
     pushCmd(std::move(c));
     return newId;
 }
+// --- changes since last save -------------------------------------------------
+// A per-entity copy of the state that is actually on disk. Everything the Changes
+// panel reports is derived from it on demand, so nothing has to be maintained as
+// edits happen — the same shape Ariane uses (m_savedTranslation + diff flags).
+struct SavedEnt { float pos[3]; float dir; };
+static std::map<long, SavedEnt> g_savedState;
+enum { DIFF_ADDED = 1, DIFF_DELETED = 2, DIFF_MOVED = 4, DIFF_ROTATED = 8, DIFF_FIELD = 16 };
+
+static void snapshotSavedState() {
+    g_savedState.clear();
+    for (const Entity& e : g_scene.entities) {
+        SavedEnt s; for (int k = 0; k < 3; k++) s.pos[k] = e.pos[k]; s.dir = e.dir;
+        g_savedState[e.id] = s;
+    }
+}
+static int diffFlags(const Entity& e) {
+    auto it = g_savedState.find(e.id);
+    if (it == g_savedState.end()) return DIFF_ADDED;
+    int f = 0;
+    for (int k = 0; k < 3; k++)
+        if (std::fabs(e.pos[k] - it->second.pos[k]) > 0.001f) f |= DIFF_MOVED;
+    if (std::fabs(e.dir - it->second.dir) > 0.01f) f |= DIFF_ROTATED;
+    for (const EntityField& fl : e.fields) if (fl.dirty) { f |= DIFF_FIELD; break; }
+    return f;
+}
+
+// --- clipboard ---------------------------------------------------------------
+// Entries hold the source entity's OBJT bytes plus its world position, so a paste
+// can reproduce the group's shape around a new anchor (or land it back in place).
+struct ClipEntry { std::vector<unsigned char> objt; float pos[3]; };
+static std::vector<ClipEntry> g_clipboard;
+static float g_clipAnchor[3] = {0,0,0};
+
+static void copySelection() {
+    g_clipboard.clear();
+    if (g_selection.empty() || g_scene.raw.empty()) return;
+    flushEditsToRaw();       // clipboard must carry the edited bytes, not the stale ones
+    double ax = 0, ay = 0, az = 0; int n = 0;
+    for (int i : g_selection) {
+        if (i < 0 || i >= (int)g_scene.entities.size()) continue;
+        const Entity& e = g_scene.entities[i];
+        if (e.objtStart < 0 || e.objtEnd <= e.objtStart || e.objtEnd > (long)g_scene.raw.size()) continue;
+        ClipEntry c;
+        c.objt.assign(g_scene.raw.begin() + e.objtStart, g_scene.raw.begin() + e.objtEnd);
+        for (int k = 0; k < 3; k++) c.pos[k] = e.pos[k];
+        ax += e.pos[0]; ay += e.pos[1]; az += e.pos[2]; n++;
+        g_clipboard.push_back(std::move(c));
+    }
+    if (n) { g_clipAnchor[0]=(float)(ax/n); g_clipAnchor[1]=(float)(ay/n); g_clipAnchor[2]=(float)(az/n); }
+    snprintf(g_saveStatus, sizeof(g_saveStatus), "Copied %d entit%s.",
+             (int)g_clipboard.size(), g_clipboard.size()==1?"y":"ies");
+}
+
+// Paste the clipboard, keeping the group's relative layout. `atX/atY` is the new
+// anchor; inPlace pastes back at the original coordinates. One undo command covers
+// the whole paste, and the pasted entities become the selection.
+static void pasteClipboard(bool inPlace, float atX, float atY) {
+    if (g_clipboard.empty() || g_scene.raw.empty() || g_srcMap.empty()) return;
+    flushEditsToRaw();
+    long nextId = 1;
+    for (const auto& en : g_scene.entities) if (en.id >= nextId) nextId = en.id + 1;
+    std::vector<long> newIds;
+    EditCmd batch; batch.kind = CMD_BATCH;
+    for (const ClipEntry& c : g_clipboard) {
+        std::vector<unsigned char> blob = c.objt;
+        long id = nextId++;
+        // patch ID + Pos inside the blob using the offsets of the *pasted* record,
+        // which we only know after it is parsed — so insert first, then edit fields.
+        if (!insert_objt_at_index(g_scene, -1, blob)) continue;
+        int idx = (int)g_scene.entities.size() - 1;
+        if (idx < 0) continue;
+        Entity& e = g_scene.entities[idx];
+        e.id = id;
+        if (!inPlace) {
+            e.pos[0] = atX + (c.pos[0] - g_clipAnchor[0]);
+            e.pos[1] = atY + (c.pos[1] - g_clipAnchor[1]);
+            e.pos[2] = terrainHeightAt(e.pos[0], e.pos[1]);
+        }
+        // write the new ID straight into raw (Pos goes through the normal edit path)
+        if (e.idOff >= 0 && e.idOff + 4 <= (long)g_scene.raw.size()) {
+            unsigned v = (unsigned)id;
+            g_scene.raw[e.idOff]   = v & 0xff;      g_scene.raw[e.idOff+1] = (v>>8) & 0xff;
+            g_scene.raw[e.idOff+2] = (v>>16) & 0xff; g_scene.raw[e.idOff+3] = (v>>24) & 0xff;
+        }
+        g_edited.insert(id);
+        newIds.push_back(id);
+        EditCmd add; add.kind = CMD_ADD; add.entId = id; add.objt = blob; add.entIndex = idx;
+        g_undo.push_back(std::move(add));     // one command per inserted record
+    }
+    g_redo.clear();
+    flushEditsToRaw();                        // bake the moved positions into raw
+    g_selection.clear();
+    for (long id : newIds) { int i = entityIndexById(id); if (i >= 0) g_selection.insert(i); }
+    g_selected = g_selection.empty() ? -1 : *g_selection.begin();
+    syncSelection();
+    g_entDirty = true; g_modelsDirty = true;
+    snprintf(g_saveStatus, sizeof(g_saveStatus), "Pasted %d entit%s.",
+             (int)newIds.size(), newIds.size()==1?"y":"ies");
+}
+
 static bool deleteEntityById(long id) {
     if (g_scene.raw.empty() || g_srcMap.empty()) return false;
     flushEditsToRaw();
@@ -296,6 +398,21 @@ static bool deleteEntityById(long id) {
     pushCmd(std::move(c));
     return true;
 }
+
+// Delete every selected entity. Collect the IDs first: each removal renumbers the
+// indices, so iterating the index set while mutating would delete the wrong rows.
+static int deleteSelection() {
+    if (g_selection.empty()) return 0;
+    std::vector<long> ids;
+    for (int i : g_selection)
+        if (i >= 0 && i < (int)g_scene.entities.size()) ids.push_back(g_scene.entities[i].id);
+    int n = 0;
+    for (long id : ids) if (deleteEntityById(id)) n++;
+    selectNone();
+    if (n) snprintf(g_saveStatus, sizeof(g_saveStatus), "Deleted %d entit%s.", n, n==1?"y":"ies");
+    return n;
+}
+static void cutSelection() { copySelection(); deleteSelection(); }
 
 // write a 24-bit BMP from an RGB framebuffer read (rows bottom-up, as GL gives)
 static void writeBMP(const char* path, int w, int h, const unsigned char* rgb) {
@@ -449,6 +566,8 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     // command from the old scene must never be replayed onto the new one, and the
     // model/texture GL caches would otherwise grow with every load.
     g_undo.clear(); g_redo.clear(); g_snapActive = false; g_strokeActive = false;
+    g_clipboard.clear();
+    snapshotSavedState();     // baseline for the Changes panel = the file as opened
     if (g_glReady) { g_vp.clearModels(); g_vp.clearOverlays(); }
     resetThumbCache();
     if (!preserveView) snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
@@ -520,6 +639,8 @@ static void doSaveTo(const std::string& out, bool keepBackup) {
         snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved -> %s%s", out.c_str(),
                  keepBackup ? "  (previous kept as .bak)" : "");
         g_edited.clear(); g_scene.terrainEdited = false;
+        for (Entity& e : g_scene.entities) for (EntityField& f : e.fields) f.dirty = false;
+        snapshotSavedState();       // the Changes panel now diffs against this file
         if (!g_scene.heightDirty.empty())
             std::fill(g_scene.heightDirty.begin(), g_scene.heightDirty.end(), (unsigned char)0);
     } else {
@@ -640,17 +761,6 @@ static float terrainHeightAt(float x, float y) {
     return a * (1 - ty) + b * ty;
 }
 
-// Place a copy of entity srcId at world XZ (wx,wy), grounded on the terrain.
-// In-memory structural insert: the view, the terrain and every pending edit stay
-// exactly as they were, and the new entity is selected.
-static void placeDuplicateAt(long srcId, float wx, float wy) {
-    if (srcId < 0 || g_srcMap.empty()) return;
-    float p[3] = { wx, wy, terrainHeightAt(wx, wy) };   // ground on the heightmap
-    placeEntityClone(srcId, p);
-}
-// Convenience: place at the current camera target (used by the panel button).
-static void placeDuplicate(long srcId) { placeDuplicateAt(srcId, g_cam.target.x, g_cam.target.z); }
-
 // True when the active mode's selected tool is the "Place" tool (Object/Unit/
 // Ambient modes) — i.e. a left-click on terrain should drop a prototype copy.
 static bool activeToolIsPlace() {
@@ -663,8 +773,19 @@ static bool activeToolIsPlace() {
 
 // --- prototype thumbnails (THMB chunk of each model .srm) ------------------
 static std::map<std::string, std::string> g_protoIndex;   // guid -> model .srm
+static std::map<std::string, ProtoInfo>   g_protoFull;    // guid -> model/name/schema
 static bool  g_protoIndexBuilt = false;
 static std::map<std::string, unsigned> g_thumbCache;      // guid -> GL tex (0=none)
+
+static void ensureProtoIndex() {
+    if (g_protoIndexBuilt) return;
+    std::string p = vfs_resolve("ProtoDB.bin", g_dataRoot);
+    g_protoFull = protodb_full_index(p);
+    g_protoIndex.clear();
+    for (const auto& kv : g_protoFull)
+        if (!kv.second.model.empty()) g_protoIndex[kv.first] = kv.second.model;
+    g_protoIndexBuilt = true;
+}
 
 // Lazily decode & upload the THMB thumbnail for a prototype GUID. Returns a GL
 // texture id, or 0 if the model has no thumbnail / can't be resolved. Each guid
@@ -673,10 +794,7 @@ static unsigned thumbForProto(const std::string& protoGuid) {
     std::string g; for (char c : protoGuid) g += (char)tolower((unsigned char)c);
     auto ci = g_thumbCache.find(g);
     if (ci != g_thumbCache.end()) return ci->second;
-    if (!g_protoIndexBuilt) {
-        g_protoIndex = protodb_model_index(vfs_resolve("ProtoDB.bin", g_dataRoot));
-        g_protoIndexBuilt = true;
-    }
+    ensureProtoIndex();
     unsigned tex = 0;
     auto it = g_protoIndex.find(g);
     if (it != g_protoIndex.end()) {
@@ -700,14 +818,11 @@ static unsigned thumbForProto(const std::string& protoGuid) {
 // Drop cached thumbnails/index when the map (and thus data root) changes.
 static void resetThumbCache() {
     for (auto& kv : g_thumbCache) if (kv.second) { unsigned t = kv.second; glDeleteTextures(1, &t); }
-    g_thumbCache.clear(); g_protoIndex.clear(); g_protoIndexBuilt = false;
+    g_thumbCache.clear(); g_protoIndex.clear(); g_protoFull.clear(); g_protoIndexBuilt = false;
 }
 // Resolve a prototype's model .srm path (forward-slashed, original case), or "".
 static std::string modelPathForProto(const std::string& protoGuid) {
-    if (!g_protoIndexBuilt) {
-        g_protoIndex = protodb_model_index(vfs_resolve("ProtoDB.bin", g_dataRoot));
-        g_protoIndexBuilt = true;
-    }
+    ensureProtoIndex();
     std::string g; for (char c : protoGuid) g += (char)tolower((unsigned char)c);
     auto it = g_protoIndex.find(g);
     return it == g_protoIndex.end() ? std::string() : it->second;
@@ -740,6 +855,55 @@ static std::string categoryForProto(const std::string& protoGuid, const std::str
     return "Other";
 }
 
+// --- placing prototypes the map has never used -------------------------------
+// There is no need to construct an OBJT from the schema: clone an existing record
+// of the RIGHT entity schema and point its Prototype at the new GUID. The schema
+// to match is derivable — ProtoDB's "SP<X>" is the .map's "S<X>Desc" — and GUIDs
+// are a fixed 36 chars, so the swap is size-preserving.
+//
+// Returns the entity index of a usable byte template, or -1 with `why` set.
+static int templateForProto(const std::string& guid, std::string& why) {
+    ensureProtoIndex();
+    std::string g; for (char c : guid) g += (char)tolower((unsigned char)c);
+    auto it = g_protoFull.find(g);
+    if (it == g_protoFull.end()) { why = "prototype not in ProtoDB"; return -1; }
+    std::string want = protodb_map_schema(it->second.schema);
+    if (want.empty()) { why = "unrecognised prototype schema '" + it->second.schema + "'"; return -1; }
+    for (int i = 0; i < (int)g_scene.entities.size(); i++) {
+        const Entity& e = g_scene.entities[i];
+        if (e.type == want && e.objtStart >= 0 && e.protoOff >= 0 && e.idOff >= 0 && e.posOff >= 0)
+            return i;
+    }
+    why = "this map has no " + want + " to use as a template";
+    return -1;
+}
+
+// Place `guid` at world XZ, grounded. Returns the new entity ID or -1.
+static long placePrototypeAt(const std::string& guid, float wx, float wy) {
+    if (g_scene.raw.empty() || g_srcMap.empty()) return -1;
+    std::string why;
+    int ti = templateForProto(guid, why);
+    if (ti < 0) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "Cannot place: %s.", why.c_str());
+        return -1;
+    }
+    long srcId = g_scene.entities[ti].id;
+    long newId = 1;
+    for (const auto& en : g_scene.entities) if (en.id >= newId) newId = en.id + 1;
+    float p[3] = { wx, wy, terrainHeightAt(wx, wy) };
+    flushEditsToRaw();
+    std::vector<unsigned char> blob;
+    if (!add_entity_bytes(g_scene, srcId, p, newId, &blob, guid)) {
+        snprintf(g_saveStatus, sizeof(g_saveStatus), "Cannot place: GUID splice refused.");
+        return -1;
+    }
+    afterStructural(newId);
+    EditCmd c; c.kind = CMD_ADD; c.entId = newId; c.objt = std::move(blob);
+    c.entIndex = entityIndexById(newId);
+    pushCmd(std::move(c));
+    return newId;
+}
+
 static ImU32 playerColor(int p) {
     static const ImU32 c[] = {
         IM_COL32(200,200,200,255), IM_COL32(220,70,70,255), IM_COL32(70,120,220,255),
@@ -768,24 +932,30 @@ static void drawMenuBar() {
         if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !g_undo.empty())) undoEdit();
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !g_redo.empty())) redoEdit();
         ImGui::Separator();
-        bool hasSel = g_selected >= 0 && g_selected < (int)g_scene.entities.size();
+        bool hasSel = !g_selection.empty();
         if (ImGui::MenuItem("Select all", "Ctrl+A", false, g_scene.loaded)) selectAllVisible();
-        if (ImGui::MenuItem("Select none", "Ctrl+Shift+A", false, !g_selection.empty())) selectNone();
-        if (ImGui::MenuItem("Drop to ground", "G", false, !g_selection.empty())) groundSelection();
+        if (ImGui::MenuItem("Select none", "Ctrl+Shift+A", false, hasSel)) selectNone();
+        if (ImGui::MenuItem("Drop to ground", "G", false, hasSel)) groundSelection();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Cut", "Ctrl+X", false, hasSel)) cutSelection();
+        if (ImGui::MenuItem("Copy", "Ctrl+C", false, hasSel)) copySelection();
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, !g_clipboard.empty()))
+            pasteClipboard(false, g_cam.target.x, g_cam.target.z);
+        if (ImGui::MenuItem("Paste in place", "Ctrl+Shift+V", false, !g_clipboard.empty()))
+            pasteClipboard(true, 0, 0);
         ImGui::Separator();
         if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, hasSel)) {
-            const Entity& e = g_scene.entities[g_selected];
-            float p[3] = { e.pos[0] + 8.0f, e.pos[1] + 8.0f, e.pos[2] };
-            placeEntityClone(e.id, p);
+            copySelection();
+            pasteClipboard(false, g_clipAnchor[0] + 8.0f, g_clipAnchor[1] + 8.0f);
         }
-        if (ImGui::MenuItem("Delete", "Del", false, hasSel))
-            deleteEntityById(g_scene.entities[g_selected].id);
+        if (ImGui::MenuItem("Delete", "Del", false, hasSel)) deleteSelection();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Modes", nullptr, &g_showModes);
         ImGui::MenuItem("Mode tools", nullptr, &g_showPanel);
         ImGui::MenuItem("Entities", nullptr, &g_showEntities);
+        ImGui::MenuItem("Changes since save", nullptr, &g_showChanges);
         ImGui::MenuItem("Properties", nullptr, &g_showProps);
         ImGui::Separator();
         ImGui::MenuItem("3D models", nullptr, &g_showModels);
@@ -859,6 +1029,133 @@ static void drawModesPanel() {
             if (ImGui::Selectable(kModes[i].name, g_mode == i)) { g_mode = i; g_activeTool = 0; }
     ImGui::End();
 }
+// --- prototype browser -------------------------------------------------------
+// Sources from ProtoDB, not from what the map happens to contain, so anything in
+// the game can be placed. Entries the current map cannot host (no entity of the
+// matching schema to use as a byte template) are shown greyed with the reason.
+static char  g_browseFilter[128] = "";
+static bool  g_browseGrid = true;
+static bool  g_browseFavOnly = false;
+static bool  g_browseOnMapOnly = false;
+static std::set<std::string> g_favourites;      // proto guids
+static std::string g_placeProto;                // guid selected for placement
+
+static void drawPrototypeBrowser() {
+    ensureProtoIndex();
+    if (g_protoFull.empty()) {
+        ImGui::TextWrapped("ProtoDB.bin not found — open a map from the game folder "
+                           "or a .pak so prototypes can be listed.");
+        return;
+    }
+    // how many of each prototype the map already uses (shown as "xN")
+    static std::map<std::string, int> counts;
+    static size_t countsFor = (size_t)-1;
+    if (countsFor != g_scene.entities.size()) {
+        counts.clear();
+        for (const Entity& e : g_scene.entities) {
+            if (e.proto.empty()) continue;
+            std::string g; for (char c : e.proto) g += (char)tolower((unsigned char)c);
+            counts[g]++;
+        }
+        countsFor = g_scene.entities.size();
+    }
+    ImGui::SetNextItemWidth(-70);
+    ImGui::InputTextWithHint("##filter", "search name / model / category", g_browseFilter, sizeof(g_browseFilter));
+    ImGui::SameLine(); ImGui::Checkbox("Grid", &g_browseGrid);
+    ImGui::Checkbox("Favourites only", &g_browseFavOnly); ImGui::SameLine();
+    ImGui::Checkbox("On this map only", &g_browseOnMapOnly);
+
+    std::string needle; for (char* c = g_browseFilter; *c; c++) needle += (char)tolower((unsigned char)*c);
+    struct Row { const std::string* guid; const ProtoInfo* info; int count; };
+    std::map<std::string, std::vector<Row>> cats;
+    int shown = 0;
+    for (const auto& kv : g_protoFull) {
+        const ProtoInfo& pi = kv.second;
+        if (pi.model.empty()) continue;                       // nothing to show or place
+        int cnt = counts.count(kv.first) ? counts[kv.first] : 0;
+        if (g_browseOnMapOnly && cnt == 0) continue;
+        if (g_browseFavOnly && !g_favourites.count(kv.first)) continue;
+        std::string cat = categoryForProto(kv.first, pi.schema);
+        if (!needle.empty()) {
+            std::string hay = pi.name + " " + pi.model + " " + cat + " " + pi.schema;
+            for (auto& c : hay) c = (char)tolower((unsigned char)c);
+            if (hay.find(needle) == std::string::npos) continue;
+        }
+        cats[cat].push_back({ &kv.first, &pi, cnt });
+        shown++;
+    }
+    ImGui::TextDisabled("%d of %d prototypes", shown, (int)g_protoFull.size());
+
+    ImGui::BeginChild("protos", ImVec2(0, 340), ImGuiChildFlags_None);
+    const float img = 56.0f, cell = img + 18.0f;
+    for (auto& c : cats) {
+        char hdr[80]; snprintf(hdr, sizeof(hdr), "%s (%d)", c.first.c_str(), (int)c.second.size());
+        if (!ImGui::TreeNodeEx(hdr, needle.empty() ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) continue;
+        int perRow = 1;
+        if (g_browseGrid) {
+            float availw = ImGui::GetContentRegionAvail().x;
+            perRow = (int)(availw / cell); if (perRow < 1) perRow = 1;
+        }
+        int col = 0;
+        for (const Row& r : c.second) {
+            const std::string& guid = *r.guid;
+            bool sel = (g_placeProto == guid);
+            bool fav = g_favourites.count(guid) != 0;
+            ImGui::PushID(guid.c_str());
+            if (g_browseGrid) {
+                unsigned tex = thumbForProto(guid);
+                ImGui::BeginGroup();
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                bool clicked;
+                if (tex)   // flip V: THMB rows are top-down, ImGui samples bottom-up
+                    clicked = ImGui::ImageButton("t", (ImTextureID)tex, ImVec2(img, img),
+                                                 ImVec2(0, 1), ImVec2(1, 0));
+                else
+                    clicked = ImGui::Button("?##noimg", ImVec2(img + 8, img + 8));
+                if (sel) ImGui::PopStyleColor();
+                if (clicked) g_placeProto = guid;
+                char cap[40];
+                if (r.count) snprintf(cap, sizeof(cap), "%s%.5s x%d", fav?"*":"", r.info->name.c_str(), r.count);
+                else         snprintf(cap, sizeof(cap), "%s%.6s", fav?"*":"", r.info->name.c_str());
+                ImGui::TextUnformatted(cap);
+                ImGui::EndGroup();
+            } else {
+                char lbl[192];
+                snprintf(lbl, sizeof(lbl), "%s%s  (%s)%s", fav?"* ":"",
+                         r.info->name.empty() ? guid.c_str() : r.info->name.c_str(),
+                         r.info->schema.c_str(), r.count ? "  [on map]" : "");
+                if (ImGui::Selectable(lbl, sel)) g_placeProto = guid;
+            }
+            if (ImGui::IsItemHovered()) {
+                std::string why; int ti = templateForProto(guid, why);
+                ImGui::SetTooltip("%s\n%s\n%s\n%s\nused on this map: %d\n%s",
+                                  r.info->name.c_str(), r.info->schema.c_str(),
+                                  r.info->model.c_str(), guid.c_str(), r.count,
+                                  ti >= 0 ? "placeable" : ("NOT placeable: " + why).c_str());
+            }
+            if (ImGui::IsItemClicked(1)) {           // right-click toggles favourite
+                if (fav) g_favourites.erase(guid); else g_favourites.insert(guid);
+            }
+            ImGui::PopID();
+            if (g_browseGrid && ++col % perRow != 0) ImGui::SameLine();
+        }
+        ImGui::TreePop();
+    }
+    ImGui::EndChild();
+
+    if (!g_placeProto.empty()) {
+        std::string why; int ti = templateForProto(g_placeProto, why);
+        auto pi = g_protoFull.find(g_placeProto);
+        ImGui::TextWrapped("Selected: %s", pi == g_protoFull.end() ? g_placeProto.c_str()
+                                                                  : pi->second.name.c_str());
+        if (ti < 0) ImGui::TextColored(ImVec4(1,0.5f,0.3f,1), "Not placeable here: %s", why.c_str());
+        else if (ImGui::Button("Place at view center"))
+            placePrototypeAt(g_placeProto, g_cam.target.x, g_cam.target.z);
+    }
+    ImGui::TextDisabled("With the Place tool, left-click the terrain to drop one.");
+    ImGui::TextDisabled("Right-click a tile to favourite it. Ctrl+D dup, Del remove.");
+}
+
 static void drawModePanel() {
     if (!g_showPanel) return;
     const Mode& m = kModes[g_mode];
@@ -877,70 +1174,65 @@ static void drawModePanel() {
             ImGui::SliderFloat("Height", &g_brushHeight, -50.0f, 50.0f);
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
         } else {
-            // Prototype browser: distinct prototypes on the map, grouped by
-            // category, each shown as its baked THMB preview. Click one, then Place.
-            ImGui::TextWrapped("Prototypes on this map — click a thumbnail, then Place:");
-            struct PInfo { long srcId; int count; std::string type; };
-            std::map<std::string, PInfo> protos;   // proto guid -> info
-            for (const Entity& e : g_scene.entities) {
-                if (e.proto.empty()) continue;
-                auto& pr = protos[e.proto];
-                if (pr.count == 0) { pr.srcId = e.id; pr.type = e.type; }
-                pr.count++;
-            }
-            // bucket into categories (sorted; each holds pointers into `protos`)
-            std::map<std::string, std::vector<std::pair<const std::string, PInfo>*>> cats;
-            for (auto& kv : protos)
-                cats[categoryForProto(kv.first, kv.second.type)].push_back(&kv);
-
-            ImGui::BeginChild("protos", ImVec2(0, 340), ImGuiChildFlags_None);
-            const float img = 56.0f, cell = img + 18.0f;
-            for (auto& c : cats) {
-                char hdr[64]; snprintf(hdr, sizeof(hdr), "%s (%d)", c.first.c_str(), (int)c.second.size());
-                if (!ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen)) continue;
-                float availw = ImGui::GetContentRegionAvail().x;
-                int perRow = (int)(availw / cell); if (perRow < 1) perRow = 1;
-                int col = 0;
-                for (auto* kvp : c.second) {
-                    const std::string& proto = kvp->first;
-                    const PInfo& pi = kvp->second;
-                    unsigned tex = thumbForProto(proto);
-                    bool sel = (g_placeSrcId == pi.srcId);
-                    ImGui::PushID(proto.c_str());
-                    ImGui::BeginGroup();
-                    if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
-                                 ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-                    bool clicked;
-                    if (tex)   // flip V: THMB rows are top-down, ImGui samples bottom-up
-                        clicked = ImGui::ImageButton("t", (ImTextureID)tex, ImVec2(img, img),
-                                                     ImVec2(0, 1), ImVec2(1, 0));
-                    else
-                        clicked = ImGui::Button("?##noimg", ImVec2(img + 8, img + 8));
-                    if (sel) ImGui::PopStyleColor();
-                    if (clicked) g_placeSrcId = pi.srcId;
-                    char cap[32];
-                    snprintf(cap, sizeof(cap), "%.6s x%d", pi.type.c_str(), pi.count);
-                    ImGui::TextUnformatted(cap);
-                    ImGui::EndGroup();
-                    if (ImGui::IsItemHovered()) {
-                        std::string mp = modelPathForProto(proto);
-                        ImGui::SetTooltip("%s\n%s\n%s  (x%d)", pi.type.c_str(),
-                                          mp.empty() ? "(no model)" : mp.c_str(), proto.c_str(), pi.count);
-                    }
-                    ImGui::PopID();
-                    if (++col % perRow != 0) ImGui::SameLine();
-                }
-                ImGui::TreePop();
-            }
-            ImGui::EndChild();
-            if (ImGui::Button("Place at view center") && g_placeSrcId >= 0)
-                placeDuplicate(g_placeSrcId);
-            ImGui::TextDisabled("Or: with the Place tool, left-click on terrain to drop a copy.");
-            ImGui::TextDisabled("(grounded on the heightmap; Ctrl+D dup, Delete remove)");
+            drawPrototypeBrowser();
         }
     }
     ImGui::End();
 }
+// Everything that differs from what is on disk, by category, with a jump-to.
+// Cheap to build (one pass over the entity list) and it answers the question the
+// byte-faithful save model makes you ask constantly: "what am I about to write?"
+static void drawChanges() {
+    if (!g_showChanges) return;
+    int added = 0, moved = 0, rotated = 0, fielded = 0;
+    struct Row { int idx; int flags; };
+    std::vector<Row> rows;
+    std::set<long> live;
+    for (int i = 0; i < (int)g_scene.entities.size(); i++) {
+        const Entity& e = g_scene.entities[i];
+        live.insert(e.id);
+        int f = diffFlags(e);
+        if (!f) continue;
+        if (f & DIFF_ADDED)   added++;
+        if (f & DIFF_MOVED)   moved++;
+        if (f & DIFF_ROTATED) rotated++;
+        if (f & DIFF_FIELD)   fielded++;
+        rows.push_back({ i, f });
+    }
+    int deleted = 0;
+    for (const auto& kv : g_savedState) if (!live.count(kv.first)) deleted++;
+
+    char title[96];
+    snprintf(title, sizeof(title), "Changes (%d)###changes", (int)rows.size() + deleted);
+    if (ImGui::Begin(title, &g_showChanges)) {
+        if (g_srcMap.empty()) ImGui::TextDisabled("No .map loaded.");
+        ImGui::Text("+%d added   -%d deleted   %d moved   %d rotated   %d field edits",
+                    added, deleted, moved, rotated, fielded);
+        ImGui::TextDisabled("versus %s", g_srcMap.empty() ? "(nothing)" : g_srcMap.c_str());
+        ImGui::Separator();
+        ImGuiListClipper clip; clip.Begin((int)rows.size());
+        while (clip.Step())
+            for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
+                const Entity& e = g_scene.entities[rows[r].idx];
+                int f = rows[r].flags;
+                char tag[40] = "";
+                snprintf(tag, sizeof(tag), "%s%s%s%s",
+                         (f & DIFF_ADDED)   ? "new "   : "",
+                         (f & DIFF_MOVED)   ? "moved " : "",
+                         (f & DIFF_ROTATED) ? "rot "   : "",
+                         (f & DIFF_FIELD)   ? "field " : "");
+                char lbl[200];
+                snprintf(lbl, sizeof(lbl), "%ld  %s  [%s]##c%d", e.id, e.type.c_str(), tag, r);
+                if (ImGui::Selectable(lbl, g_selection.count(rows[r].idx) != 0)) {
+                    selectOnly(rows[r].idx);
+                    g_cam.target = V3{ e.pos[0], e.pos[2], e.pos[1] };   // jump to it
+                    if (g_cam.dist > 120.0f) g_cam.dist = 120.0f;
+                }
+            }
+    }
+    ImGui::End();
+}
+
 static void drawEntities() {
     if (!g_showEntities) return;
     char title[64];
@@ -974,9 +1266,51 @@ static void drawEntities() {
     }
     ImGui::End();
 }
+// Every schema field the record declares, typed and editable in place. The parser
+// already decodes name/type/offset for all of them; this just surfaces them.
+// Pos/Dir/Player/Scale are drawn separately above (the viewport mirrors those), and
+// strings stay read-only because changing their length would resize the record.
+static void drawSchemaFields(Entity& e) {
+    if (e.fields.empty()) return;
+    if (!ImGui::CollapsingHeader("All schema fields")) return;
+    ImGui::PushID("schema");
+    for (size_t k = 0; k < e.fields.size(); k++) {
+        EntityField& f = e.fields[k];
+        if (f.mirrored) continue;
+        ImGui::PushID((int)k);
+        bool changed = false;
+        if (f.kind == FK_STR) {
+            ImGui::LabelText(f.name.c_str(), "%s", f.s.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("strings are read-only (editing would resize the record)");
+        } else if (!field_is_writable(f.ftype)) {
+            ImGui::TextDisabled("%s  (type 0x%04X, not editable)", f.name.c_str(), f.ftype);
+        } else if (f.kind == FK_VEC3) {
+            float v[3] = { f.v3[0], f.v3[1], f.v3[2] };
+            if (ImGui::DragFloat3(f.name.c_str(), v, 0.05f)) {
+                for (int j = 0; j < 3; j++) f.v3[j] = v[j];
+                changed = true;
+            }
+        } else if (f.kind == FK_FLOAT) {
+            float v = (float)f.f;
+            if (ImGui::DragFloat(f.name.c_str(), &v, 0.05f)) { f.f = v; changed = true; }
+        } else if (f.ftype == 0x0003) {                    // FT_BOOL
+            bool v = f.i != 0;
+            if (ImGui::Checkbox(f.name.c_str(), &v)) { f.i = v ? 1 : 0; changed = true; }
+        } else {
+            int v = (int)f.i;
+            if (ImGui::InputInt(f.name.c_str(), &v)) { f.i = v; changed = true; }
+        }
+        if (changed) { f.dirty = true; g_edited.insert(e.id); }
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+}
+
 static void drawProperties() {
     if (!g_showProps) return;
     if (ImGui::Begin("Properties", &g_showProps)) {
+        if (g_selection.size() > 1)
+            ImGui::TextDisabled("%d selected — editing the primary below.", (int)g_selection.size());
         if (g_selected < 0 || g_selected >= (int)g_scene.entities.size())
             ImGui::TextDisabled("Nothing selected.");
         else {
@@ -1003,7 +1337,15 @@ static void drawProperties() {
             }
             if (ImGui::IsItemActivated()) snapEntity(g_selected);
             if (ImGui::IsItemDeactivatedAfterEdit()) commitEntity();
+            if (e.scaleOff >= 0) {
+                float sc = e.scale;
+                if (ImGui::DragFloat("Scale", &sc, 0.01f, 0.05f, 20.0f)) {
+                    e.scale = sc; g_edited.insert(e.id); g_modelsDirty = true;
+                }
+            }
             if (g_edited.count(e.id)) ImGui::TextDisabled("(edited — File > Save edits)");
+            ImGui::Separator();
+            drawSchemaFields(e);
         }
         if (g_saveStatus[0]) { ImGui::Separator(); ImGui::TextWrapped("%s", g_saveStatus); }
     }
@@ -1349,12 +1691,12 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
         return;   // don't pick/move entities while brushing
     }
     // Place-on-click: with a browser prototype selected and the Place tool active
-    // (Object/Unit/Ambient), left-click on terrain drops a grounded copy there.
-    bool placing = g_scene.loaded && g_placeSrcId >= 0 && activeToolIsPlace();
+    // (Object/Unit/Ambient), left-click on terrain drops a grounded instance there.
+    bool placing = g_scene.loaded && !g_placeProto.empty() && activeToolIsPlace();
     if (over && placing && ImGui::IsMouseClicked(0)) {
         float gx, gy;
         if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
-            placeDuplicateAt(g_placeSrcId, gx, gy);
+            placePrototypeAt(g_placeProto, gx, gy);
             return;   // consumed the click; don't also pick/move an entity
         }
     }
@@ -1437,6 +1779,101 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     }
 }
 
+// dev: place a prototype the map does NOT already use, by cloning a record of the
+// matching entity schema and swapping the Prototype GUID. Verifies the swap is
+// size-preserving, the reparse is clean, and the new entity reads back with the
+// requested prototype.
+static int protoPlaceTest(const char* mapPath, const char* protoDbPath, const char* outPath) {
+    Scene s;
+    if (!load_map_native(mapPath, s)) { printf("protoplacetest: load failed\n"); return 2; }
+    auto db = protodb_full_index(protoDbPath);
+    if (db.empty()) { printf("protoplacetest: ProtoDB empty (%s)\n", protoDbPath); return 2; }
+    std::set<std::string> onMap;
+    for (const auto& e : s.entities) {
+        std::string g; for (char c : e.proto) g += (char)tolower((unsigned char)c);
+        if (!g.empty()) onMap.insert(g);
+    }
+    // pick a prototype absent from the map whose schema IS represented on it
+    std::string guid, wantType; long srcId = -1;
+    for (const auto& kv : db) {
+        if (kv.second.model.empty() || onMap.count(kv.first)) continue;
+        std::string want = protodb_map_schema(kv.second.schema);
+        if (want.empty()) continue;
+        for (const auto& e : s.entities)
+            if (e.type == want && e.protoOff >= 0 && e.idOff >= 0 && e.posOff >= 0) {
+                guid = kv.first; wantType = want; srcId = e.id; break;
+            }
+        if (srcId >= 0) break;
+    }
+    if (srcId < 0) { printf("protoplacetest: no absent prototype with a template\n"); return 2; }
+    printf("protoplacetest placing %s (%s -> %s) using template entity %ld\n",
+           guid.c_str(), db[guid].schema.c_str(), wantType.c_str(), srcId);
+
+    size_t n0 = s.entities.size(), rawBefore = s.raw.size();
+    long newId = 1; for (const auto& e : s.entities) if (e.id >= newId) newId = e.id + 1;
+    float p[3] = { 100.0f, 100.0f, 0.0f };
+    if (!add_entity_bytes(s, srcId, p, newId, nullptr, guid)) {
+        printf("protoplacetest: add_entity_bytes refused\n"); return 3;
+    }
+    // the source record's size must be exactly what the file grew by (GUID swap is
+    // size-preserving), and the new entity must read back with the new prototype
+    long grew = (long)s.raw.size() - (long)rawBefore;
+    { std::ofstream f(outPath, std::ios::binary); f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size()); }
+    Scene s2;
+    if (!load_map_native(outPath, s2)) { printf("protoplacetest: reparse failed\n"); return 3; }
+    std::string got, gotType;
+    for (const auto& e : s2.entities) if (e.id == newId) {
+        for (char c : e.proto) got += (char)tolower((unsigned char)c);
+        gotType = e.type;
+    }
+    bool ok = s2.entities.size() == n0 + 1 && got == guid && gotType == wantType && grew > 0;
+    printf("protoplacetest ents %zu->%zu grew=%ld proto=%s type=%s %s\n",
+           n0, s2.entities.size(), grew, got == guid ? "match" : got.c_str(),
+           gotType.c_str(), ok ? "OK" : "FAIL");
+    return ok ? 0 : 3;
+}
+
+// dev: schema-field editing — pick a writable non-mirrored field on one entity,
+// change it, save, reload, and confirm exactly that field changed and nothing else.
+static int fieldTest(const char* mapPath, const char* outPath) {
+    Scene s;
+    if (!load_map_native(mapPath, s)) { printf("fieldtest: load failed\n"); return 2; }
+    int ei = -1, fi = -1;
+    for (size_t i = 0; i < s.entities.size() && ei < 0; i++)
+        for (size_t k = 0; k < s.entities[i].fields.size(); k++) {
+            const EntityField& f = s.entities[i].fields[k];
+            if (f.name == "ID") continue;   // changing the key would break the readback
+            if (!f.mirrored && f.kind == FK_INT && field_is_writable(f.ftype)) {
+                ei = (int)i; fi = (int)k; break;
+            }
+        }
+    if (ei < 0) { printf("fieldtest: no writable int field found\n"); return 2; }
+    Entity& e = s.entities[ei];
+    EntityField& f = e.fields[fi];
+    long before = f.i, want = before + 7;
+    printf("fieldtest entity %ld field '%s' (type 0x%04X) %ld -> %ld\n",
+           e.id, f.name.c_str(), f.ftype, before, want);
+    f.i = want; f.dirty = true;
+
+    std::vector<unsigned char> bytes = s.raw;
+    apply_edits_inplace(s, {e.id}, bytes);
+    // exactly the field's own bytes may differ
+    int diff = 0, outside = 0;
+    for (size_t i = 0; i < bytes.size(); i++)
+        if (bytes[i] != s.raw[i]) { diff++; if ((long)i < f.off || (long)i >= f.off + 4) outside++; }
+    { std::ofstream o(outPath, std::ios::binary); o.write((const char*)bytes.data(), (std::streamsize)bytes.size()); }
+    Scene s2;
+    if (!load_map_native(outPath, s2)) { printf("fieldtest: reload failed\n"); return 3; }
+    long got = -12345;
+    for (const auto& e2 : s2.entities) if (e2.id == e.id)
+        for (const auto& f2 : e2.fields) if (f2.name == f.name) got = f2.i;
+    bool ok = (got == want) && outside == 0 && diff > 0 &&
+              s2.entities.size() == s.entities.size();
+    printf("fieldtest bytesChanged=%d outsideField=%d readback=%ld %s\n",
+           diff, outside, got, ok ? "OK" : "FAIL");
+    return ok ? 0 : 3;
+}
+
 // dev: end-to-end check that a structural edit no longer eats pending field edits
 // and that undo/redo of add+delete round-trips the byte buffer exactly.
 static int structTest(const char* mapPath, const char* outPath) {
@@ -1495,6 +1932,12 @@ int main(int argc, char** argv) {
             std::string tmp = vfs_resolve(argv[i+2], "");
             if (!tmp.empty()) loadPath = tmp;
             i += 2;
+        }
+        else if (!strcmp(argv[i], "--protoplacetest") && i + 3 < argc) {
+            return protoPlaceTest(argv[i+1], argv[i+2], argv[i+3]);
+        }
+        else if (!strcmp(argv[i], "--fieldtest") && i + 2 < argc) {
+            return fieldTest(argv[i+1], argv[i+2]);
         }
         else if (!strcmp(argv[i], "--structtest") && i + 1 < argc) {
             const char* out = (i + 2 < argc && argv[i+2][0] != '-') ? argv[i+2] : nullptr;
@@ -1802,6 +2245,7 @@ int main(int argc, char** argv) {
         drawModesPanel();
         drawModePanel();
         drawEntities();
+        drawChanges();
         drawProperties();
 
         // central viewport region (empty dock node -> 3D shows through)
@@ -1834,22 +2278,26 @@ int main(int argc, char** argv) {
             if (ImGui::IsKeyPressed(ImGuiKey_G)) groundSelection();
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) selectNone();
         }
-        // [ / ] rotate the selected entity 5 degrees (yaw)
+        // clipboard + structural shortcuts (operate on the whole selection)
+        if (!kio.WantCaptureKeyboard) {
+            if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) copySelection();
+            if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) cutSelection();
+            if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
+                if (kio.KeyShift) pasteClipboard(true, 0, 0);
+                else pasteClipboard(false, g_cam.target.x, g_cam.target.z);
+            }
+            if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D) && !g_selection.empty()) {
+                copySelection();
+                pasteClipboard(false, g_clipAnchor[0] + 8.0f, g_clipAnchor[1] + 8.0f);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deleteSelection();
+        }
+        // [ / ] rotate the primary selection 5 degrees (yaw)
         if (!kio.WantCaptureKeyboard && g_selected >= 0 &&
             g_selected < (int)g_scene.entities.size()) {
             Entity& e = g_scene.entities[g_selected];
-            const long selId = e.id;
-            const float selPos[3] = { e.pos[0], e.pos[1], e.pos[2] };
             if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { snapEntity(g_selected); e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { snapEntity(g_selected); e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
-            // Delete / Ctrl+D: structural, in memory, undoable. Both rebuild the
-            // entity list, so `e` must not be touched afterwards.
-            if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-                deleteEntityById(selId);
-            } else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
-                float p[3] = { selPos[0] + 8.0f, selPos[1] + 8.0f, selPos[2] };
-                placeEntityClone(selId, p);
-            }
         }
 
         ImGui::SetNextWindowBgAlpha(0.35f);
