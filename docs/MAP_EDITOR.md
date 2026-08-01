@@ -69,8 +69,12 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       size-preserving, round-trip intact.
 - [x] **M2b — terrain height edits** in place (`heightmap_info`, `set_height`,
       `set_heights`). Verified: brush-patch raise persists, size-preserving,
-      round-trip intact. (Splat-layer painting still TODO.)
-- [ ] **M3 — structural edits** (add/remove entity; size recompute up the chain).
+      round-trip intact. (Splat-layer painting landed natively in M10.)
+- [x] **M3 — structural edits** (add/remove entity; size recompute up the chain).
+      Done natively in C++ (`mapfile.cpp`), not in the Python oracle: the buffer
+      ops patch every ancestor container size, the OBJS `schema_offset` and the
+      UNTS `entity_count`. Verified by `--addtest` / `--deltest` / `--structtest`
+      and cross-checked against `cpcw_map.py entities` + `roundtrip`.
 - [x] **M4 — C++ editor scaffold** (`mapeditor/`): GLFW+OpenGL+ImGui, docking,
       File/Edit/View/Mode menus, mode switcher, swappable tool/param panel,
       Properties panel, dockable viewport. Builds (MSVC) and runs.
@@ -138,9 +142,39 @@ panel is schema-driven (units expose Player/Level/HP/Ammo/Fuel/Cargo/AI/upgrades
       - **Browser**: THMB thumbnails flipped upright, grouped by category
         (Vehicles/Buildings/Objects/Nature…), placement grounded on the terrain +
         auto-selected (view-preserving reload).
-- [ ] **Remaining**: placing prototypes not already on the map (needs OBJT
-      construction from the schema); confirm the model handedness axis vs the game;
-      roads/decals are view-only (not yet editable).
+- [x] **M10 — trustworthy editing, real selection, full content pipeline**:
+      - **Structural edits happen in memory** (`delete_entity_bytes` /
+        `add_entity_bytes` / `insert_objt_at_index` / `erase_objt_bytes` +
+        `reparse_entities`), not by writing a temp map and reloading it. That
+        removed two silent data-loss defects: a place/delete used to discard every
+        unsaved field edit, and the undo stack was keyed on entity *index*, which
+        an insert renumbers. Undo is keyed on entity ID and structural commands
+        carry the exact OBJT bytes, so undo/redo are byte-identical.
+      - **GPU colour-code picking**: an offscreen pass draws terrain as code 0 and
+        each model flat-shaded with its entity index in RGB. One pixel read =
+        exact click select (occlusion- and alpha-cut-correct); a rectangle read =
+        rubber-band multi-select. Runs on demand, not per frame.
+      - **Selection set + ImGuizmo** translate/rotate about the centroid, world or
+        local, grid/angle snapping, drop-to-ground, batched undo.
+      - **Place any prototype**, not just ones already on the map. No OBJT
+        construction needed: ProtoDB's `SP<X>` schema is the map's `S<X>Desc`, and
+        every prototype GUID is exactly 36 chars, so it is "clone a record of the
+        matching schema, splice the GUID" — size-preserving. Browser sources from
+        ProtoDB with search, categories, thumbnails and favourites.
+      - **Clipboard** (cut/copy/paste/paste-in-place over the selection) and a
+        **schema-driven Properties panel** covering every fixed-width field.
+      - **Changes since last save** panel derived from a per-entity saved-state copy.
+      - **Terrain**: SetPlane / Raise>Plane / Lower>Plane / Grab wired to the Height
+        slider, Ctrl-invert, and **splat layer painting** (Blend / TileFill) written
+        back through `Scene::splatOff` — size-preserving, so still byte-faithful.
+      - **Entity `Scale`** is read and applied (2884/3427 records on M_01 carry it).
+      - Save As / overwrite-original with two-phase `.tmp` -> `.bak` -> rename.
+      - Every write path has a headless harness: `--structtest`, `--fieldtest`,
+        `--splattest`, `--protoplacetest`, `--picktest`.
+- [ ] **Remaining**: roads/decals are decoded and rendered but view-only (no write
+      path); splines/rivers, lake & water data, the WTHR weather/lighting block and
+      the trigger system are not decoded — those modes open a raw chunk inspector
+      instead of offering invented fields.
 
 See also `docs/MAP_FORMAT.md`, `cpcw_map.py`, the `.srm` viewer under `viewer/`
 (the renderer whose UX this echoes), and `CPCWMap_Blender/` (existing preview).
