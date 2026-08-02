@@ -794,30 +794,40 @@ public:
         modelCache.clear(); instances.clear(); texCache.clear(); modelsBuilt = false;
     }
 
-    // wireframe AABB of `inst` (transformed by its xf), drawn depth-off so the
-    // highlight is always visible. Used for selected/hovered entities.
-    void drawHiliteBox(const M4& mvp, const ModelInst& inst, float r, float g, float b) {
-        V3 lo = inst.model->bmin, hi = inst.model->bmax;
-        if (lo.x > hi.x) return;
-        V3 c[8] = {{lo.x,lo.y,lo.z},{hi.x,lo.y,lo.z},{hi.x,lo.y,hi.z},{lo.x,lo.y,hi.z},
-                   {lo.x,hi.y,lo.z},{hi.x,hi.y,lo.z},{hi.x,hi.y,hi.z},{lo.x,hi.y,hi.z}};
-        V3 w[8]; const float* m = inst.xf.m;
-        for (int i=0;i<8;i++){
-            w[i].x=m[0]*c[i].x+m[4]*c[i].y+m[8]*c[i].z+m[12];
-            w[i].y=m[1]*c[i].x+m[5]*c[i].y+m[9]*c[i].z+m[13];
-            w[i].z=m[2]*c[i].x+m[6]*c[i].y+m[10]*c[i].z+m[14];
+    // World-space AABB of an entity: the union over every model instance it owns,
+    // each model's local AABB transformed by that instance's matrix. False if the
+    // entity has no model geometry (effects, sound emitters) — the caller then has
+    // nothing to box and should mark the spot instead.
+    //
+    // Replaces the old drawHiliteBox: selection is drawn as a 2D overlay now, so
+    // the viewport only has to supply the measurement, not the presentation.
+    bool entityWorldAABB(int entIdx, V3& lo, V3& hi) const {
+        bool any = false;
+        for (const auto& inst : instances) {
+            if (inst.entIdx != entIdx || !inst.model) continue;
+            V3 a = inst.model->bmin, b = inst.model->bmax;
+            if (a.x > b.x) continue;
+            V3 c[8] = {{a.x,a.y,a.z},{b.x,a.y,a.z},{b.x,a.y,b.z},{a.x,a.y,b.z},
+                       {a.x,b.y,a.z},{b.x,b.y,a.z},{b.x,b.y,b.z},{a.x,b.y,b.z}};
+            const float* m = inst.xf.m;
+            for (int i=0;i<8;i++){
+                V3 w{ m[0]*c[i].x+m[4]*c[i].y+m[8]*c[i].z+m[12],
+                      m[1]*c[i].x+m[5]*c[i].y+m[9]*c[i].z+m[13],
+                      m[2]*c[i].x+m[6]*c[i].y+m[10]*c[i].z+m[14] };
+                if (!any) { lo = hi = w; any = true; }
+                else {
+                    lo.x = std::min(lo.x,w.x); lo.y = std::min(lo.y,w.y); lo.z = std::min(lo.z,w.z);
+                    hi.x = std::max(hi.x,w.x); hi.y = std::max(hi.y,w.y); hi.z = std::max(hi.z,w.z);
+                }
+            }
         }
-        static const int E[24]={0,1,1,2,2,3,3,0, 4,5,5,6,6,7,7,4, 0,4,1,5,2,6,3,7};
-        std::vector<float> ln; ln.reserve(24*3);
-        for (int i=0;i<24;i++){ ln.push_back(w[E[i]].x); ln.push_back(w[E[i]].y); ln.push_back(w[E[i]].z); }
-        glDisable(GL_DEPTH_TEST);
-        drawThickLines(mvp, ln, r, g, b, 2.5f);   // real thickness (glLineWidth is clamped)
-        glEnable(GL_DEPTH_TEST);
+        return any;
     }
 
     void render(const Camera& cam, float aspect, bool wireframe, int selected,
                 bool showModels = true, bool showDots = true, int hovered = -1) {
         M4 mvp = cam.viewProj(aspect);
+        (void)hovered;   // selection/hover boxes are 2D overlays now; see below
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
         if (showModels && !instances.empty()) {
@@ -851,15 +861,13 @@ public:
             }
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             if (cullMode) glDisable(GL_CULL_FACE);
-            // hover (cyan) + selection highlight boxes. The primary selection is
-            // yellow (it is what the Properties panel and the gizmo act on); the
-            // rest of a multi-selection is a dimmer orange.
-            if (hovered >= 0 || selected >= 0 || !selectionSet.empty())
-                for (auto& inst : instances) {
-                    if (inst.entIdx == selected)                 drawHiliteBox(mvp, inst, 1.0f, 0.85f, 0.15f);
-                    else if (selectionSet.count(inst.entIdx))    drawHiliteBox(mvp, inst, 0.95f, 0.55f, 0.12f);
-                    else if (inst.entIdx == hovered)             drawHiliteBox(mvp, inst, 0.30f, 0.90f, 1.0f);
-                }
+            // Selection and hover boxes used to be drawn HERE, depth-test off —
+            // which was the bug. Depth-test off also means no depth WRITE, so the
+            // terrain and overlay passes below happily painted over the lines. A
+            // box was only visible where some already-drawn model sat behind it to
+            // fail terrain's depth test; over open ground it vanished. They are 2D
+            // overlays in main.cpp now (drawSelectionOverlay), drawn after the
+            // whole scene, so nothing can occlude them.
         }
         if (terrainCount) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);

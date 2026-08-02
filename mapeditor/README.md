@@ -77,7 +77,8 @@ Every write path has a no-window check that runs from the command line:
 | Flag | Checks |
 |---|---|
 | `--selftest --load <map>` | parse summary (entities, grid, Scale field, splat offset) |
-| `--shot <out.bmp>` | render one frame to a BMP (cannot show mouse-driven UI) |
+| `--shot <out.bmp>` | render one scene frame to a BMP — **no ImGui**, so it cannot show the selection overlay or any UI |
+| `--uishot <out.bmp> [--uishot-frames N] [--uishot-select IDX]` | run the real frame loop and capture the whole window, UI overlays included |
 | `--picktest [out.bmp]` | colour-code pick buffer resolves entities; optional dump |
 | `--structtest <map> [out]` | a field edit survives a structural insert; undo/redo byte-exact |
 | `--fieldtest <map> <out>` | one schema field written, nothing outside it touched |

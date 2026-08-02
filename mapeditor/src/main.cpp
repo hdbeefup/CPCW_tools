@@ -1683,6 +1683,131 @@ static void commitBatch(std::vector<EntSnap>& start) {
     start.clear();
 }
 
+// --- selection overlay -------------------------------------------------------
+// Ported from the S.W.I.N.E. editor, which draws its selection markers the same
+// way and does not have this editor's occlusion problem.
+//
+// The boxes used to be GL line geometry submitted mid-scene with depth-test off.
+// Depth-test off disables depth WRITES too, so every later pass — terrain, road
+// and decal overlays — painted straight over them; a box only survived where an
+// already-drawn model happened to sit behind it. Drawing them as 2D overlays
+// after the entire scene removes the ordering question rather than tuning it.
+//
+// Foreground draw list, clipped to the central dock node. The background list
+// would be the tidier choice — under the panels automatically — but it renders
+// beneath the dockspace host window and never appears (verified: geometry and
+// projection were correct, the lines simply were not visible). ImGuizmo already
+// uses the foreground list for the same reason. The explicit clip rect gives
+// back what the background list would have done for free: nothing can spill
+// outside the viewport onto the docked panels.
+
+static bool projectToView(const M4& vp, const V3& w, const ImVec2& cmin,
+                          float W, float H, ImVec2& out) {
+    float cx = vp.m[0]*w.x + vp.m[4]*w.y + vp.m[8]*w.z + vp.m[12];
+    float cy = vp.m[1]*w.x + vp.m[5]*w.y + vp.m[9]*w.z + vp.m[13];
+    float cw = vp.m[3]*w.x + vp.m[7]*w.y + vp.m[11]*w.z + vp.m[15];
+    if (cw <= 0.001f) return false;                 // behind the eye
+    out = ImVec2(cmin.x + (cx/cw*0.5f + 0.5f) * W,
+                 cmin.y + (1.0f - (cy/cw*0.5f + 0.5f)) * H);
+    return true;
+}
+
+static void drawSelectionOverlay(const ImVec2& cmin, const ImVec2& cmax) {
+    if (!g_scene.loaded) return;
+    float W = cmax.x - cmin.x, H = cmax.y - cmin.y;
+    if (W <= 8 || H <= 8) return;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->PushClipRect(cmin, cmax, true);
+    static int dbg = getenv("MAPEDITOR_DEBUG_SEL") ? 1 : 0;
+    M4 vp = g_cam.viewProj(W / H);
+
+    // Primary selection is yellow — it is what Properties and the gizmo act on;
+    // the rest of a multi-selection is orange, hover is cyan.
+    struct Mark { int idx; ImU32 col; bool handles; };
+    std::vector<Mark> marks;
+    for (int si : g_selection)
+        if (si != g_selected) marks.push_back({ si, IM_COL32(242, 140, 30, 220), false });
+    if (g_hovered >= 0 && g_hovered != g_selected && !g_selection.count(g_hovered))
+        marks.push_back({ g_hovered, IM_COL32(77, 230, 255, 200), false });
+    if (g_selected >= 0) marks.push_back({ g_selected, IM_COL32(255, 210, 40, 235), true });
+
+    const ImU32 kHandle = IM_COL32(255, 255, 255, 255);
+    const ImU32 kEdge   = IM_COL32(0, 0, 0, 200);
+
+    for (const Mark& mk : marks) {
+        if (mk.idx < 0 || mk.idx >= (int)g_scene.entities.size()) continue;
+        const Entity& e = g_scene.entities[mk.idx];
+        if (!g_showKind[(e.kind >= 0 && e.kind < 3) ? e.kind : 2]) continue;
+
+        // Scene stores Z-up; the viewport is Y-up. Same swap pickEntity uses.
+        V3 org{ e.pos[0], e.pos[2], e.pos[1] };
+
+        V3 lo, hi;
+        bool hasBox = g_vp.entityWorldAABB(mk.idx, lo, hi);
+        if (dbg) {
+            ImVec2 dp; bool dok = projectToView(vp, org, cmin, W, H, dp);
+            fprintf(stderr, "[sel] idx=%d kind=%d aabb=%d org=(%.1f,%.1f,%.1f) "
+                    "proj=%d (%.0f,%.0f) rect=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                    mk.idx, e.kind, (int)hasBox, org.x, org.y, org.z,
+                    (int)dok, dp.x, dp.y, cmin.x, cmin.y, cmax.x, cmax.y);
+        }
+        if (!hasBox) {
+            // No geometry (effects, emitters) — mark the spot so a model-less
+            // entity is still visibly selected. The old GL path skipped these
+            // entirely because it iterated model instances.
+            const float r = 1.0f;
+            lo = V3{ org.x - r, org.y,            org.z - r };
+            hi = V3{ org.x + r, org.y + r * 2.0f, org.z + r };
+        }
+
+        // 8 corners, ground four first, then 12 edges. Box edges are straight in
+        // world space so projecting the endpoints is exact — no need to subdivide.
+        const V3 c[8] = {
+            {lo.x,lo.y,lo.z},{hi.x,lo.y,lo.z},{hi.x,lo.y,hi.z},{lo.x,lo.y,hi.z},
+            {lo.x,hi.y,lo.z},{hi.x,hi.y,lo.z},{hi.x,hi.y,hi.z},{lo.x,hi.y,hi.z}
+        };
+        ImVec2 pt[8]; bool ok[8];
+        for (int i = 0; i < 8; i++) ok[i] = projectToView(vp, c[i], cmin, W, H, pt[i]);
+
+        static const int E[12][2] = { {0,1},{1,2},{2,3},{3,0},
+                                      {4,5},{5,6},{6,7},{7,4},
+                                      {0,4},{1,5},{2,6},{3,7} };
+        for (int i = 0; i < 12; i++)
+            if (ok[E[i][0]] && ok[E[i][1]])
+                dl->AddLine(pt[E[i][0]], pt[E[i][1]], mk.col, mk.handles ? 2.0f : 1.5f);
+
+        if (!mk.handles) continue;
+
+        // Handles are a fixed pixel size, so on a distant or small object the
+        // four of them merge into an illegible blob that is larger than the box
+        // itself. Below that threshold the outline alone reads better.
+        float sx0 = pt[0].x, sx1 = pt[0].x, sy0 = pt[0].y, sy1 = pt[0].y;
+        for (int i = 1; i < 8; i++) {
+            if (!ok[i]) continue;
+            sx0 = std::min(sx0, pt[i].x); sx1 = std::max(sx1, pt[i].x);
+            sy0 = std::min(sy0, pt[i].y); sy1 = std::max(sy1, pt[i].y);
+        }
+        if (sx1 - sx0 < 26.0f && sy1 - sy0 < 26.0f) continue;
+
+        // Control points on the ground corners of the primary selection only —
+        // on every box in a large multi-selection they become noise.
+        for (int i = 0; i < 4; i++) {
+            if (!ok[i]) continue;
+            dl->AddRectFilled(ImVec2(pt[i].x-4, pt[i].y-4), ImVec2(pt[i].x+4, pt[i].y+4), kHandle);
+            dl->AddRect      (ImVec2(pt[i].x-4, pt[i].y-4), ImVec2(pt[i].x+4, pt[i].y+4), kEdge);
+        }
+        // Anchor dot at the entity's own origin, not the box centre — the origin
+        // is what Pos stores and what rotation pivots around.
+        ImVec2 base;
+        if (projectToView(vp, org, cmin, W, H, base)) {
+            dl->AddCircleFilled(base, 4.0f, kHandle);
+            dl->AddCircle(base, 4.0f, kEdge);
+        }
+    }
+    dl->PopClipRect();
+}
+
 // 3D translate/rotate handles over the whole selection (ImGuizmo). Runs BEFORE
 // updateCamera each frame so IsOver()/IsUsing() can gate viewport input — a click
 // on a handle must not also pick or orbit.
@@ -2155,10 +2280,19 @@ static int structTest(const char* mapPath, const char* outPath) {
 }
 
 int main(int argc, char** argv) {
-    std::string loadPath, shotPath, pickDump; bool selftest = false, pickTest = false;
+    std::string loadPath, shotPath, pickDump, uiShotPath; bool selftest = false, pickTest = false;
+    int uiShotFrames = 0, uiShotSelect = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
+        // --shot renders the bare scene FBO with no ImGui, so it cannot show
+        // anything drawn as a UI overlay — which now includes the selection
+        // boxes. --uishot runs the real frame loop and captures the window.
+        else if (!strcmp(argv[i], "--uishot") && i + 1 < argc) {
+            uiShotPath = argv[++i]; if (uiShotFrames < 4) uiShotFrames = 4;
+        }
+        else if (!strcmp(argv[i], "--uishot-frames") && i + 1 < argc) uiShotFrames = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--uishot-select") && i + 1 < argc) uiShotSelect = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
         else if (!strcmp(argv[i], "--picktest")) {
             pickTest = true;
@@ -2464,6 +2598,7 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
+    int uiShotFrame = 0;
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
@@ -2573,6 +2708,16 @@ int main(int argc, char** argv) {
             g_vp.refreshSplatWeights(g_scene); g_splatTexDirty = false;
         }
 
+        // Scripted selection for --uishot: applied once the scene and its model
+        // instances exist, so entityWorldAABB has something to measure.
+        if (uiShotSelect >= 0 && g_scene.loaded && !g_sceneDirty) {
+            selectOnly(uiShotSelect); uiShotSelect = -1;
+        }
+
+        // After the rebuild block, so a box tracks the model in the same frame a
+        // drag moved it, and before Render() so it makes it into the draw data.
+        drawSelectionOverlay(cmin, cmax);
+
         ImGui::Render();
         int fbw, fbh; glfwGetFramebufferSize(win, &fbw, &fbh);
         ImGuiIO& io = ImGui::GetIO();
@@ -2600,6 +2745,18 @@ int main(int argc, char** argv) {
         }
 
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Full-window capture: everything the user sees, UI overlays included.
+        // Taken before the swap, from the back buffer we just finished drawing.
+        if (!uiShotPath.empty() && ++uiShotFrame >= uiShotFrames) {
+            std::vector<unsigned char> px((size_t)fbw * fbh * 3);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, fbw, fbh, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+            writeBMP(uiShotPath.c_str(), fbw, fbh, px.data());
+            printf("wrote %s (%dx%d)\n", uiShotPath.c_str(), fbw, fbh);
+            glfwSwapBuffers(win);
+            break;
+        }
         glfwSwapBuffers(win);
     }
     ImGui_ImplOpenGL3_Shutdown();
