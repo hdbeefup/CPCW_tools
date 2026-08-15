@@ -87,6 +87,8 @@ static bool  g_glReady = false, g_sceneDirty = false;
 static int   g_mode = 0, g_activeTool = 0, g_selected = -1, g_hovered = -1;
 static ModeKind modeKind() { return kModes[g_mode].kind; }
 static bool  modeIs(ModeKind k) { return kModes[g_mode].kind == k; }
+static int   g_lightMode = 0;      // 0 neutral, 1 map preset, 2 preset + fog
+static std::string g_presetArg;    // --preset <name|#slot>, for headless shots
 static float g_brushSize = 2.0f, g_brushHeight = 0.0f, g_brushPress = 0.5f;
 static bool  g_wireframe = false;
 static bool  g_showModes = true, g_showPanel = true, g_showProps = true,
@@ -1039,6 +1041,15 @@ static void drawMenuBar() {
         ImGui::MenuItem("Roads", nullptr, &g_vp.showRoads);
         ImGui::MenuItem("Decals", nullptr, &g_vp.showDecals);
         ImGui::MenuItem("Rivers", nullptr, &g_vp.showRivers);
+        if (ImGui::BeginMenu("Lighting")) {
+            // Neutral is the DEFAULT: the 30 multiplayer Night_multi presets carry
+            // SunColor exactly (0,0,0), which would render a map flat blue and
+            // unusable to edit. Mode 7 switches to Preset while it is open.
+            if (ImGui::MenuItem("Editor (neutral)", "L", g_lightMode==0)) g_lightMode=0;
+            if (ImGui::MenuItem("Map preset",       nullptr, g_lightMode==1)) g_lightMode=1;
+            if (ImGui::MenuItem("Map preset + fog", nullptr, g_lightMode==2)) g_lightMode=2;
+            ImGui::EndMenu();
+        }
         ImGui::Separator();
         if (ImGui::BeginMenu("Model cull")) {   // hides hull interior (pick what looks right)
             if (ImGui::MenuItem("Off (two-sided)", nullptr, g_vp.cullMode==0)) g_vp.cullMode=0;
@@ -1231,6 +1242,38 @@ static void drawPrototypeBrowser() {
 // with the editable panel. Showing the real values now is what makes the decode
 // checkable by eye rather than only by --wthrtest.
 static int g_lightPreset = -1;
+
+// Resolve --preset into an index of g_scene.weather (-1 = leave as-is).
+static int presetIndexFromArg() {
+    if (g_presetArg.empty()) return -1;
+    if (g_presetArg[0] == '#') {
+        int slot = atoi(g_presetArg.c_str() + 1);
+        for (size_t k = 0; k < g_scene.weather.size(); k++)
+            if (g_scene.weather[k].slot == slot) return (int)k;
+        return -1;
+    }
+    for (size_t k = 0; k < g_scene.weather.size(); k++)
+        if (g_scene.weather[k].name == g_presetArg) return (int)k;
+    return -1;
+}
+
+// Push the environment the viewport should shade with. While the Light panel is
+// open the SELECTED preset drives the preview -- otherwise editing "Sundown"
+// while the viewport renders "Default" makes every colour drag look broken.
+// Everywhere else the engine-active preset drives it.
+static void syncEnvironment() {
+    if (!g_scene.loaded || g_scene.weather.empty() || g_lightMode == 0) {
+        g_vp.setEnvironment(nullptr, 0);
+        return;
+    }
+    int forced = presetIndexFromArg();
+    int idx = forced >= 0 ? forced
+            : (modeIs(MK_LIGHT) && g_lightPreset >= 0 &&
+               g_lightPreset < (int)g_scene.weather.size())
+              ? g_lightPreset : g_scene.weatherActive;
+    if (idx < 0 || idx >= (int)g_scene.weather.size()) { g_vp.setEnvironment(nullptr, 0); return; }
+    g_vp.setEnvironment(&g_scene.weather[(size_t)idx], g_lightMode);
+}
 
 static void drawLightPanel() {
     if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
@@ -2579,6 +2622,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--uishot-select") && i + 1 < argc) uiShotSelect = atoi(argv[++i]);
         // Overlay visibility from the command line, so a --shot pair can isolate
         // exactly one layer's contribution ("count pixels, not records").
+        else if (!strcmp(argv[i], "--lighting") && i + 1 < argc) {
+            const char* v = argv[++i];
+            g_lightMode = !strcmp(v,"preset") ? 1 : !strcmp(v,"presetfog") ? 2 : 0;
+        }
+        // Accepts a name OR "#<slot>" — preset names are not unique (one map ships
+        // two live presets both called Night_multi).
+        else if (!strcmp(argv[i], "--preset") && i + 1 < argc) g_presetArg = argv[++i];
         else if (!strcmp(argv[i], "--no-rivers")) g_vp.showRivers = false;
         else if (!strcmp(argv[i], "--no-roads"))  g_vp.showRoads  = false;
         else if (!strcmp(argv[i], "--no-decals")) g_vp.showDecals = false;
@@ -2677,6 +2727,84 @@ int main(int argc, char** argv) {
             for (size_t k=0;k<s.roadSplines.size() && k<4;k++)
                 printf("  spline[%zu] nodes=%zu %s\n", k, s.roadSplines[k].cx.size(), s.roadSplines[k].tex.c_str());
             for (size_t k=0;k<s.decals.size() && k<3;k++) printf("  decal[%zu] %s\n", k, s.decals[k].tex.c_str());
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--sunprobe") && i + 1 < argc) {
+            // dev: --sunprobe <map>
+            //
+            // WTHR stores the direction light TRAVELS, in the engine's LH Y-up
+            // space; component 1 is vertical (< 0 on 219/219 records). That fixes
+            // the vertical axis but leaves four horizontal sign/swap candidates.
+            // The editor's documented engine->GL transform (loadModel negates X
+            // and Z, a 180-deg Y rotation) picks one of them: L = (D.x, -D.y, D.z).
+            //
+            // This scores all four against the light that was hard-coded in the
+            // renderer long before WTHR was decoded — an independently-arrived-at
+            // vector that a correct swizzle must reproduce. Printing every
+            // candidate keeps the choice falsifiable instead of merely plausible.
+            Scene s;
+            if (!load_map_native(argv[i+1], s)) return 2;
+            if (s.weather.empty()) { printf("sunprobe: no WTHR presets\n"); return 3; }
+            int di = -1;
+            for (int f = 0; f < kWeatherFieldCount; f++)
+                if (!strcmp(kWeatherFields[f].name, "SunDirection")) di = f;
+            const float legacy[3] = { 0.4f, 0.8f, 0.35f };
+            float ll = std::sqrt(legacy[0]*legacy[0]+legacy[1]*legacy[1]+legacy[2]*legacy[2]);
+            struct Cand { const char* name; int sx, sz; bool swap; };
+            const Cand cands[] = {
+                { "( D.x, -D.y,  D.z)  [engine->GL: negate X and Z, as loadModel does]", +1, +1, false },
+                { "(-D.x, -D.y, -D.z)  [plain -D, no handedness change]",                -1, -1, false },
+                { "(-D.x, -D.y,  D.z)  [X only]",                                        -1, +1, false },
+                { "( D.z, -D.y,  D.x)  [horizontal swap]",                               +1, +1, true  },
+            };
+            // Compare ONLY the engine-active preset. Averaging over every preset
+            // in a map is meaningless: Rain, Sundown and Sunny legitimately point
+            // different ways, and only one vector could ever have been the
+            // reference for a single hard-coded constant.
+            int ai = s.weatherActive >= 0 ? s.weatherActive : 0;
+            const WeatherPreset& w = s.weather[(size_t)ai];
+            const float* D = w.values[(size_t)di].data();
+            printf("sunprobe %s  preset \"%s\" (slot %d)  D = %.4f %.4f %.4f\n",
+                   s.name.c_str(), w.name.c_str(), w.slot, D[0], D[1], D[2]);
+            int best = -1; float bestAng = 1e9f;
+            for (int c = 0; c < 4; c++) {
+                float v[3];
+                v[0] = cands[c].swap ? D[2] * cands[c].sx : D[0] * cands[c].sx;
+                v[1] = -D[1];
+                v[2] = cands[c].swap ? D[0] * cands[c].sz : D[2] * cands[c].sz;
+                float vl = std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+                if (vl < 1e-6f) continue;
+                float dot = (v[0]*legacy[0]+v[1]*legacy[1]+v[2]*legacy[2])/(vl*ll);
+                float ang = acosf(std::max(-1.0f, std::min(1.0f, dot))) * 57.2957795f;
+                printf("  cand %d  %-58s  %.3f %.3f %.3f   %6.1f deg\n",
+                       c, cands[c].name, v[0]/vl, v[1]/vl, v[2]/vl, ang);
+                if (ang < bestAng) { bestAng = ang; best = c; }
+            }
+            printf("  legacy hard-coded light                                          "
+                   "     %.3f %.3f %.3f\n", legacy[0]/ll, legacy[1]/ll, legacy[2]/ll);
+            printf("  closest to legacy on this map: candidate %d (%.1f deg)\n", best, bestAng);
+            // The legacy constant can only have been eyeballed from ONE map. The
+            // stock Default (0.4156, -0.8090, 0.4156) recurs across maps and is
+            // the plausible source, so a map carrying it discriminates; a map with
+            // its own sun direction does not, and must not be read as evidence.
+            bool stock = fabsf(D[0] - 0.4156f) < 1e-3f && fabsf(D[1] + 0.8090f) < 1e-3f &&
+                         fabsf(D[2] - 0.4156f) < 1e-3f;
+            if (stock) {
+                printf("  this preset IS the stock Default -> discriminating. Note D.x == D.z,\n"
+                       "  so candidates 0 and 3 are mathematically identical here and cannot\n"
+                       "  be separated by this map; 1 and 2 are eliminated.\n");
+            } else {
+                printf("  this preset is map-specific, so distance to the legacy constant\n"
+                       "  carries NO information about the swizzle. Reported, not scored.\n");
+            }
+            // NO pass/fail. The legacy constant is one vector somebody eyeballed;
+            // it can only correspond to whichever map they had open, so agreement
+            // is evidence on THAT map and silence everywhere else. Reporting a
+            // winner per map would dress a single data point up as a corpus
+            // result. The vertical axis IS settled (D[1] < 0 on 219/219); the
+            // horizontal pairing is not, and the renderer stays in neutral mode by
+            // default until someone reads the engine's draw-side light setup.
+            printf("sunprobe: REPORT ONLY - the horizontal swizzle is NOT settled by this test.\n");
             return 0;
         }
         else if (!strcmp(argv[i], "--overlayscan") && i + 1 < argc) {
@@ -3077,7 +3205,11 @@ int main(int argc, char** argv) {
             fprintf(stderr, "warning: FBO incomplete\n");
         glViewport(0, 0, fbw, fbh);
         glEnable(GL_DEPTH_TEST);
-        glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
+        syncEnvironment();
+        // Clear to the fog colour when fog is on, or distant terrain fades into a
+        // band of sky that the background then cuts off.
+        if (g_vp.fogOn) glClearColor(g_vp.fogColor[0], g_vp.fogColor[1], g_vp.fogColor[2], 1.0f);
+        else            glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         g_vp.render(g_cam, (float)fbw / (float)fbh, g_wireframe, g_selected,
                     g_showModels, g_showDots);
@@ -3326,7 +3458,9 @@ int main(int argc, char** argv) {
             glEnable(GL_SCISSOR_TEST);
             glScissor(vx, vy, vw, vh);
             glViewport(vx, vy, vw, vh);
-            glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
+            syncEnvironment();
+            if (g_vp.fogOn) glClearColor(g_vp.fogColor[0], g_vp.fogColor[1], g_vp.fogColor[2], 1.0f);
+            else            glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             g_vp.render(g_cam, (float)vw / (float)vh, g_wireframe, g_selected,
                         g_showModels, g_showDots, g_hovered);

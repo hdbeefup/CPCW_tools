@@ -82,9 +82,13 @@ mode opens a raw chunk inspector (`View > Map chunks`) rather than offering
 invented fields. Lake/Water is **retired**, not pending: no lake or water data
 exists in any of the 45 shipped maps.
 
-The lighting presets are not yet applied to the viewport: the vertical axis of
-`SunDirection` is established but its horizontal swizzle is not, and guessing it
-would light every map wrong in a way that looks plausible.
+`View > Lighting` shades the viewport with the map's own preset — sun direction,
+sun colour, ambient, and distance fog — or with the neutral editor light.
+**Neutral is the default**, because the 30 multiplayer `Night_multi` presets carry
+a sun colour of exactly black and would render those maps unusable to edit. The
+horizontal axis of `SunDirection` is narrowed to two indistinguishable candidates
+rather than confirmed (`--sunprobe` reports the evidence), which is the other
+reason preset lighting is opt-in.
 
 ## Headless harnesses
 
@@ -106,6 +110,8 @@ Every write path has a no-window check that runs from the command line:
 | `--chunktile <map\|dir>` | container sizes tile exactly + every OBJS `schema_offset` points at its own SCHD |
 | `--overlayscan <map\|dir>` | GROL/GDCL/GRVL slot pools walk exactly, counts match, used-list invariants hold; river summary |
 | `--no-roads` `--no-decals` `--no-rivers` | drop one overlay layer, so a `--shot` pair isolates its pixels |
+| `--lighting {editor\|preset\|presetfog}` `--preset <name\|#slot>` | shade a `--shot` with a chosen WTHR preset |
+| `--sunprobe <map>` | score the four sun-swizzle candidates against the legacy light (reports, does not score a winner) |
 | `--uishot-mode <n>` | which mode's panel a `--uishot` captures |
 | `--paktest` `--protodbtest` `--thumbtest` `--srmcheck` | archive, prototype DB, thumbnails, model |
 

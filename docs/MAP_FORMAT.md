@@ -831,10 +831,36 @@ satisfy at once. Measured over all 45 maps / 219 records:
 
 `SunDirection[1] < 0` on every record, with components 0 and 2 taking either
 sign, means **index 1 is the vertical axis and the vector is the direction light
-travels** (downward). A shader wants `L = -SunDirection`. The remaining horizontal
-swizzle is *not yet established* — do not guess it from the editor's old
-hard-coded `{0.4, 0.8, 0.35}`, which matches M_01 `Default` in magnitude but with
-opposite horizontal signs.
+travels** (downward). A shader wants `L = -SunDirection`.
+
+### 11.2a The horizontal swizzle — HALF resolved
+
+Four candidates remain once the vertical axis is fixed. `--sunprobe` scores them
+against the light that was hard-coded in the editor's renderer long before WTHR
+was decoded, `(0.4, 0.8, 0.35)`:
+
+| # | Candidate | On the stock `Default` |
+|---|-----------|------------------------|
+| 0 | `( D.x, -D.y,  D.z)` — engine→GL, i.e. negate X and Z as `loadModel` does | **3.2°** |
+| 1 | `(-D.x, -D.y, -D.z)` — plain `-D`, no handedness change | 69.6° |
+| 2 | `(-D.x, -D.y,  D.z)` — X only | 49.3° |
+| 3 | `( D.z, -D.y,  D.x)` — horizontal swap | **3.2°** |
+
+**Candidates 1 and 2 are eliminated.** Candidates 0 and 3 cannot be separated:
+the stock `Default` is `(0.4156, -0.8090, 0.4156)`, where `D.x == D.z` makes a
+swap a no-op. Candidate 0 is implemented because it follows the engine→GL
+transform the model loader already uses.
+
+Two caveats worth keeping:
+- Only a map whose `Default` **is** that stock vector discriminates (M_01 and M_12
+  both carry it). A map with its own sun direction — M_06's is
+  `(-0.282, -0.500, -0.819)` — has no reason to match a hard-coded constant, and
+  its distance to that constant carries no information. An earlier version of this
+  probe averaged over every preset in a map and produced a different "winner" per
+  map; that was measuring nothing.
+- The swizzle is therefore **not confirmed**, only narrowed. The editor's default
+  lighting mode stays neutral, and settling it properly means reading the engine's
+  draw-side light setup.
 
 ### 11.3 NOT invariants — do not assert these hard
 

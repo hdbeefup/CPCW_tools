@@ -148,12 +148,26 @@ correctly rejected).
     the black ones are the MP `Night_multi` at exactly 0,0,0). `SunColor` is not
     clamped to 1 — it reaches 2.78. `unknown98`/`unknown9c` are read at v13 but
     absent from the reflection table: do not name them.
-  - The **sun axis is only half resolved**: `SunDirection[1] < 0` on 219/219 with
-    the other two components taking either sign, so index 1 is vertical and the
-    vector is the direction light *travels* (`L = -SunDirection`). The horizontal
-    swizzle is still open. Do **not** infer it from the old hard-coded
-    `{0.4, 0.8, 0.35}` — that matches M_01 `Default` in magnitude but with
-    opposite horizontal signs.
+  - The **sun axis is half resolved, and the half that is open is documented**.
+    `SunDirection[1] < 0` on 219/219, so index 1 is vertical and the vector is the
+    direction light *travels* (`L = -SunDirection`). Of the four horizontal
+    candidates, `--sunprobe` **eliminates two** (`-D` entirely, and X-only: 69.6°
+    and 49.3° from the legacy hard-coded light on the stock `Default`). The
+    surviving two — engine→GL negate-X-and-Z, and a horizontal swap — both land at
+    3.2° and **cannot be separated**, because the stock `Default` is
+    `(0.4156, -0.8090, 0.4156)` where `D.x == D.z` makes a swap a no-op. The
+    negate-X-and-Z form is implemented, because it is the transform `loadModel`
+    already applies. **Not confirmed — narrowed.**
+    - Only a map whose `Default` IS that stock vector discriminates (M_01, M_12).
+      M_06's `Default` is `(-0.282, -0.500, -0.819)` and has no reason to match a
+      hard-coded constant; its distance to one means nothing. **Eliminated
+      hypothesis:** a first version of `--sunprobe` averaged the angle over every
+      preset in a map and named a different winner per map (2, 1, 2) — it was
+      averaging sunset against noon against night. Do not re-derive that.
+    - Corroboration for the implemented choice: under it, the `Default` preset
+      renders within ~7 mean levels of neutral shading, which is what a 3.2°
+      direction difference predicts; a 49–70° error would light the map from a
+      visibly different quadrant.
 - **GROL / GDCL / GRVL are SLOT POOLS**, not "a 24-byte header then records with a
   9-or-18-byte prefix" (that prefix was a free slot plus a real slot header):
   `u32 usedCount, freeHead, freeTail, usedHead, usedTail, slotCount`, then

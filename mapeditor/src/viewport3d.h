@@ -4,6 +4,7 @@
 #pragma once
 #include "glcore.h"
 #include "scene.h"
+#include "weather.h"          // kWeatherFields[] — the WTHR field table
 #include "protodb.h"
 #include "vfs.h"             // resolve logical paths to disk or extracted-from-pak temp
 #include "srm_model.h"        // viewer's .srm geometry loader (added to the build)
@@ -106,22 +107,44 @@ public:
             "#version 330 core\n"
             "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
             "layout(location=2) in vec3 aCol;\n"
-            "uniform mat4 uMVP; out vec3 vN; out float vH; out vec3 vCol;\n"
-            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aN; vH=aPos.y; vCol=aCol; }\n",
+            "uniform mat4 uMVP; out vec3 vN; out float vH; out vec3 vCol; out vec3 vWorld;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aN; vH=aPos.y; vCol=aCol; vWorld=aPos; }\n",
             "#version 330 core\n"
-            "in vec3 vN; in float vH; in vec3 vCol; out vec4 F;\n"
-            "uniform vec3 uLight; uniform int uUseColor;\n"
+            "in vec3 vN; in float vH; in vec3 vCol; in vec3 vWorld; out vec4 F;\n"
+            "uniform vec3 uLight, uSunCol, uAmb; uniform int uUseColor, uLightMode;\n"
+            "uniform vec3 uFogCol, uEye; uniform float uFogNear, uFogFar; uniform int uFogOn;\n"
             "void main(){ vec3 n=normalize(vN);\n"
-            " float d=max(dot(n,normalize(uLight)),0.0)*0.75+0.25;\n"
+            " float nl=max(dot(n,normalize(uLight)),0.0);\n"
+            " float d=nl*0.75+0.25;\n"
             " vec3 col;\n"
             " if(uUseColor==1){ col=vCol; }\n"
             " else if(vH<0.0){ col=mix(vec3(0.20,0.30,0.50),vec3(0.34,0.44,0.32),clamp(vH/-20.0+1.0,0.0,1.0)); }\n"
             " else { col=mix(vec3(0.34,0.44,0.30),vec3(0.55,0.50,0.40),clamp(vH/25.0,0.0,1.0));\n"
             "        col=mix(col,vec3(0.9),clamp((vH-18.0)/12.0,0.0,1.0)); }\n"
-            " F=vec4(col*d,1.0); }\n");
+            // uLightMode 0 evaluates the ORIGINAL expression, ungamma'd, so the
+            // "nothing changed" regression against the pre-WTHR build is exact.
+            " if(uLightMode==0){ F=vec4(col*d,1.0); }\n"
+            // No gamma encode here. The layer textures are sRGB and never get
+            // linearized, so a 1/2.2 encode on top double-brightens — it made the
+            // "Default" preset, whose sun direction is within 3 deg of the neutral
+            // light, render visibly blown out beside it. Preset mode is a pure
+            // LIGHTING change: the same texture*factor form as neutral, with the
+            // preset's sun colour and ambient replacing the fixed 0.75/0.25 ramp.
+            " else { F=vec4(col*(uSunCol*nl+uAmb),1.0); }\n"
+            " if(uFogOn==1){ float fg=clamp((distance(vWorld,uEye)-uFogNear)/max(uFogFar-uFogNear,1e-3),0.0,1.0);\n"
+            "   F.rgb=mix(F.rgb,uFogCol,fg); }\n"
+            "}\n");
         uTerrMVP = glGetUniformLocation(terrainProg, "uMVP");
         uTerrLight = glGetUniformLocation(terrainProg, "uLight");
         uTerrUseColor = glGetUniformLocation(terrainProg, "uUseColor");
+        uTerrSun = glGetUniformLocation(terrainProg, "uSunCol");
+        uTerrAmb = glGetUniformLocation(terrainProg, "uAmb");
+        uTerrLightMode = glGetUniformLocation(terrainProg, "uLightMode");
+        uTerrFogCol = glGetUniformLocation(terrainProg, "uFogCol");
+        uTerrFogNear = glGetUniformLocation(terrainProg, "uFogNear");
+        uTerrFogFar = glGetUniformLocation(terrainProg, "uFogFar");
+        uTerrFogOn = glGetUniformLocation(terrainProg, "uFogOn");
+        uTerrEye = glGetUniformLocation(terrainProg, "uEye");
 
         entProg = glProgram(
             "#version 330 core\n"
@@ -142,11 +165,14 @@ public:
             "#version 330 core\n"
             "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
             "layout(location=2) in vec2 aUV;\n"
-            "uniform mat4 uMVP; uniform mat4 uModel; out vec3 vN; out vec2 vUV;\n"
-            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aN; vUV=aUV; }\n",
+            "uniform mat4 uMVP; uniform mat4 uModel; out vec3 vN; out vec2 vUV; out vec3 vWorld;\n"
+            "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aN; vUV=aUV;\n"
+            " vWorld=(uModel*vec4(aPos,1.0)).xyz; }\n",
             "#version 330 core\n"
-            "in vec3 vN; in vec2 vUV; out vec4 F;\n"
-            "uniform vec3 uLight, uColor; uniform sampler2D uTex; uniform int uHasTex, uAlphaTest;\n"
+            "in vec3 vN; in vec2 vUV; in vec3 vWorld; out vec4 F;\n"
+            "uniform vec3 uLight, uColor, uSunCol, uAmb; uniform sampler2D uTex;\n"
+            "uniform int uHasTex, uAlphaTest, uLightMode;\n"
+            "uniform vec3 uFogCol, uEye; uniform float uFogNear, uFogFar; uniform int uFogOn;\n"
             "void main(){\n"
             " vec4 tx = uHasTex==1 ? texture(uTex, vec2(vUV.x, 1.0-vUV.y)) : vec4(uColor,1.0);\n"
             " if (uAlphaTest==1 && tx.a < 0.5) discard;\n"                    // foliage/fence cutout
@@ -155,16 +181,31 @@ public:
             " vec3 fdir=normalize(vec3(-0.5, 0.35, -0.6));\n"               // fill (opposite-ish)
             " float key=max(dot(n,kdir),0.0);\n"
             " float fill=max(dot(n,fdir),0.0);\n"
+            // The key/fill rig stays in both modes -- it is what keeps foliage
+            // readable. Only the ambient term and the tint come from the preset.
             " float amb=mix(0.32, 0.52, n.y*0.5+0.5);\n"                    // hemispheric ambient
-            " float lit=amb + 0.60*key + 0.16*fill;\n"
+            " vec3 lit;\n"
+            " if(uLightMode==0){ lit=vec3(amb + 0.60*key + 0.16*fill); }\n"
+            " else { lit=uAmb*mix(0.85,1.15,n.y*0.5+0.5) + uSunCol*(0.60*key) + 0.16*fill; }\n"
             " vec3 c=pow(tx.rgb*lit, vec3(1.0/2.2));\n"                      // gamma (fixes muddy)
-            " F=vec4(c,1.0); }\n");
+            " F=vec4(c,1.0);\n"
+            " if(uFogOn==1){ float fg=clamp((distance(vWorld,uEye)-uFogNear)/max(uFogFar-uFogNear,1e-3),0.0,1.0);\n"
+            "   F.rgb=mix(F.rgb,uFogCol,fg); }\n"
+            "}\n");
         uMdlMVP=glGetUniformLocation(modelProg,"uMVP");
         uMdlModel=glGetUniformLocation(modelProg,"uModel");
         uMdlLight=glGetUniformLocation(modelProg,"uLight");
         uMdlColor=glGetUniformLocation(modelProg,"uColor");
         uMdlHasTex=glGetUniformLocation(modelProg,"uHasTex");
         uMdlAlphaTest=glGetUniformLocation(modelProg,"uAlphaTest");
+        uMdlSun=glGetUniformLocation(modelProg,"uSunCol");
+        uMdlAmb=glGetUniformLocation(modelProg,"uAmb");
+        uMdlLightMode=glGetUniformLocation(modelProg,"uLightMode");
+        uMdlFogCol=glGetUniformLocation(modelProg,"uFogCol");
+        uMdlFogNear=glGetUniformLocation(modelProg,"uFogNear");
+        uMdlFogFar=glGetUniformLocation(modelProg,"uFogFar");
+        uMdlFogOn=glGetUniformLocation(modelProg,"uFogOn");
+        uMdlEye=glGetUniformLocation(modelProg,"uEye");
         glUseProgram(modelProg); glUniform1i(glGetUniformLocation(modelProg,"uTex"),0);
 
         // Splat-textured terrain: blend up to MAXL real layer .dds by per-vertex
@@ -173,13 +214,15 @@ public:
             "#version 330 core\n"
             "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aN;\n"
             "uniform mat4 uMVP; uniform vec2 uGridInv;\n"
-            "out vec3 vN; out vec2 vTerrUV; out vec2 vWorldXZ;\n"
+            "out vec3 vN; out vec2 vTerrUV; out vec2 vWorldXZ; out vec3 vWorld;\n"
             "void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=aN;\n"
             " vTerrUV=vec2((aPos.x+0.5)*uGridInv.x,(aPos.z+0.5)*uGridInv.y);\n"
-            " vWorldXZ=vec2(aPos.x,aPos.z); }\n",
+            " vWorldXZ=vec2(aPos.x,aPos.z); vWorld=aPos; }\n",
             "#version 330 core\n"
-            "in vec3 vN; in vec2 vTerrUV; in vec2 vWorldXZ; out vec4 F;\n"
-            "uniform vec3 uLight; uniform int uLayerCount; uniform float uTile;\n"
+            "in vec3 vN; in vec2 vTerrUV; in vec2 vWorldXZ; in vec3 vWorld; out vec4 F;\n"
+            "uniform vec3 uLight, uSunCol, uAmb; uniform int uLayerCount, uLightMode;\n"
+            "uniform vec3 uFogCol, uEye; uniform float uFogNear, uFogFar; uniform int uFogOn;\n"
+            "uniform float uTile;\n"
             "uniform sampler2D uLayerTex[8]; uniform float uUvScale[8];\n"
             "uniform int uHasTex[8]; uniform vec3 uFallback[8];\n"
             "uniform sampler2D uW0; uniform sampler2D uW1;\n"
@@ -191,9 +234,28 @@ public:
             "   vec3 s = (uHasTex[i]==1) ? texture(uLayerTex[i], vWorldXZ*uTile*uUvScale[i]).rgb : uFallback[i];\n"
             "   float al = (i==0)?1.0:clamp(w[i],0.0,1.0);\n"
             "   col = mix(col, s, al); }\n"
-            " float d=max(dot(normalize(vN),normalize(uLight)),0.0)*0.75+0.25;\n"
-            " F=vec4(col*d,1.0); }\n");
+            " float nl=max(dot(normalize(vN),normalize(uLight)),0.0);\n"
+            " float d=nl*0.75+0.25;\n"
+            " if(uLightMode==0){ F=vec4(col*d,1.0); }\n"
+            // No gamma encode here. The layer textures are sRGB and never get
+            // linearized, so a 1/2.2 encode on top double-brightens — it made the
+            // "Default" preset, whose sun direction is within 3 deg of the neutral
+            // light, render visibly blown out beside it. Preset mode is a pure
+            // LIGHTING change: the same texture*factor form as neutral, with the
+            // preset's sun colour and ambient replacing the fixed 0.75/0.25 ramp.
+            " else { F=vec4(col*(uSunCol*nl+uAmb),1.0); }\n"
+            " if(uFogOn==1){ float fg=clamp((distance(vWorld,uEye)-uFogNear)/max(uFogFar-uFogNear,1e-3),0.0,1.0);\n"
+            "   F.rgb=mix(F.rgb,uFogCol,fg); }\n"
+            "}\n");
         uTTMVP=glGetUniformLocation(terrainTexProg,"uMVP");
+        uTTSun=glGetUniformLocation(terrainTexProg,"uSunCol");
+        uTTAmb=glGetUniformLocation(terrainTexProg,"uAmb");
+        uTTLightMode=glGetUniformLocation(terrainTexProg,"uLightMode");
+        uTTFogCol=glGetUniformLocation(terrainTexProg,"uFogCol");
+        uTTFogNear=glGetUniformLocation(terrainTexProg,"uFogNear");
+        uTTFogFar=glGetUniformLocation(terrainTexProg,"uFogFar");
+        uTTFogOn=glGetUniformLocation(terrainTexProg,"uFogOn");
+        uTTEye=glGetUniformLocation(terrainTexProg,"uEye");
         uTTGridInv=glGetUniformLocation(terrainTexProg,"uGridInv");
         uTTLight=glGetUniformLocation(terrainTexProg,"uLight");
         uTTLayerCount=glGetUniformLocation(terrainTexProg,"uLayerCount");
@@ -894,7 +956,11 @@ public:
             // Culls the single-sided text-decal backfaces that render text mirrored.
             if (cullMode) { glEnable(GL_CULL_FACE); glCullFace(cullMode==1?GL_BACK:GL_FRONT); }
             glUseProgram(modelProg);
-            float light[3]={0.4f,0.8f,0.35f}; glUniform3fv(uMdlLight,1,light);
+            glUniform3fv(uMdlLight,1,sunDir);
+            glUniform3fv(uMdlSun,1,sunColor);
+            glUniform3fv(uMdlAmb,1,ambient);
+            glUniform1i(uMdlLightMode, lightMode);
+            setFogUniforms(uMdlFogCol,uMdlFogNear,uMdlFogFar,uMdlFogOn,uMdlEye,cam);
             float col[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,col);
             // flipModelX reflects each model in its LOCAL X. Combined with loadModel's
             // negate-Z that is a 180-deg Y rotation (two reflections = no mirror), so
@@ -929,13 +995,17 @@ public:
         }
         if (terrainCount) {
             glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
-            float light[3]={0.4f,0.8f,0.35f};
+            const float* light = sunDir;
             bool useTex = (terrainMode==0) && splatReady && terrainTexProg;
             if (useTex) {
                 glUseProgram(terrainTexProg);
                 glUniformMatrix4fv(uTTMVP,1,GL_FALSE,mvp.m);
                 glUniform2f(uTTGridInv, splatGridInv[0], splatGridInv[1]);
                 glUniform3fv(uTTLight,1,light);
+                glUniform3fv(uTTSun,1,sunColor);
+                glUniform3fv(uTTAmb,1,ambient);
+                glUniform1i(uTTLightMode, lightMode);
+                setFogUniforms(uTTFogCol,uTTFogNear,uTTFogFar,uTTFogOn,uTTEye,cam);
                 glUniform1i(uTTLayerCount, splatLayerCount);
                 glUniform1f(uTTTile, terrainTile);
                 glUniform1fv(uTTUvScale, splatLayerCount, splatUv);
@@ -949,6 +1019,10 @@ public:
                 glUseProgram(terrainProg);
                 glUniformMatrix4fv(uTerrMVP,1,GL_FALSE,mvp.m);
                 glUniform3fv(uTerrLight,1,light);
+                glUniform3fv(uTerrSun,1,sunColor);
+                glUniform3fv(uTerrAmb,1,ambient);
+                glUniform1i(uTerrLightMode, lightMode);
+                setFogUniforms(uTerrFogCol,uTerrFogNear,uTerrFogFar,uTerrFogOn,uTerrEye,cam);
                 glUniform1i(uTerrUseColor, (terrainMode!=2 && terrainHasColor) ? 1 : 0);
             }
             glBindVertexArray(terrainVAO);
@@ -1240,6 +1314,8 @@ private:
     std::vector<ModelInst> instances;
     GLuint modelProg=0;
     GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1, uMdlHasTex=-1, uMdlAlphaTest=-1;
+    GLint uMdlSun=-1, uMdlAmb=-1, uMdlLightMode=-1, uMdlFogCol=-1, uMdlFogNear=-1,
+          uMdlFogFar=-1, uMdlFogOn=-1, uMdlEye=-1;
     bool modelsBuilt=false;
     std::map<std::string, GLuint> texCache;    // basename -> GL texture
     std::map<std::string, std::pair<int,int>> texDim;  // basename -> (w,h) pixels
@@ -1249,12 +1325,15 @@ private:
     GLuint terrainProg=0, entProg=0;
     GLuint terrainVAO=0, terrainVBO=0, terrainEBO=0, entVAO=0, entVBO=0;
     GLint uTerrMVP=-1, uTerrLight=-1, uTerrUseColor=-1, uEntMVP=-1, uEntSize=-1, uEntWhite=-1;
+    GLint uTerrSun=-1, uTerrAmb=-1, uTerrLightMode=-1, uTerrFogCol=-1, uTerrFogNear=-1,
+          uTerrFogFar=-1, uTerrFogOn=-1, uTerrEye=-1;
     int terrainCount=0, entCount=0;
     bool terrainHasColor=false;
 
     // splat-textured terrain
     GLuint terrainTexProg=0;
     GLint uTTMVP=-1,uTTGridInv=-1,uTTLight=-1,uTTLayerCount=-1,uTTTile=-1,uTTUvScale=-1,uTTHasTex=-1,uTTFallback=-1;
+    GLint uTTSun=-1,uTTAmb=-1,uTTLightMode=-1,uTTFogCol=-1,uTTFogNear=-1,uTTFogFar=-1,uTTFogOn=-1,uTTEye=-1;
     int   splatLayerCount=0;
     GLuint splatLayerTex[8]={0}; float splatUv[8]={0}; int splatHasTex[8]={0};
     float splatFallback[24]={0}; GLuint splatW0=0, splatW1=0; float splatGridInv[2]={0,0};
@@ -1295,6 +1374,77 @@ public:
     int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
     float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
     bool  showRoads=true, showDecals=true, showRivers=true;
+
+    // ---- lighting environment (WTHR) ----------------------------------------
+    // lightMode 0 = Editor/neutral: the legacy hard-coded light, kept EXACTLY so
+    // the no-change regression is meaningful and a night preset can never make a
+    // map unusable to edit. 1 = the map's own preset. 2 = preset + fog.
+    //
+    // The sun vector: WTHR stores the direction light TRAVELS, in the engine's
+    // left-handed Y-up space (index 1 is vertical, < 0 on 219/219 records). The
+    // shading vector is therefore -D in engine space, and the editor's documented
+    // engine->GL transform negates X and Z (loadModel, a 180-deg Y rotation), so
+    //     L_gl = (D.x, -D.y, D.z)
+    // Corroboration: M_01 "Default" D = (0.4156, -0.8090, 0.4156) gives
+    // (0.4156, 0.8090, 0.4156), and the light hard-coded here long before WTHR was
+    // decoded is (0.4, 0.8, 0.35). Two independent routes to the same vector.
+    // `--sunprobe` scores all four horizontal candidates against that legacy light
+    // so the choice stays falsifiable rather than merely plausible.
+    int   lightMode = 0;
+    float sunDir[3]   = {0.4f, 0.8f, 0.35f};
+    float sunColor[3] = {1.0f, 1.0f, 1.0f};
+    float ambient[3]  = {0.32f, 0.32f, 0.32f};
+    float fogColor[3] = {0.5f, 0.6f, 0.7f};
+    float fogStart = 0.0f, fogEnd = 1e9f;
+    int   fogOn = 0;
+
+    // Push the fog block to whichever program is bound. `eye` must be the camera
+    // position in the SAME space the shader's vWorld is in (world space).
+    void setFogUniforms(GLint uCol, GLint uNear, GLint uFar, GLint uOn, GLint uEyeLoc,
+                        const Camera& cam) const {
+        V3 e = cam.eye();
+        if (uCol   >= 0) glUniform3fv(uCol, 1, fogColor);
+        if (uNear  >= 0) glUniform1f(uNear, fogStart);
+        if (uFar   >= 0) glUniform1f(uFar, fogEnd);
+        if (uOn    >= 0) glUniform1i(uOn, fogOn);
+        if (uEyeLoc>= 0) { float ev[3] = { e.x, e.y, e.z }; glUniform3fv(uEyeLoc, 1, ev); }
+    }
+
+    // Convert a WTHR SunDirection into the viewport's light vector.
+    static void sunFromWeather(const float d[3], float out[3]) {
+        float x = d[0], y = -d[1], z = d[2];
+        float L = std::sqrt(x*x + y*y + z*z);
+        if (L < 1e-6f) { out[0]=0.4f; out[1]=0.8f; out[2]=0.35f; return; }
+        out[0] = x/L; out[1] = y/L; out[2] = z/L;
+    }
+
+    // Apply a decoded preset (or reset to neutral when `w` is null).
+    void setEnvironment(const WeatherPreset* w, int mode) {
+        lightMode = mode;
+        if (!w || mode == 0) {
+            sunDir[0]=0.4f; sunDir[1]=0.8f; sunDir[2]=0.35f;
+            sunColor[0]=sunColor[1]=sunColor[2]=1.0f;
+            ambient[0]=ambient[1]=ambient[2]=0.32f;
+            fogOn = 0;
+            return;
+        }
+        auto get = [&](const char* n) -> const float* {
+            for (int f = 0; f < kWeatherFieldCount; f++)
+                if (!strcmp(kWeatherFields[f].name, n)) return w->values[(size_t)f].data();
+            return nullptr;
+        };
+        if (const float* d = get("SunDirection")) sunFromWeather(d, sunDir);
+        if (const float* c = get("SunColor"))   { for (int k=0;k<3;k++) sunColor[k]=c[k]; }
+        if (const float* a = get("SunAmbient")) { for (int k=0;k<3;k++) ambient[k]=a[k]; }
+        if (const float* f = get("FogColor"))   { for (int k=0;k<3;k++) fogColor[k]=f[k]; }
+        const float* fe = get("FogEnabled");
+        const float* fs = get("FogStart");
+        const float* fd = get("FogEnd");
+        fogOn = (mode >= 2 && fe && fe[0] != 0.0f) ? 1 : 0;
+        if (fs) fogStart = fs[0];
+        if (fd) fogEnd   = fd[0];
+        if (fogEnd <= fogStart) fogOn = 0;
+    }
     // Model backface cull: 0 Off, 1 Back, 2 Front. Exterior faces are CCW (verified
     // live: Front-cull shows the interior), so Back-cull is correct/standard and
     // hides the hull interior. Toggle: View>Model cull, or key C.
