@@ -8,10 +8,11 @@ Key entry points used by the importer:
     MapFile(path)          - parse a .map file
     .find_chunk('WRLD')    - world dims live in chunk.meta['width'/'height']
     .get_entities()        - list of placed-entity dicts (Prototype/Pos/Dir/...)
-    .get_blck_grid()       - (grid, w, h) passability grid, 6x uint16 per cell
+    .get_blck_grid()       - (flags, types, w, h) two BLCK planes (u16, u8)
 """
 
 import argparse
+import array
 import json
 import math
 import struct
@@ -525,16 +526,20 @@ class MapFile:
         dim1, pos = _u32(d, pos)
         dim2, pos = _u32(d, pos)
 
-        grid_w = dim1 // 2 if dim1 > 0 else 0
-        grid_h = dim2 // 2 if dim2 > 0 else 0
-
+        # Kept in step with cpcw_map.py: BLCK is TWO planes at ITS OWN header
+        # dims -- a uint16 flag plane then a uint8 type plane -- not (w/2 x h/2)
+        # cells of six uint16s (same byte count, wrong stride). The header dims
+        # are world*2 on only 41/45 maps. See docs/MAP_FORMAT.md section 8.
         chunk.meta.update({
             'version': version,
+            'grid_w': dim1,
+            'grid_h': dim2,
             'vertex_w': dim1,
             'vertex_h': dim2,
-            'grid_w': grid_w,
-            'grid_h': grid_h,
+            'flags_offset': pos,
+            'types_offset': pos + dim1 * dim2 * 2,
             'grid_offset': pos,
+            'payload_size': dim1 * dim2 * 3,
         })
 
     # -- Object tree access -------------------------------------------------
@@ -771,24 +776,27 @@ class MapFile:
         return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) ** 2 / (sxx * syy)
 
     def get_blck_grid(self):
-        """Return the BLCK grid as a list of rows, each row a list of 6-tuples."""
+        """Return (flags, types, w, h) -- the two BLCK planes, row-major.
+
+        `flags` is a uint16 plane and `types` a uint8 plane, both w*h at BLCK's
+        OWN header dims. Index a cell with [y * w + x]. Semantics are not
+        decoded, so this is read-only. Kept identical to cpcw_map.py.
+        """
         chunk = self.find_chunk('BLCK')
-        if not chunk or 'grid_offset' not in chunk.meta:
-            return None, 0, 0
+        if not chunk or 'flags_offset' not in chunk.meta:
+            return None, None, 0, 0
 
         d = self.data
         w = chunk.meta['grid_w']
         h = chunk.meta['grid_h']
-        offset = chunk.meta['grid_offset']
+        fo = chunk.meta['flags_offset']
+        to = chunk.meta['types_offset']
+        if to + w * h > len(d):
+            return None, None, 0, 0
 
-        grid = []
-        pos = offset
-        for y in range(h):
-            row = []
-            for x in range(w):
-                cell = struct.unpack_from('<6H', d, pos)
-                row.append(cell)
-                pos += 12
-            grid.append(row)
-        return grid, w, h
+        flags = array.array('H'); flags.frombytes(bytes(d[fo:fo + w * h * 2]))
+        if sys.byteorder != 'little':
+            flags.byteswap()
+        types = array.array('B'); types.frombytes(bytes(d[to:to + w * h]))
+        return flags, types, w, h
 

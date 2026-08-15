@@ -67,6 +67,24 @@ bool erase_objt_bytes(Scene& s, long pos, long len);
 struct ChunkNode { int depth; std::string tag; long offset; long size; };
 bool map_chunk_outline(const std::vector<unsigned char>& raw, std::vector<ChunkNode>& out);
 
+// ---- structural-integrity check (--chunktile) -------------------------------
+// `cpcw_map.py roundtrip` does NOT validate container sizes: its writer re-emits
+// each chunk's original span and never recomputes one, so an edit that inserts
+// bytes without bumping every ancestor still round-trips IDENTICAL. This is the
+// check that catches it — children must tile their parent's content exactly, and
+// every OBJS `schema_offset` must still point at its own SCHD child. Run it on
+// any map a write path produced, alongside the oracle.
+struct ChunkTileReport {
+    long fileSize = 0;
+    int  chunks = 0, containers = 0;
+    int  objs = 0, objsSchemaOk = 0;
+    long gapBytes = 0, overlapBytes = 0;
+    long trailerBytes = 0;      // bytes past the root SCEN chunk (allowed)
+    bool ok = false;
+    std::vector<std::string> issues;
+};
+bool map_chunk_tile(const std::vector<unsigned char>& raw, ChunkTileReport& out);
+
 // ---- file wrappers (dev harnesses) -----------------------------------------
 bool delete_entity_native(const Scene& s, long id, const std::string& outPath);
 bool add_entity_native(const Scene& s, long srcId, const float pos[3], long newId,

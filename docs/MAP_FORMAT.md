@@ -66,13 +66,14 @@ SCEN                                    Root container
     ├── OBJS                            World objects (locations, camera paths)
     │   └── SCHD                        Schemas for world objects
     ├── GTRN                            Ground Terrain
-    │   ├── GTRD                        Terrain paint/splatmap data
-    │   └── GROL                        Ground Roles (physics zones)
-    │       └── GROA                    Ground Roles Array
-    ├── BLCK                            Block grid (per-cell properties)
-    ├── PATH                            Pathfinding data
-    ├── CAMS                            Camera definitions
-    ├── WTHR                            Weather settings
+    │   ├── GTRD                        Terrain heightmap + splatmap paint (§7)
+    │   ├── GROL                        Road pool -> GROA records (§9)
+    │   ├── GDCL                        Decal pool -> GDEC records (§9)
+    │   └── GRVL                        River pool -> GRVR records
+    ├── BLCK                            Block grid: u16 flag + u8 type plane (§8)
+    ├── PATH                            Pathfinding data (slot pool, §4.9)
+    ├── CAMS                            Camera definitions (slot pool, §4.9)
+    ├── WTHR                            Lighting/weather presets (slot pool, §4.9 + §11)
     └── UNTS                            Placed entities
         ├── OBJS                        Entity descriptor tree
         └── SCHD                        Entity schemas
@@ -169,17 +170,38 @@ World dimensions define the playable area in engine units. Observed values:
 0x10    ...           Children: OBJS (entity descriptors) + SCHD
 ```
 
-### 4.9 PATH, CAMS, WTHR — Simple versioned data
+### 4.9 PATH, CAMS, WTHR — slot pools
 
-All three follow the same header pattern:
+All three share a **slot-pool** container: a version, a live count, two
+doubly-linked lists (a free list and a used list) over a fixed-capacity slot
+array, then the slots themselves.
 
 ```
 0x00    4     tag     "PATH" / "CAMS" / "WTHR"
 0x04    4     uint32  Content size
 0x08    4     uint32  Version
-0x0C    4     uint32  Entry count
-0x10    ...           Data entries (format TBD, contains HEAP structures)
+0x0C    4     uint32  Live entry count
+0x10    4     int32   freeHead      (-1 when the free list is empty)
+0x14    4     int32   freeTail
+0x18    4     int32   listHead      (first entry in presentation order)
+0x1C    4     int32   listTail
+0x20    4     int32   capacity      (number of slots that follow)
+0x24    ...           capacity x slot:
+                        4   int32   next      (index, -1 = end)
+                        4   int32   prev
+                        1   uint8   isFree
+                        ..          the record, present only when isFree == 0
 ```
+
+An empty pool ships as `capacity 0` with `(-1,-1,-1,-1)` — several MPMission maps
+carry `CAMS` and `PATH` exactly that way, and that is valid, not a failure.
+
+**Iterate `listHead -> next`, not the slot array.** The used list is not in slot
+order: M_17's weather chain is `7 -> 0 -> 1 -> 4`, which is the authored order
+(`M_17_1_Clouds`, `_2_Rain_1`, `_2_Rain_2`, `_3_After_Rain`).
+
+`WTHR`'s record is decoded in §11 below. `PATH` and `CAMS` record bodies are not
+decoded (`CAMS` nests `GCAC` sub-chunks with their own sizes).
 
 ---
 
@@ -399,87 +421,155 @@ decals / (vestigial) — and do not carry the elevation. See §9 (now decoded).
 
 ---
 
-## 8. BLCK — Block Grid
+## 8. BLCK — Block Grid — **TWO PLANES, not 12 bytes per cell**
 
-A fixed-size per-cell terrain property grid. The grid dimensions match the
-world dimensions (WRLD width x height), with exactly 12 bytes per cell.
+A per-**vertex** terrain property grid, stored as **two separate planes** at the
+dimensions in BLCK's own header: a `uint16` plane followed by a `uint8` plane.
+
+> **Corrected 2026-08-15.** This section previously described the payload as
+> `world_w x world_h` cells of six `uint16`s. That is the same byte count
+> (`(W/2)*(H/2)*12 == W*H*3`) read at the wrong stride, which is why it "worked".
+> It is wrong on two counts, both measured over all 45 maps — see 8.3.
 
 ### 8.1 Header
 
 ```
 Offset  Size  Type    Description
 0x00    4     uint32  Version (observed: 3)
-0x04    4     uint32  Vertex width  (= world_width * 2)
-0x08    4     uint32  Vertex height (= world_height * 2)
+0x04    4     uint32  Grid width   (BLCK's own; usually but NOT always world_w*2)
+0x08    4     uint32  Grid height  (BLCK's own; usually but NOT always world_h*2)
 ```
 
-Total data size = 12 + (world_width * world_height * 12) bytes.
+Total chunk content = `12 + hdr_w * hdr_h * 3` bytes. Verified on **45/45** maps.
 
-### 8.2 Grid Data
+**Always take the dimensions from this header, never from WRLD.** They are
+`world * 2` on only 41 of 45 maps. The four exceptions:
+
+| Map | WRLD | BLCK header | `world*2` would be |
+|-----|------|-------------|--------------------|
+| Domination/(2) Island Thunder   | 544x464 | 1088x960   | 1088x928 |
+| Domination/(2) Urban Legend     | 528x448 | 1088x896   | 1056x896 |
+| Domination/(4) Islands Of Hope  | 720x720 | 1472x1472  | 1440x1440 |
+| Domination/(4) The Last Village | 576x400 | 1152x832   | 1152x800 |
+
+Any code deriving the size from WRLD reads past or short of the payload on
+exactly those four.
+
+### 8.2 Payload
 
 ```
-grid[world_height][world_width]:
-  uint16[6]    Six 16-bit values per cell
+0x0C                      flags[hdr_h][hdr_w]   uint16, row-major (Y outer, X inner)
+0x0C + w*h*2              types[hdr_h][hdr_w]   uint8,  row-major, same dims
 ```
 
-Cells are stored in row-major order (Y outer, X inner).
+### 8.3 Why two planes (the discriminating measurement)
 
-### 8.3 Cell Values
+Both readings consume identical bytes, so they were separated on **spatial
+coherence and value cardinality** — a terrain property map is smooth, a
+misaligned read of one is not. On M_01 (BLCK 1024x1344, 1,376,256 samples):
 
-| Pattern | Meaning | Frequency (T_01) |
-|---------|---------|-------------------|
-| `(1,1,1,1,1,1)` | Default passable terrain | ~70% |
-| `(0,0,0,0,0,0)` | Blocked/impassable | ~29% |
-| Mixed values | Terrain properties | ~1% |
+| Reading | horiz. neighbour equality | vert. | distinct values |
+|---|---|---|---|
+| `uint16` plane | 0.9956 | 0.9946 | **4** |
+| `uint8` plane  | 0.9879 | 0.9854 | **6** |
+| 6x`uint16` per cell, lanes 0..5 | 0.942 | 0.959 | ~30 each |
 
-Non-trivial cell values (512, 1280, 1285, 2816, 8448, 8449, etc.) likely encode:
-- Terrain movement type / ground material
-- Passability flags per movement class (infantry, vehicle, etc.)
-- Cover values
-- Visual material index
+The plane reading is more coherent on **45/45** maps (narrowest margin
++0.0067, Domination/(4) Cold War). The cell reading's six lanes also have
+near-identical statistics to each other, which is the signature of one field
+being read at six offsets rather than six distinct channels — and it is where
+the old "251 unique cell patterns" figure came from.
 
-251 unique cell patterns were observed in T_01.map.
+### 8.4 Values — semantics still UNKNOWN
+
+M_01 counts (of 1,376,256): `uint16` plane `{256: 1146408, 33: 158397,
+32: 61471, 2: 9980}`; `uint8` plane `{0: 802422, 5: 343986, 2: 158397,
+7: 50930, 11: 10541, 3: 9980}`. The planes are correlated but **not** 1:1 —
+Island Thunder maps both `36` and `256` to type `0`.
+
+The old `(1,1,1,1,1,1)` = passable / `(0,0,0,0,0,0)` = blocked table was an
+artifact of the wrong alignment; do not rely on it. Until the flag bits are
+pinned against the engine, **BLCK is read-only**: render it, do not paint it.
 
 ---
 
-## 9. GROL / GROA (roads) & GDCL / GDEC (decals) — Terrain overlays — SOLVED
+## 9. GROL / GDCL / GRVL — Terrain overlays (roads, decals, rivers) — SOLVED
 
-`GROL`, `GDCL` (and the vestigial `GRVL`) are siblings of `GTRD` under `GTRN`.
-They hold the **road/sidewalk and decal overlay geometry** drawn on top of the
-terrain with `Terrain/Road/*` and `Terrain/Decal/*` materials — **not** physics
-"ground role" zones (an earlier guess). Present in all 45 CPCW maps. Decoded by
-`mapeditor/src/overlays.cpp` (`parse_overlays`) and rendered as textured,
-terrain-projected overlays; `cpcw_mapeditor --overlaytest <map>` dumps counts.
+`GROL`, `GDCL` and `GRVL` are siblings of `GTRD` under `GTRN`. They hold the
+**road/sidewalk, decal and river geometry** drawn on top of the terrain with
+`Terrain/Road/*`, `Terrain/Decal/*` and `Terrain/River/*` materials — **not**
+physics "ground role" zones (an earlier guess). All three are present in all 45
+CPCW maps. Decoded by `mapeditor/src/overlays.cpp` (`parse_overlays`);
+`cpcw_mapeditor --overlayscan <map|dir>` checks the containers and
+`--overlaytest <map>` dumps render counts.
 
-### Container layout (GROL and GDCL share it)
+> **`GRVL` is not vestigial.** An earlier note called it "24 empty bytes in every
+> map"; that measured only the 17 maps where the pool is empty. The other 28 carry
+> **51 `GRVR` river records** (49 with more than one node).
+
+### Container layout — a slot pool, shared by all three
+
+Identical to §4.9's pool minus the leading version dword. The engine reads all
+three with one templated routine instantiated three times — `FUN_004bdba0`
+(roads), `FUN_004bdd80` (decals), `FUN_004bdf60` (rivers) — differing only in the
+record size they allocate (0x120 / 0x184 / 0x11c).
 
 ```
-0x00    4     tag       "GROL" / "GDCL"
+0x00    4     tag       "GROL" / "GDCL" / "GRVL"
 0x04    4     uint32    Content size
 --- content ---
-0x00    4     uint32    Record count (# GROA / GDEC records)
-0x04    20    bytes     5 more header dwords (24-byte header total)
-0x18    ...             Records: each = a short per-record prefix
-                        (9 or 18 bytes: idx u32 + flag u32 + u8, sometimes padded)
-                        followed by a "GROA" / "GDEC" chunk (tag + u32 size + body)
+0x00    4     uint32    usedCount     (live records)
+0x04    4     int32     freeHead      (-1 when empty)
+0x08    4     int32     freeTail
+0x0C    4     int32     usedHead
+0x10    4     int32     usedTail
+0x14    4     int32     slotCount     (= capacity; the array below)
+0x18    ...             slotCount x:
+                          4   int32   next     (slot index, -1 = end)
+                          4   int32   prev
+                          1   uint8   isFree
+                          ..          "GROA"/"GDEC"/"GRVR" chunk, only if isFree == 0
 ```
-Because the inter-record prefix length varies, a robust reader scans forward for
-the next `GROA`/`GDEC` tag after each chunk rather than assuming a fixed stride.
+
+This walks to the **exact** content end on all 135 shipped containers, with
+`usedCount` matching the live slots every time. The earlier reader's "9 or 18
+byte per-record prefix, so scan forward for the next tag" was this structure
+misread: a free slot (9 bytes, no record) followed by a real slot header.
+
+**Order.** The engine's loader iterates the **slot array**, i.e. file order, not
+the used list. The used list is a different order on **71 of 90** road/decal
+pools (`usedHead != 0` on 28), so if the *renderer* walks the list instead, the
+list order is the Z-order. That has **not** been established — the loader does not
+settle it — and the measured visual consequence is small (of the overlapping
+decal pairs, the two orders disagree on 1 of 51 pairs in M_02, 24 of 302 in M_05,
+0 of 16 in M_01). Emit in slot order until the draw side is read.
 
 ### GROA — road/sidewalk ribbon
 
 ```
-0x00    4     uint32    Type (observed 11)
+0x00    4     uint32    Version (observed 11)
 0x04    4     uint32    Node count N
 0x08    N×36  nodes     Per node (36 bytes = 9 floats):
                           float x, y, z   world-space centreline point (y≈0)
-                          float ×6        segment length, tangent dx/dz, ...
-        ...   bytes      Trailer: a 4×4 transform matrix / bbox
-        var   string     Material path (u16 len), first "Terrain/Road/..." string
-        var   string     Shader (u16 len, e.g. ".../BumpDisplace", ".../AlphaBlend")
+                          float ×3        "in" Catmull-Rom handle
+                          float ×3        "out" Catmull-Rom handle
+0x08+N*36
+        4     uint32    N2 (== N)
+        N×16  params    Per node; float0 is a width-or-UV scale (see below)
+        1     uint8     flag
+        var   string    Material path (u16 len), first "Terrain/Road/..." string
+        var   string    Shader (u16 len, e.g. ".../BumpDisplace", ".../AlphaBlend")
+        22    bytes     tail
 ```
 The N nodes trace the road centreline; extrude ±half-width along the segment
-normal for a ribbon, projecting Y onto the heightmap (§7.4).
+normal for a ribbon, projecting Y onto the heightmap (§7.4). Road width is **not**
+in the record — it derives from the road texture's short dimension (§ memory
+`cpcw-road-groa`). The handle magnitudes are the distances to the previous and
+next node, so they are re-derivable when a node moves.
+
+`params[i].float0` is 1.0 on 31517 of 35668 nodes with 137 distinct values in
+(0,1]; it is a width scale **or** a UV scale and has not been separated, so
+nothing multiplies the half-width by it yet.
 
 ### GDEC — decal quad
 
@@ -495,10 +585,38 @@ normal for a ribbon, projecting Y onto the heightmap (§7.4).
 ```
 One rotated, terrain-projected textured quad (mud/water/grass-dry/sidewalk-piece).
 
-### GRVL
+### GRVR — river ribbon
 
-24 bytes, effectively empty (sentinel `0xFFFFFFFF` fill) in every observed map —
-vestigial; not rendered.
+The same record shape as `GROA`, at version 2:
+
+```
+0x00    4     uint32    Version (observed 2)
+0x04    4     uint32    Node count N
+0x08    N×36  nodes     float x, y, z + "in" handle (3f) + "out" handle (3f)
+0x08+N*36
+        4     uint32    N2 (== N)
+        N×16  params    float0 = WIDTH in world units; float1..3 = 1,1,0
+        1     uint8     flag
+        var   string    Material path ("Terrain/River/...")
+```
+
+Two things differ from a road, and both matter:
+
+- **`y` is the water surface**, constant along a record (−13.0 to +15.4 across the
+  corpus), so a river must **not** be projected onto the heightmap the way roads
+  and decals are — it cuts through the banks.
+- **The width is real and per node**, in world units (1.0 … 37.0 observed), so a
+  river needs none of the road's texture-dimension derivation.
+
+51 records across 28 maps; 2 of them have a single node and cannot form a ribbon
+(both in Domination/(8) Sole Survivor).
+
+**Material → texture is NOT decoded.** River materials are per-map names —
+`Terrain/River/M_03/M_03_rivers`, `Terrain/River/Water`,
+`Terrain/River/M_12/Elbe_Kanal` — and no DDS of that stem ships; the actual water
+textures are generic, under `CPCWPak/Rivers/` (`P2_diffuse_alfa_river_01` …).
+A basename-stem resolver will silently borrow an unrelated terrain texture, so
+resolve river materials against the `Rivers/` set instead.
 
 ---
 
@@ -635,7 +753,111 @@ decoded terrain heightmap (§7.4).
 
 ---
 
-## 11. Cross-Map Observations
+## 11. WTHR — SWeather lighting presets — SOLVED
+
+Each live slot of the `WTHR` pool (§4.9) is one named lighting/weather preset:
+
+```
+4     uint32   Record version — 13 on 219/219 shipped records
+2+n   string   Name (uint16 length prefix)
+194   bytes    The record body, laid out below
+```
+
+**Assert the record version.** `SWeather::Load` is a cascade of `if (N < version)`
+guards, so a lower version is a *shorter* record and the fixed 194-byte stride
+would silently desync. Likewise **refuse chunk version 2**: it is a flat
+count+records list the engine routes through a different reader.
+
+### 11.1 Body layout — STREAM order, not struct order
+
+The offsets below are into the 194-byte body, in the order `SWeather::Load`
+reads them. This is deliberately **not** the engine's reflection/struct order —
+`FogColor` is read 8th and `SunSpecular` 12th. Both orders sum to 194, so a table
+in the wrong order still walks every map cleanly while decoding every colour into
+the wrong field; see 11.2 for how the order is actually pinned.
+
+| Off | Field | Type | Engine | Notes |
+|-----|-------|------|--------|-------|
+| 0   | FogEnabled       | uint8    | +0x08 | |
+| 1   | FogStart         | float    | +0x0c | |
+| 5   | FogEnd           | float    | +0x10 | |
+| 9   | SunDirection     | 3x float | +0x2c | unit vector; see 11.2 |
+| 21  | SunColor         | 4x float | +0x38 | **not** clamped to 1 — reaches 2.78 |
+| 37  | SunAmbient       | 4x float | +0x48 | |
+| 53  | SunShadow        | 4x float | +0x58 | 4th component is **not** an alpha (0.25..2.58) |
+| 69  | FogColor         | 4x float | +0x1c | |
+| 85  | Night            | uint8    | +0x78 | |
+| 86  | WindDirection    | 2x float | +0x7c | |
+| 94  | CloudSpeed       | float    | +0x84 | |
+| 98  | SunSpecular      | 4x float | +0x68 | |
+| 114 | CloudCover       | float    | +0x88 | |
+| 118 | CloudMovementDir | 2x float | +0x8c | usually `WindDirection * CloudSpeed` — see 11.3 |
+| 126 | FogBottom        | float    | +0x14 | |
+| 130 | FogTop           | float    | +0x18 | |
+| 134 | EffectCount      | uint32   | —     | 4 on 219/219 |
+| 138 | Effects          | 4x float | +0xc0 | slot meanings **unknown** — label "Effect 0..3" |
+| 154 | Puddles          | float    | +0x94 | |
+| 158 | BloomMul         | float    | +0xa0 | |
+| 162 | BloomAdd         | float    | +0xa4 | 0.0 on every shipped record |
+| 166 | SoftShadows      | float    | +0xb4 | |
+| 170 | TimeOfTheDay     | float    | +0xb8 | hours, 4.0 .. 24.0 |
+| 174 | Brightness       | float    | +0xa8 | exactly 1.0 on 219/219 |
+| 178 | Contrast         | float    | +0xac | exactly 1.0 on 219/219 |
+| 182 | Saturation       | float    | +0xb0 | 1.0 on 214/219, min 0.58 |
+| 186 | unknown98        | float    | +0x98 | read at v13, **absent from the reflection table** |
+| 190 | unknown9c        | float    | +0x9c | ditto — do not invent a name |
+
+Total 194. Every field is fixed-width, so a preset edit is a size-preserving
+in-place write and the save stays byte-faithful.
+
+### 11.2 How the order is pinned (CONFIRMED)
+
+"The walk consumed the chunk exactly" passes on 45/45 maps for a wrong
+permutation, so the order is established by semantics that a permutation cannot
+satisfy at once. Measured over all 45 maps / 219 records:
+
+| Assertion | Result |
+|---|---|
+| record version == 13 | 219/219 |
+| alpha of SunColor / SunAmbient / FogColor / SunSpecular == 1.0 | 876/876 |
+| `SunShadow[3]` range (so it is *not* an alpha) | 0.2500 .. 2.5800 |
+| `EffectCount` == 4 | 219/219 |
+| `\|SunDirection\|` == 1 ± 0.02 | 219/219 |
+| `SunDirection[1] < 0` | 219/219 |
+| FogEnabled, Night ∈ {0,1} | 219/219 |
+| TimeOfTheDay ∈ [0,24] | 219/219 |
+| Brightness == Contrast == 1.0 | 219/219 |
+| FogEnd > FogStart when fog is on | 186/186 (min FogEnd **162.0**) |
+
+`SunDirection[1] < 0` on every record, with components 0 and 2 taking either
+sign, means **index 1 is the vertical axis and the vector is the direction light
+travels** (downward). A shader wants `L = -SunDirection`. The remaining horizontal
+swizzle is *not yet established* — do not guess it from the editor's old
+hard-coded `{0.4, 0.8, 0.35}`, which matches M_01 `Default` in magnitude but with
+opposite horizontal signs.
+
+### 11.3 NOT invariants — do not assert these hard
+
+- `CloudMovementDir == WindDirection * CloudSpeed` fails on 8 of 219 records
+  (6 above 1e-4, 2 above 1e-3, worst 0.00999999 in M_07 `02_cloudy`). Treat it as
+  a derived default, never auto-rewrite it — that would destroy authored data.
+- **Night presets are not uniformly dark.** M_06 `03_night` has SunColor
+  (1.242, 1.502, 1.800). The genuinely black case is the multiplayer
+  `Night_multi` presets, at exactly (0,0,0) with ambient (0.5, 0.7, 1.0).
+- **Preset names are not unique.** Domination/(4) Ring Of Fire ships two live
+  presets both named `Night_multi` with different bodies. Key any UI or CLI on
+  the pool slot, not the name.
+- **The active preset is the one literally named `"Default"`** — `LoadWeathers`
+  builds that string and only assigns on a find-by-name hit. It is *not* slot 0
+  and *not* the list head. M_17 has no `Default` at all; MPMission/(6)
+  Breakthrough has both `Default` and `Default2`.
+
+Implemented by `mapeditor/src/weather.{h,cpp}`; `cpcw_mapeditor --wthrtest <map|dir>`
+re-checks every assertion in this section.
+
+---
+
+## 12. Cross-Map Observations
 
 Verified across T_01, T_02, and M_01:
 
@@ -656,7 +878,7 @@ World sizes vary:
 
 ---
 
-## 12. Relationship to ProtoDB.bin
+## 13. Relationship to ProtoDB.bin
 
 The `.map` format shares the same serialization system as `ProtoDB.bin`:
 
@@ -677,7 +899,7 @@ A parser that handles ProtoDB can be extended to handle .map files by:
 
 ---
 
-## 13. File Inventory
+## 14. File Inventory
 
 68 map files across the game data (`CPCWData/main1/Maps/`):
 

@@ -11,3 +11,7 @@ blendertools/*.zip
 
 # Render outputs (regenerable)
 renders/
+
+# Map editor runtime artifacts (dock layout, debug frame dumps)
+mapeditor/imgui.ini
+mapeditor/*.bmp

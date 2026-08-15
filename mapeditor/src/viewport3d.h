@@ -570,6 +570,32 @@ public:
     // Resolve a material path to the texIndex KEY (lowercased stem) that best matches,
     // or "" if none. Skips normal/aux maps in the fuzzy fallback (they are blue and
     // rendered decals purple when picked as the diffuse).
+    // River materials do NOT name a texture. They are per-map material names —
+    // "Terrain/River/M_03/M_03_rivers", "Terrain/River/Water",
+    // "Terrain/River/M_12/Elbe_Kanal" — and no DDS of that stem ships. The actual
+    // water textures are generic, under CPCWPak/Rivers/ (p2_diffuse_alfa_river_01
+    // and friends). The material -> texture indirection is not decoded, so
+    // resolveTexKey's longest-prefix fallback would silently borrow an unrelated
+    // terrain texture (which is exactly what it was doing: rivers drew as dark
+    // ground). Pick a real river diffuse instead, and prefer an ice variant only
+    // when the material actually says ice.
+    GLuint resolveRiverTex(const std::string& mat) {
+        std::string m; for (char c : mat) m += (char)tolower((unsigned char)c);
+        bool wantIce = m.find("ice") != std::string::npos ||
+                       m.find("snow") != std::string::npos;
+        std::string best;
+        for (const auto& kv : texIndex) {
+            const std::string& k = kv.first;
+            if (k.find("river") == std::string::npos) continue;
+            if (k.find("normal") != std::string::npos || k.find("bump") != std::string::npos) continue;
+            bool isIce = k.find("ice") != std::string::npos;
+            if (isIce != wantIce) continue;
+            if (best.empty() || k < best) best = k;      // stable pick
+        }
+        if (best.empty()) return 0;
+        return loadTexture(best);
+    }
+
     std::string resolveTexKey(const std::string& logical) {
         size_t sl = logical.find_last_of('/');
         std::string base = (sl==std::string::npos) ? logical : logical.substr(sl+1);
@@ -693,13 +719,13 @@ public:
         if (s.roads.empty() && s.decals.empty() && s.roadSplines.empty()) return;
         if (dataRoot.empty() && !vfs_any_mounted()) return;
         buildTexIndex(dataRoot);
-        // group vertices/indices by (GL texture, isDecal)
+        // group vertices/indices by (GL texture, kind)
         std::map<std::pair<GLuint,int>, std::pair<std::vector<float>, std::vector<unsigned>>> groups;
-        auto add=[&](const std::vector<Scene::OverlayMesh>& list, int isDecal){
+        auto add=[&](const std::vector<Scene::OverlayMesh>& list, int kind){
             for (const auto& m : list) {
                 GLuint t = resolveLayerTex(m.tex);
                 if (!t) continue;
-                auto& g = groups[{t,isDecal}];
+                auto& g = groups[{t,kind}];
                 unsigned base = (unsigned)(g.first.size()/5);
                 g.first.insert(g.first.end(), m.verts.begin(), m.verts.end());
                 for (unsigned ix : m.idx) g.second.push_back(base + ix);
@@ -760,8 +786,40 @@ public:
                 g.second.insert(g.second.end(), { aa,cc,b2, b2,cc,dd });
             }
         }
+        // --- rivers (GRVL/GRVR): a ribbon at the record's own water level -------
+        // Unlike roads, a river carries a real per-node width in world units, so
+        // no texture-dimension derivation is needed. And its y is the WATER
+        // SURFACE, constant along the record — do NOT project it onto the
+        // heightmap, or the river climbs the banks it is supposed to cut through.
+        for (const auto& rv : s.rivers) {
+            if (rv.cx.size() < 2) continue;
+            GLuint t = resolveRiverTex(rv.tex);
+            if (!t) continue;
+            auto& g = groups[{t, 2}];              // rivers get their own pass
+            unsigned base = (unsigned)(g.first.size() / 5);
+            float vrun = 0.0f;
+            for (size_t i = 0; i < rv.cx.size(); i++) {
+                size_t a = i > 0 ? i - 1 : i, c = i + 1 < rv.cx.size() ? i + 1 : i;
+                float dx = rv.cx[c] - rv.cx[a], dz = rv.cz[c] - rv.cz[a];
+                float len = std::sqrt(dx*dx + dz*dz); if (len < 1e-4f) len = 1e-4f;
+                float nx = -dz/len, nz = dx/len;
+                if (i > 0) { float sx = rv.cx[i]-rv.cx[i-1], sz = rv.cz[i]-rv.cz[i-1];
+                             vrun += std::sqrt(sx*sx + sz*sz); }
+                float hw = (i < rv.w.size() ? rv.w[i] : 1.0f) * 0.5f;
+                float lx = rv.cx[i]-nx*hw, lz = rv.cz[i]-nz*hw;
+                float rx = rv.cx[i]+nx*hw, rz = rv.cz[i]+nz*hw;
+                float u = vrun / 12.0f;
+                g.first.insert(g.first.end(), { lx, rv.level, lz, u, 0.0f });
+                g.first.insert(g.first.end(), { rx, rv.level, rz, u, 1.0f });
+            }
+            for (size_t i = 0; i + 1 < rv.cx.size(); i++) {
+                unsigned aa = base + (unsigned)(i*2), b2 = aa+1, cc = aa+2, dd = aa+3;
+                g.second.insert(g.second.end(), { aa,cc,b2, b2,cc,dd });
+            }
+        }
+
         for (auto& kv : groups) {
-            OverlayBatch ob; ob.tex = kv.first.first; ob.isDecal = kv.first.second; ob.count = (int)kv.second.second.size();
+            OverlayBatch ob; ob.tex = kv.first.first; ob.kind = kv.first.second; ob.count = (int)kv.second.second.size();
             glGenVertexArrays(1,&ob.vao); glGenBuffers(1,&ob.vbo); glGenBuffers(1,&ob.ebo);
             glBindVertexArray(ob.vao);
             glBindBuffer(GL_ARRAY_BUFFER, ob.vbo);
@@ -899,7 +957,8 @@ public:
         }
         // road/decal overlays: textured, alpha-blended, lifted above the terrain.
         // Depth WRITES off so the many coplanar overlays don't z-fight each other;
-        // two passes (roads first, then decals) so markings paint on top of roads.
+        // three passes (roads, decals, rivers) so markings paint on top of roads
+        // and water on top of both.
         if (!overlayBatches.empty() && !wireframe) {
             glUseProgram(overlayProg);
             glUniformMatrix4fv(uOvMVP,1,GL_FALSE,mvp.m);
@@ -907,10 +966,10 @@ public:
             glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-2.0f,-2.0f);
             glDepthMask(GL_FALSE);
             glActiveTexture(GL_TEXTURE0);
-            for (int pass = 0; pass < 2; pass++)         // 0 = roads, 1 = decals
+            for (int pass = 0; pass < 3; pass++)   // roads, then decals, then rivers
                 for (auto& b : overlayBatches) {
-                    if (b.isDecal != pass) continue;
-                    if (b.isDecal ? !showDecals : !showRoads) continue;
+                    if (b.kind != pass) continue;
+                    if (b.kind == 0 ? !showRoads : b.kind == 1 ? !showDecals : !showRivers) continue;
                     glBindTexture(GL_TEXTURE_2D, b.tex);
                     glBindVertexArray(b.vao);
                     glDrawElements(GL_TRIANGLES, b.count, GL_UNSIGNED_INT, 0);
@@ -1204,7 +1263,9 @@ private:
 
     // road/decal overlays
     GLuint overlayProg=0; GLint uOvMVP=-1;
-    struct OverlayBatch { GLuint tex=0, vao=0, vbo=0, ebo=0; int count=0, isDecal=0; };
+    // kind: 0 = road, 1 = decal, 2 = river. Drawn in that order, so markings
+    // paint over roads and water sits on top of both.
+    struct OverlayBatch { GLuint tex=0, vao=0, vbo=0, ebo=0; int count=0, kind=0; };
     std::vector<OverlayBatch> overlayBatches;
 
     // terrain brush cursor ring
@@ -1233,7 +1294,7 @@ private:
 public:
     int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
     float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
-    bool  showRoads=true, showDecals=true;
+    bool  showRoads=true, showDecals=true, showRivers=true;
     // Model backface cull: 0 Off, 1 Back, 2 Front. Exterior faces are CCW (verified
     // live: Front-cull shows the interior), so Back-cull is correct/standard and
     // hides the hull interior. Toggle: View>Model cull, or key C.

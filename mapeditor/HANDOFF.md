@@ -33,9 +33,25 @@ $E --pakmap "$GD" "Maps/M_01.map" --shot out.bmp          # one rendered frame
 `--shot` renders into an offscreen FBO. It CANNOT show mouse-driven UI (brush ring,
 hover box, gizmo, marquee) — those need the live app; ask the user to verify.
 
-Always cross-check a written map against the Python oracle:
-`python cpcw_map.py roundtrip <out.map>` must say IDENTICAL, and
-`python cpcw_map.py entities <out.map>` must agree with the native count.
+Always cross-check a written map **three** ways:
+```
+$E --chunktile out.map                     # container sizes tile exactly
+python cpcw_map.py roundtrip out.map       # must say IDENTICAL
+python cpcw_map.py entities out.map        # must agree with the native count
+```
+**`roundtrip` alone does NOT validate container sizes, and never did.**
+`cpcw_map.py:_serialize_chunk` re-emits each chunk's *original* byte span and
+never recomputes a size, and `pack()` echoes any trailer verbatim — so a
+structural edit that forgets to bump an ancestor still round-trips IDENTICAL.
+Demonstrated: insert 100 bytes at M_01's `GROL` content end, bump only `SCEN`,
+and the oracle reports "re-write IDENTICAL" on a corrupt map while `--chunktile`
+fails it naming `SCEN`, `WRLD` and `GTRN` with exact byte deltas.
+
+`--chunktile <map|dir>` is the real detector: every container's children must
+tile its content exactly (no gap, no overlap, no slack) after that container's
+fixed sub-header, and every `OBJS.meta_schema_off` must still point at its own
+`SCHD` child. Baseline on the shipped corpus: **45/45 OK, 225/225 OBJS,
+gap=0 overlap=0 trailer=0**.
 
 Test maps on disk: `N:/gamePAKdata/CPCWPak/Maps/*.map` (45 are real CPCW `SCEN`
 maps; the `add_ge_*`/`fr_*`/`ger_*` ones are an older Gepard format and are
@@ -102,6 +118,94 @@ correctly rejected).
   `resolveTexKey` skips corner/cross/junc pieces so roads pick the tiling strip.
   Full RE writeup: `N:\gamePAKdata\re\ROADS_RESULT.md`, memory [[cpcw-road-groa]].
 
+- **WTHR is decoded** (`src/weather.{h,cpp}`, `docs/MAP_FORMAT.md` §4.9 + §11).
+  `PATH`/`CAMS`/`WTHR` share a **slot-pool** container: version, live count,
+  `freeHead/freeTail/listHead/listTail/capacity`, then `capacity ×
+  {i32 next, i32 prev, u8 isFree[, record]}`. A live WTHR slot = `u32
+  recordVersion(13)` + `u16`-prefixed name + **194 fixed bytes**. Walks to the
+  exact chunk end on **45/45 maps, 219 records**.
+  - **Iterate `listHead → next`, never the slot array.** M_17's chain is
+    7→0→1→4, the authored order (`M_17_1_Clouds`, `_2_Rain_1`, `_2_Rain_2`,
+    `_3_After_Rain`); slot order would present them scrambled.
+  - The record body is read in **stream order, which is not the struct order**
+    (`FogColor` 8th, `SunSpecular` 12th). Both orders sum to 194, so "the walk
+    consumed the chunk exactly" passes on all 45 maps for a wrong permutation —
+    `--wthrtest` pins the order by semantics instead (alphas ≡ 1.0 on 876/876,
+    `SunShadow.w` ∈ 0.25..2.58 so it is *not* an alpha, `EffectCount` ≡ 4,
+    `|SunDirection|` ≡ 1, `TimeOfTheDay` ∈ [0,24], `Brightness`/`Contrast` ≡ 1.0,
+    `FogEnd > FogStart`). Verified by reintroducing a `SunShadow`↔`FogColor`
+    swap: alphas fall to 811/876 and `SunShadow.w` collapses to 1.0..1.0.
+  - Refuse **chunk version 2** (a flat count+records list) and assert
+    **recordVersion == 13** — the loader is an `if (N < version)` cascade, so a
+    lower version is a shorter record and the fixed stride would desync.
+  - **The engine-active preset is the one literally NAMED `"Default"`** — never
+    slot 0, never the list head. M_17 has none; MPMission/(6) Breakthrough has
+    `Default` *and* `Default2`; Domination/(4) Ring Of Fire ships two live
+    presets both named `Night_multi` with different bodies. **Key UI on the slot.**
+  - NOT invariants: `CloudMovementDir == WindDirection*CloudSpeed` fails on
+    8/219 (worst 0.00999999, M_07 `02_cloudy`) — never auto-rewrite it. Night
+    presets are not uniformly dark (M_06 `03_night` SunColor is 1.24/1.50/1.80;
+    the black ones are the MP `Night_multi` at exactly 0,0,0). `SunColor` is not
+    clamped to 1 — it reaches 2.78. `unknown98`/`unknown9c` are read at v13 but
+    absent from the reflection table: do not name them.
+  - The **sun axis is only half resolved**: `SunDirection[1] < 0` on 219/219 with
+    the other two components taking either sign, so index 1 is vertical and the
+    vector is the direction light *travels* (`L = -SunDirection`). The horizontal
+    swizzle is still open. Do **not** infer it from the old hard-coded
+    `{0.4, 0.8, 0.35}` — that matches M_01 `Default` in magnitude but with
+    opposite horizontal signs.
+- **GROL / GDCL / GRVL are SLOT POOLS**, not "a 24-byte header then records with a
+  9-or-18-byte prefix" (that prefix was a free slot plus a real slot header):
+  `u32 usedCount, freeHead, freeTail, usedHead, usedTail, slotCount`, then
+  `slotCount × {i32 next, i32 prev, u8 isFree[, chunk]}`. Walks to the exact
+  content end on **135/135** shipped containers with usedCount matching every
+  time — 3944 GROA, 4114 GDEC, 51 GRVR. `overlays.cpp` now keeps every record's
+  byte offsets (`Scene::roadPool/decalPool/riverPool`), which is what a write path
+  needs. `--overlayscan` also asserts the used chain visits every live slot once
+  with `prev` the exact inverse.
+  - **Order — measured, and deliberately NOT acted on.** The engine's *loader*
+    (FUN_004bdba0/dd80/df60, one templated routine, allocating 0x120/0x184/0x11c)
+    iterates the **slot array**, i.e. file order. The used list is a *different*
+    order on **71 of 90** road/decal pools (`usedHead != 0` on 28). If the
+    *renderer* walks the list instead, list order is the Z-order — but the loader
+    does not settle that, and nothing has been read on the draw side. The measured
+    visual stake is small: of overlapping decal pairs, the two orders disagree on
+    1/51 in M_02, 24/302 in M_05, 0/16 in M_01. **Emission stays in slot order**
+    (unchanged rendering) until someone reads the draw loop. Do not reorder on the
+    strength of the container layout alone.
+- **CPCW HAS RIVERS** — `GRVL` is empty in 17/45 maps, and earlier notes measured
+  only those. The other 28 carry **51 `GRVR` records** (49 with >1 node; the two
+  single-node ones are both in Domination/(8) Sole Survivor and cannot form a
+  ribbon). Same record shape as GROA at version 2, and two things differ that
+  matter: `y` is a CONSTANT water level per record (−13.0 … +15.4), so a river must
+  **not** be projected onto the heightmap; and `params[i].float0` is a REAL
+  per-node width in world units (1.0 … 37.0), so rivers need none of the road's
+  texture-dimension derivation. Mode 1 (Spline/River) is live and read-only;
+  `View > Rivers` toggles them.
+  - **River material -> texture is unsolved.** Materials are per-map names
+    (`Terrain/River/M_03/M_03_rivers`, `Terrain/River/Water`, `.../Elbe_Kanal`)
+    and no DDS of that stem ships; the real textures are generic under
+    `CPCWPak/Rivers/`. `resolveTexKey`'s longest-prefix fallback silently borrowed
+    an unrelated terrain texture (rivers drew as dark ground), so
+    `resolveRiverTex()` matches the `Rivers/` set instead. That is a heuristic,
+    not the engine's mapping.
+- **GROA node aux floats are Catmull-Rom handles**, not "segment length + tangent":
+  each node carries an `in` and an `out` 3-float handle whose magnitudes are the
+  distances to the previous and next node. They are therefore re-derivable when a
+  node moves. Full record: `u32 version(11) + u32 N + N×36 nodes + u32 N2 + N×16
+  params + u8 + str16 material + str16 shader + 22-byte tail`.
+- **BLCK is two planes, not 12 bytes per cell**: a `uint16` flag plane then a
+  `uint8` type plane, both at BLCK's **own** header dims (`payload == w*h*3` on
+  45/45). Those dims are `world*2` on only **41/45** — Island Thunder 544x464 →
+  1088x960, Urban Legend 528x448 → 1088x896, Islands Of Hope 720x720 →
+  1472x1472, The Last Village 576x400 → 1152x832 — so never derive them from
+  WRLD. Separated from the old reading by spatial coherence (M_01: the plane
+  reading is 0.9956/0.9879 neighbour-equality with 4 and 6 distinct values; the
+  6×uint16 reading is 0.942 with ~30 per lane and near-identical stats across all
+  six lanes, the signature of one field read at six offsets). The old
+  `(1,1,1,1,1,1)`=passable table and the "251 cell patterns" figure were both
+  artifacts of that misalignment. Values are still undecoded: **read-only**.
+
 ## OPEN issues
 1. **Merged-tank "track explosion" (17 heavy tanks) — DEFERRED, the one genuinely
    unsolved rendering bug.** `srm_bone_node_list` (`viewer/src/srm_model.cpp`
@@ -119,10 +223,19 @@ correctly rejected).
    `overlays.cpp` (a convexity assumption), and detected by a name+bbox heuristic.
 5. **Roads and decals are read-only.** They decode and render; there is no write
    path, so the Shader/Decals mode says so and opens the chunk inspector.
-6. **Not decoded at all**: splines/rivers, lake & water data, the `WTHR`
-   weather/lighting block, the trigger system (Lua bodies). `View > Map chunks` is
-   the read-only starting point for any of them — inspect the bytes, don't invent
-   fields, and land the layout in `docs/MAP_FORMAT.md` before building UI.
+6. **Not decoded at all**: the trigger system (Lua bodies), which is behind an
+   undecoded `HEAP` (type 0x89A5) — a tag-first walk reaches 0 of 1265 SLocation.
+   `View > Map chunks` is the read-only starting point — inspect the bytes, don't
+   invent fields, and land the layout in `docs/MAP_FORMAT.md` before building UI.
+   - `WTHR` is **decoded and editable** (Light mode). Still open: the horizontal
+     sun swizzle, so nothing lights the viewport yet.
+   - `GRVL`/`GRVR` rivers are **decoded and drawn** (River mode, read-only). Still
+     open: the material -> texture mapping, and no write path.
+   - **Lake/water is not "undecoded", it is absent.** No lake, water, river or
+     spline *schema* exists in any of the 45 maps. Mode 6 is marked `MK_RETIRED`.
+     Note this is only true of *water*: `GRVL` is **not** vestigial — earlier
+     notes calling it "24 empty bytes in every map" measured only the 17 maps
+     where it is empty; the other 28 carry real `GRVR` river records.
 7. **Strings are read-only in Properties** — editing one would resize the record.
    Doing it properly means patching the enclosing VOBJ/OBJT sizes as well as the
    container chain; the machinery for the container chain already exists.
@@ -135,4 +248,12 @@ correctly rejected).
 Textured terrain, road/decal decode+render, THMB thumbnails, ProtoDB browser,
 byte-faithful save + structural add/delete, colour-code picking, gizmo + snapping,
 clipboard, schema Properties, splat painting, handedness, raymarch cursor picking,
-brush ring, hover/selection highlight.
+brush ring, hover/selection highlight, WTHR decode + read-only Light mode.
+
+## Modes
+`kModes[]` carries a `ModeKind`, and every predicate asks for the kind rather
+than comparing a mode index — the indices are 0..8 and must stay that way
+(settings and `View > Mode` write them). `MK_RETIRED` means *measured absent*,
+not undecoded. Note `activeToolIsPlace()` is gated on `MK_OBJECT`: Shader/Decals
+also names its first tool "Place", and without the gate a click in that mode
+dropped an entity on the terrain.

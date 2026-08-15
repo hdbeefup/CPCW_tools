@@ -1,27 +1,41 @@
-// Road (GROL/GROA) & decal (GDCL/GDEC) overlay decoder.
-//
-// Layout reverse-engineered from the shipped maps (M_01 et al.), cross-checked by
-// bounding decoded floats against the map's world extent:
+// Road (GROL/GROA), decal (GDCL/GDEC) and river (GRVL/GRVR) overlay decoder.
 //
 //   GTRN  (1-byte version, then children GTRD, GROL, GDCL, GRVL)
-//     GROL / GDCL container:
-//       u32  recordCount               (matches the number of GROA/GDEC records)
-//       u32  ?, u32 ?, u32 0, u32 ?, u32 ?   (5 more header dwords -> 24-byte header)
-//       recordCount ×:
-//         u32 index(1-based) + u32 flag + u8 flag   (9-byte per-record prefix)
-//         "GROA"/"GDEC" + u32 size + body
+//
+// All three overlay children are the SAME slot pool (docs/MAP_FORMAT.md §4.9),
+// which the engine reads with one templated routine instantiated three times
+// (FUN_004bdba0 roads / FUN_004bdd80 decals / FUN_004bdf60 rivers — identical
+// but for the record size they allocate: 0x120 / 0x184 / 0x11c):
+//
+//     u32 usedCount, freeHead, freeTail, usedHead, usedTail, slotCount   (24 bytes)
+//     slotCount × { u32 next, u32 prev, u8 isFree [, "GROA"/"GDEC"/"GRVR" chunk] }
+//
+// The old reader here guessed at a "9 or 18 byte per-record prefix" and scanned
+// forward for the next subtag; that prefix was a free slot plus a real slot
+// header. Walking the pool properly consumes all 135 shipped containers to their
+// exact byte and yields the per-record offsets a write path needs.
+//
+// **Emission order is SLOT order**, matching the engine's loader, which iterates
+// the slot array rather than following usedHead. The used list is not in slot
+// order (71 of 90 road/decal containers), but nothing establishes that the
+// RENDERER walks the list, and the measured visual impact is tiny — see
+// `--overlayscan`. Do not reorder without evidence from the draw side.
 //
 //   GROA (road) body:
-//     u32 type(=11) + u32 nodeCount +
-//     nodeCount × 36 bytes { float x,y,z (world; y=0 -> terrain-projected) + 6 aux
-//       floats (segment length, tangent dx/dz, ...) } +
-//     trailer (transform matrix / bbox) + u16 material path + u16 shader path + tail.
-//     The nodeCount points trace the road centreline; we extrude a textured ribbon.
+//     u32 version(=11) + u32 N + N × 36-byte node + u32 N2 + N × 16-byte params
+//     + u8 + u16-str material + u16-str shader + 22-byte tail.
+//     Node = float x,y,z (world centreline; y≈0 -> projected onto the heightmap)
+//     + two 3-float Catmull-Rom handles (in, out) whose magnitudes are the
+//     distances to the previous and next node.
 //
 //   GDEC (decal) body:
-//     u32 count(=6) + float centerX + float centerZ + float sizeX + float sizeY +
-//     float rot(radians) + u32 flag + padding + u16 material path + ...
-//     -> one rotated, terrain-projected textured quad.
+//     u32 count(=6) + float centerX, centerZ, sizeX, sizeY, rot(radians) + flags
+//     + u16-str material -> one rotated, terrain-projected textured quad.
+//
+//   GRVR (river) body: the same shape as GROA with version 2. The centreline
+//     sits at a CONSTANT y (the water level, e.g. -10.0) and params[i].float0 is
+//     a real per-node width in world units (22.0, 25.0 observed) — so unlike a
+//     road, a river needs no texture-dimension width derivation.
 #include "overlays.h"
 #include <cstdint>
 #include <cstring>
@@ -75,44 +89,102 @@ float heightAt(const Scene& s, float x, float y) {
 
 const float BIAS = 0.25f;   // lift overlays above the terrain to avoid z-fighting
 
-// Walk a GROL/GDCL container: 24-byte header, then a run of `subtag` chunks
-// (tag + u32 size + body) separated by small variable-length per-record prefixes
-// (9 or 18 bytes observed). Rather than assume a fixed prefix, scan forward for
-// the next subtag after each chunk. The 4-byte subtag is distinctive enough that
-// false hits inside float data are effectively impossible with the size check.
-struct Rec { size_t bodyOff, bodySize; };
-std::vector<Rec> walkRecords(const std::vector<unsigned char>& d, size_t off, size_t size,
-                             const char* subtag) {
+// Walk the slot pool exactly. `off` is the container's CONTENT start, `size` its
+// content size. Fills `pool` (header + every live record's byte offsets) and
+// returns the live records in slot order. `pool.ok` is false unless the walk
+// lands precisely on the content end and the live count matches usedCount — a
+// half-understood pool must not be handed to a write path.
+struct Rec { size_t bodyOff, bodySize; int slot; };
+std::vector<Rec> walkPool(const std::vector<unsigned char>& d, size_t off, size_t size,
+                          const char* subtag, Scene::OverlayPool& pool) {
     std::vector<Rec> recs;
     size_t end = off + size;
-    size_t p = off + 24;                    // skip container header
+    pool.hdrOff = (long)off; pool.contentEnd = (long)end; pool.ok = false;
+    if (off + 24 > end) return recs;
+    auto i32 = [&](size_t p){ return (int32_t)u32(d, p); };
+    pool.used     = i32(off);
+    pool.freeHead = i32(off + 4);
+    pool.freeTail = i32(off + 8);
+    pool.usedHead = i32(off + 12);
+    pool.usedTail = i32(off + 16);
+    pool.cap      = i32(off + 20);
+    if (pool.cap < 0 || pool.cap > (int)((end - off) / 9) + 1) return recs;
+    size_t p = off + 24;
+    for (int s = 0; s < pool.cap; s++) {
+        if (p + 9 > end) return recs;
+        int nxt = i32(p), prv = i32(p + 4);
+        bool free = d[p + 8] != 0;
+        p += 9;
+        if (free) continue;
+        if (!tagAt(d, p, subtag)) return recs;
+        uint32_t sz = u32(d, p + 4);
+        size_t body = p + 8;
+        if (body + sz > end) return recs;
+        recs.push_back({ body, sz, s });
+        pool.live.push_back({ s, (long)p, (long)body, (long)sz, nxt, prv });
+        p = body + sz;
+    }
+    pool.ok = (p == end) && ((int)recs.size() == pool.used);
+    return recs;
+}
+
+// Fallback for a pool that does not walk: the original forward scan for the next
+// subtag. Kept so a map the pool reader cannot parse still RENDERS (read-only) —
+// it just gets no byte offsets, so nothing may write to it.
+std::vector<Rec> scanRecords(const std::vector<unsigned char>& d, size_t off, size_t size,
+                             const char* subtag) {
+    std::vector<Rec> recs;
+    size_t end = off + size, p = off + 24;
     while (p + 8 <= end) {
         if (tagAt(d, p, subtag)) {
             uint32_t sz = u32(d, p + 4);
             size_t body = p + 8;
-            if (sz > 0 && body + sz <= end) { recs.push_back({body, sz}); p = body + sz; continue; }
+            if (sz > 0 && body + sz <= end) { recs.push_back({body, sz, -1}); p = body + sz; continue; }
         }
-        p++;                                // scan to the next subtag
+        p++;
     }
     return recs;
+}
+
+std::vector<Rec> readPool(const std::vector<unsigned char>& d, size_t off, size_t size,
+                          const char* subtag, Scene::OverlayPool& pool) {
+    std::vector<Rec> r = walkPool(d, off, size, subtag, pool);
+    if (pool.ok) return r;
+    pool.live.clear();
+    return scanRecords(d, off, size, subtag);
 }
 } // namespace
 
 void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
-    s.roads.clear(); s.decals.clear(); s.roadSplines.clear();
-    // find GTRN, then its children GROL/GDCL (GTRN body has a 1-byte version)
-    size_t gtrn = std::string::npos;
-    for (size_t i = 0; i + 4 <= d.size(); i++)
-        if (d[i]=='G'&&d[i+1]=='T'&&d[i+2]=='R'&&d[i+3]=='N') { gtrn = i; break; }
-    if (gtrn == std::string::npos) return;
-    size_t gbody = gtrn + 8, gend = gbody + u32(d, gtrn + 4);
-    size_t grolOff=0, grolSz=0, gdclOff=0, gdclSz=0;
-    size_t p = gbody + 1;                    // 1-byte version
+    s.roads.clear(); s.decals.clear(); s.roadSplines.clear(); s.rivers.clear();
+    s.roadPool = Scene::OverlayPool{}; s.decalPool = Scene::OverlayPool{};
+    s.riverPool = Scene::OverlayPool{};
+    // Locate GTRN through the chunk tree (SCEN -> WRLD -> GTRN) rather than
+    // scanning the file for the bytes "GTRN": terrain float data can spell a tag
+    // by coincidence, and the first hit is not necessarily the chunk.
+    if (d.size() < 8 || memcmp(d.data(), "SCEN", 4) != 0) return;
+    size_t scenEnd = 8 + u32(d, 4), wrld = 0, wrldEnd = 0;
+    for (size_t q = 12; q + 8 <= scenEnd && q + 8 <= d.size(); ) {
+        uint32_t sz = u32(d, q + 4);
+        if (tagAt(d, q, "WRLD")) { wrld = q; wrldEnd = q + 8 + sz; break; }
+        q += 8 + sz;
+    }
+    if (!wrld) return;
+    size_t gtrn = 0, gend = 0;
+    for (size_t q = wrld + 20; q + 8 <= wrldEnd && q + 8 <= d.size(); ) {
+        uint32_t sz = u32(d, q + 4);
+        if (tagAt(d, q, "GTRN")) { gtrn = q; gend = q + 8 + sz; break; }
+        q += 8 + sz;
+    }
+    if (!gtrn) return;
+    size_t grolOff=0, grolSz=0, gdclOff=0, gdclSz=0, grvlOff=0, grvlSz=0;
+    size_t p = gtrn + 9;                     // GTRN body has a 1-byte version
     while (p + 8 <= gend) {
         const unsigned char* t = d.data() + p; uint32_t sz = u32(d, p + 4);
-        if (!memcmp(t,"GROL",4)) { grolOff=p+8; grolSz=sz; }
-        else if (!memcmp(t,"GDCL",4)) { gdclOff=p+8; gdclSz=sz; }
-        else if (memcmp(t,"GTRD",4) && memcmp(t,"GRVL",4)) break;
+        if (!memcmp(t,"GROL",4)) { grolOff=p+8; grolSz=sz; s.roadPool.chunkOff=(long)p; }
+        else if (!memcmp(t,"GDCL",4)) { gdclOff=p+8; gdclSz=sz; s.decalPool.chunkOff=(long)p; }
+        else if (!memcmp(t,"GRVL",4)) { grvlOff=p+8; grvlSz=sz; s.riverPool.chunkOff=(long)p; }
+        else if (memcmp(t,"GTRD",4)) break;
         p = p + 8 + sz;
     }
     float wmax = (float)(s.world_w > 0 ? s.world_w : 4096);
@@ -120,7 +192,7 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
 
     // ---- roads: GROA centreline polyline -> textured ribbon ---------------
     if (grolOff) {
-        for (const Rec& r : walkRecords(d, grolOff, grolSz, "GROA")) {
+        for (const Rec& r : readPool(d, grolOff, grolSz, "GROA", s.roadPool)) {
             size_t b = r.bodyOff, e = b + r.bodySize;
             uint32_t nv = u32(d, b + 4);
             if (nv < 2 || nv > 20000) continue;
@@ -166,7 +238,7 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
             } else {
                 // Store the centreline; the ribbon is extruded at render time in
                 // buildOverlays() using the road TEXTURE's height for width.
-                Scene::RoadSpline rs; rs.tex = mat;
+                Scene::RoadSpline rs; rs.tex = mat; rs.srcSlot = r.slot;
                 rs.cx = std::move(px); rs.cz = std::move(pz);
                 s.roadSplines.push_back(std::move(rs));
             }
@@ -175,7 +247,7 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
 
     // ---- decals: GDEC quad ------------------------------------------------
     if (gdclOff) {
-        for (const Rec& r : walkRecords(d, gdclOff, gdclSz, "GDEC")) {
+        for (const Rec& r : readPool(d, gdclOff, gdclSz, "GDEC", s.decalPool)) {
             size_t b = r.bodyOff, e = b + r.bodySize;
             float cx = f32(d, b + 4), cz = f32(d, b + 8);
             float sx = f32(d, b + 12), sy = f32(d, b + 16), rot = f32(d, b + 20);
@@ -193,7 +265,47 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
                 om.verts.insert(om.verts.end(), { wx, heightAt(s,wx,wz)+BIAS, wz, uv[k][0], uv[k][1] });
             }
             om.idx = {0,1,2, 0,2,3};
+            om.srcSlot = r.slot;
             s.decals.push_back(std::move(om));
+        }
+    }
+
+    // ---- rivers: GRVR centreline at a constant water level ------------------
+    // Same record shape as GROA (version 2), but the width is real: the trailing
+    // params array carries one per node in world units, so no texture-dimension
+    // derivation is needed. y is constant per record and IS the water surface —
+    // rivers are not projected onto the heightmap the way roads and decals are.
+    if (grvlOff) {
+        for (const Rec& r : readPool(d, grvlOff, grvlSz, "GRVR", s.riverPool)) {
+            size_t b = r.bodyOff, e = b + r.bodySize;
+            uint32_t nv = u32(d, b + 4);
+            if (nv < 2 || nv > 20000) continue;
+            size_t nodes = b + 8;
+            if (nodes + (size_t)nv * 36 + 4 > e) continue;
+            Scene::RiverSpline rv; rv.srcSlot = r.slot;
+            float level = 0.0f; bool haveLevel = false;
+            bool bad = false;
+            for (uint32_t i = 0; i < nv; i++) {
+                size_t n = nodes + (size_t)i * 36;
+                float x = f32(d, n), y = f32(d, n + 4), z = f32(d, n + 8);
+                if (!(x==x) || !(z==z) || !(y==y) ||
+                    x < -64 || x > wmax+64 || z < -64 || z > hmax+64) { bad = true; break; }
+                if (!haveLevel) { level = y; haveLevel = true; }
+                rv.cx.push_back(x); rv.cz.push_back(z);
+            }
+            if (bad || rv.cx.size() < 2) continue;
+            rv.level = level;
+            // params: u32 count2 (== nv) then nv x 16 bytes, float0 = width
+            size_t par = nodes + (size_t)nv * 36;
+            uint32_t n2 = u32(d, par);
+            rv.w.assign(rv.cx.size(), 1.0f);
+            if (n2 == nv && par + 4 + (size_t)nv * 16 <= e)
+                for (uint32_t i = 0; i < nv && i < rv.w.size(); i++) {
+                    float w = f32(d, par + 4 + (size_t)i * 16);
+                    rv.w[i] = (w == w && w > 0.0f && w < 4096.0f) ? w : 1.0f;
+                }
+            rv.tex = findMaterial(d, b, e);
+            s.rivers.push_back(std::move(rv));
         }
     }
 }

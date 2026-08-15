@@ -19,6 +19,7 @@
 #include "scene.h"
 #include "viewport3d.h"
 #include "mapfile.h"
+#include "weather.h"
 #include "protodb.h"
 #include "pak.h"
 #include "vfs.h"
@@ -52,17 +53,30 @@
 #endif
 
 // --- editor modes (mirrored from the S.W.I.N.E. editor) ----------------------
-struct Mode { const char* name; const char* focus; const char* tools; };
+// Each mode carries a `kind` so the rest of the file can ask what a mode IS
+// rather than compare its index. The indices are still 0..8 and must stay that
+// way: they are what `settings` persists and what `View > Mode` writes, and
+// several modes share a kind (Object/Unit/Ambient are all MK_OBJECT).
+enum ModeKind {
+    MK_TERRAIN,   // heightmap + splat brushes
+    MK_OBJECT,    // entity placement / transform
+    MK_OVERLAY,   // GROA roads + GDEC decals
+    MK_RIVER,     // GRVL/GRVR river splines
+    MK_LIGHT,     // WTHR weather / lighting presets
+    MK_TRIGGER,   // scenario logic
+    MK_RETIRED,   // the format has no such data in ANY CPCW map
+};
+struct Mode { const char* name; const char* focus; const char* tools; ModeKind kind; };
 static const Mode kModes[] = {
-    {"Vertex / Terrain", "terrain", "Grab Raise Lower SetPlane Raise>Plane Lower>Plane Smooth Blend TileFill Area"},
-    {"Spline",           "terrain", "New-river Node-move Close-loop Altitude Width Texture"},
-    {"Object / Doodad",  "object",  "Place Move Lift Rotate Tilt Align"},
-    {"Unit",             "object",  "Place Move Rotate"},
-    {"Ambient",          "object",  "Place Move Lift Distance"},
-    {"Shader / Decals",  "terrain", "Place Move Rotate Z-order"},
-    {"Lake / Water",     "terrain", "Place Move Lift"},
-    {"Light",            "global",  "(settings)"},
-    {"Trigger",          "logic",   "Locations Triggers Conditions Actions"},
+    {"Vertex / Terrain", "terrain", "Grab Raise Lower SetPlane Raise>Plane Lower>Plane Smooth Blend TileFill Area", MK_TERRAIN},
+    {"Spline / River",   "terrain", "Select Node-inspect", MK_RIVER},
+    {"Object / Doodad",  "object",  "Place Move Lift Rotate Tilt Align", MK_OBJECT},
+    {"Unit",             "object",  "Place Move Rotate", MK_OBJECT},
+    {"Ambient",          "object",  "Place Move Lift Distance", MK_OBJECT},
+    {"Shader / Decals",  "terrain", "Place Move Rotate Z-order", MK_OVERLAY},
+    {"Lake / Water",     "terrain", "(retired)", MK_RETIRED},
+    {"Light",            "global",  "(settings)", MK_LIGHT},
+    {"Trigger",          "logic",   "Locations Triggers Conditions Actions", MK_TRIGGER},
 };
 static const int kNumModes = (int)(sizeof(kModes) / sizeof(kModes[0]));
 
@@ -71,6 +85,8 @@ static Camera     g_cam;
 static Viewport3D g_vp;
 static bool  g_glReady = false, g_sceneDirty = false;
 static int   g_mode = 0, g_activeTool = 0, g_selected = -1, g_hovered = -1;
+static ModeKind modeKind() { return kModes[g_mode].kind; }
+static bool  modeIs(ModeKind k) { return kModes[g_mode].kind == k; }
 static float g_brushSize = 2.0f, g_brushHeight = 0.0f, g_brushPress = 0.5f;
 static bool  g_wireframe = false;
 static bool  g_showModes = true, g_showPanel = true, g_showProps = true,
@@ -130,7 +146,10 @@ static ImVec2 g_marqueeA{0,0};
 // renumbers every later index, so an index-keyed stack would undo onto the wrong
 // entity. Structural commands carry the exact OBJT bytes, so both directions are
 // byte-exact.
-enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH };
+// CMD_WEATHER is keyed on (pool slot, field index), not an entity id: a preset is
+// not an entity. Both keys are stable because nothing creates or deletes a preset
+// yet, and an entity edit never touches the WTHR pool.
+enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH, CMD_WEATHER };
 struct EditCmd {
     int  kind = CMD_ENTITY;
     long entId = 0;
@@ -138,6 +157,8 @@ struct EditCmd {
     std::vector<int> cells; std::vector<float> h0, h1;   // CMD_TERRAIN
     std::vector<unsigned char> objt; int entIndex = -1;  // CMD_ADD / CMD_DELETE
     std::vector<EntSnap> ents;                           // CMD_BATCH (gizmo, group ops)
+    int wSlot = -1, wField = -1;                         // CMD_WEATHER
+    std::array<float,4> w0{}, w1{};
 };
 static std::vector<EditCmd> g_undo, g_redo;
 static bool g_snapActive = false; static EditCmd g_snap;   // pending entity snapshot
@@ -198,7 +219,13 @@ static void selectAllVisible() {
 static void flushEditsToRaw() {
     if (g_scene.raw.empty()) return;
     std::vector<long> ids(g_edited.begin(), g_edited.end());
-    if (ids.empty() && !g_scene.terrainEdited) return;
+    // Every edit kind that lives outside Scene::raw must be named here. The
+    // early-out used to test only `terrainEdited`, so painting a splat layer (or
+    // now editing a weather preset) and THEN placing an object silently threw the
+    // paint away — apply_edits_inplace never ran, and the structural op rebuilt
+    // raw from bytes that had never seen it.
+    if (ids.empty() && !g_scene.terrainEdited && !g_scene.splatEdited &&
+        !g_scene.weatherEdited) return;
     apply_edits_inplace(g_scene, ids, g_scene.raw);
 }
 // After a structural edit the entity list is rebuilt: re-anchor the selection by
@@ -230,6 +257,20 @@ static void applyCmd(const EditCmd& c, bool useNew) {
             g_edited.insert(e.id);
         }
         g_entDirty = true; g_modelsDirty = true;
+        return;
+    }
+    if (c.kind == CMD_WEATHER) {
+        for (WeatherPreset& w : g_scene.weather) {
+            if (w.slot != c.wSlot) continue;
+            if (c.wField < 0 || c.wField >= (int)w.values.size()) break;
+            w.values[(size_t)c.wField] = useNew ? c.w1 : c.w0;
+            // The dirty flag is NOT cleared on undo: the field still differs from
+            // the bytes on disk, so it must still be written on save or
+            // Scene::weather and Scene::raw diverge.
+            w.dirty[(size_t)c.wField] = 1;
+            g_scene.weatherEdited = true;
+            break;
+        }
         return;
     }
     if (c.kind == CMD_ADD || c.kind == CMD_DELETE) {
@@ -650,11 +691,22 @@ static void doSaveTo(const std::string& out, bool keepBackup) {
     if (writeMapAtomic(out, bytes, keepBackup, err)) {
         snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved -> %s%s", out.c_str(),
                  keepBackup ? "  (previous kept as .bak)" : "");
-        g_edited.clear(); g_scene.terrainEdited = false;
+        // Clear EVERY dirty flag, not just the entity/terrain ones: the file on
+        // disk now matches memory, so leaving a flag set makes the next save
+        // rewrite cells the user never touched again (and keeps the Changes
+        // panel and the title claiming unsaved work).
+        g_edited.clear();
+        g_scene.terrainEdited = false;
+        g_scene.splatEdited = false;
+        g_scene.weatherEdited = false;
         for (Entity& e : g_scene.entities) for (EntityField& f : e.fields) f.dirty = false;
+        for (WeatherPreset& w : g_scene.weather)
+            std::fill(w.dirty.begin(), w.dirty.end(), (unsigned char)0);
         snapshotSavedState();       // the Changes panel now diffs against this file
         if (!g_scene.heightDirty.empty())
             std::fill(g_scene.heightDirty.begin(), g_scene.heightDirty.end(), (unsigned char)0);
+        for (auto& layer : g_scene.splatDirty)
+            std::fill(layer.begin(), layer.end(), (unsigned char)0);
     } else {
         snprintf(g_saveStatus, sizeof(g_saveStatus), "Save failed: %s", err.c_str());
     }
@@ -775,7 +827,10 @@ static float terrainHeightAt(float x, float y) {
 
 // True when the active mode's selected tool is the "Place" tool (Object/Unit/
 // Ambient modes) — i.e. a left-click on terrain should drop a prototype copy.
+// The MK_OBJECT gate matters: Shader/Decals also names its first tool "Place",
+// so without it a click in that mode dropped an *entity* on the terrain.
 static bool activeToolIsPlace() {
+    if (!modeIs(MK_OBJECT)) return false;
     char buf[256]; snprintf(buf, sizeof(buf), "%s", kModes[g_mode].tools);
     int idx = 0;
     for (char* tok = strtok(buf, " "); tok; tok = strtok(nullptr, " "), idx++)
@@ -983,6 +1038,7 @@ static void drawMenuBar() {
         }
         ImGui::MenuItem("Roads", nullptr, &g_vp.showRoads);
         ImGui::MenuItem("Decals", nullptr, &g_vp.showDecals);
+        ImGui::MenuItem("Rivers", nullptr, &g_vp.showRivers);
         ImGui::Separator();
         if (ImGui::BeginMenu("Model cull")) {   // hides hull interior (pick what looks right)
             if (ImGui::MenuItem("Off (two-sided)", nullptr, g_vp.cullMode==0)) g_vp.cullMode=0;
@@ -1169,6 +1225,210 @@ static void drawPrototypeBrowser() {
     ImGui::TextDisabled("Right-click a tile to favourite it. Ctrl+D dup, Del remove.");
 }
 
+// --- Light mode (WTHR) -------------------------------------------------------
+// Read-only for now: the format is decoded and every field is fixed-width, so
+// editing is a size-preserving in-place write, but the write path + undo land
+// with the editable panel. Showing the real values now is what makes the decode
+// checkable by eye rather than only by --wthrtest.
+static int g_lightPreset = -1;
+
+static void drawLightPanel() {
+    if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
+    if (g_scene.weather.empty()) {
+        ImGui::TextWrapped("This map has no readable WTHR pool. Either the chunk is "
+                           "absent, or it is the older flat chunk version 2, which "
+                           "this decoder refuses rather than mis-strides.");
+        if (ImGui::Button("Open the raw chunk inspector")) g_showChunks = true;
+        return;
+    }
+    if (g_lightPreset < 0 || g_lightPreset >= (int)g_scene.weather.size())
+        g_lightPreset = g_scene.weatherActive >= 0 ? g_scene.weatherActive : 0;
+
+    ImGui::Text("%d preset%s, %d free of %d slots", (int)g_scene.weather.size(),
+                g_scene.weather.size() == 1 ? "" : "s", g_scene.weatherFree, g_scene.weatherCap);
+    if (g_scene.weatherActive >= 0)
+        ImGui::TextDisabled("engine-active: \"%s\" (slot %d)",
+                            g_scene.weather[g_scene.weatherActive].name.c_str(),
+                            g_scene.weather[g_scene.weatherActive].slot);
+    else
+        // Not a parse failure: the engine binds by NAME, and this map has none.
+        ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
+                           "No preset is named \"Default\" - the engine binds that name, "
+                           "so this map has no active preset.");
+    ImGui::SeparatorText("Presets");
+    // Listed in list-chain order, which is the authored order, not slot order.
+    for (int k = 0; k < (int)g_scene.weather.size(); k++) {
+        const WeatherPreset& w = g_scene.weather[(size_t)k];
+        char lbl[160];
+        snprintf(lbl, sizeof(lbl), "%s%s##wp%d", w.name.c_str(),
+                 k == g_scene.weatherActive ? "  *" : "", k);
+        if (ImGui::Selectable(lbl, k == g_lightPreset)) g_lightPreset = k;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("pool slot %d", w.slot);
+    }
+
+    WeatherPreset& w = g_scene.weather[(size_t)g_lightPreset];
+    ImGui::SeparatorText(w.name.c_str());
+    ImGui::TextDisabled("edits are in-place and byte-faithful; Ctrl+S writes them");
+
+    // One undo command per interaction, not per frame: snapshot when a widget is
+    // grabbed, commit when it is released, matching snapEntity/commitEntity.
+    static int   sSlot = -1, sField = -1;
+    static std::array<float,4> sBefore{};
+    auto beginEdit = [&](int f) {
+        if (sField == f && sSlot == w.slot) return;
+        sSlot = w.slot; sField = f; sBefore = w.values[(size_t)f];
+    };
+    auto endEdit = [&](int f) {
+        if (sSlot != w.slot || sField != f) return;
+        if (w.values[(size_t)f] != sBefore) {
+            EditCmd c; c.kind = CMD_WEATHER; c.wSlot = w.slot; c.wField = f;
+            c.w0 = sBefore; c.w1 = w.values[(size_t)f];
+            pushCmd(std::move(c));
+        }
+        sSlot = sField = -1;
+    };
+    auto touched = [&](int f) {
+        if (ImGui::IsItemActivated()) beginEdit(f);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            w.dirty[(size_t)f] = 1; g_scene.weatherEdited = true; endEdit(f);
+        }
+    };
+    // kWeatherFields[] is in the engine's STREAM order, in which the groups
+    // interleave (Fog, Sun, Colours, Fog, Sky, Colours, Sky, Fog...). Drive the
+    // outer loop from a fixed group order and filter, so each heading appears
+    // once — without reordering the table, which is the decode's source of truth.
+    static const char* kGroups[] = {"Sun", "Colours", "Fog", "Sky", "Effects", "Post", "Unknown"};
+    for (const char* group : kGroups) {
+    ImGui::SeparatorText(group);
+    for (int f = 0; f < kWeatherFieldCount; f++) {
+        const WeatherField& F = kWeatherFields[f];
+        if (strcmp(F.group, group)) continue;
+        float* v = w.values[(size_t)f].data();
+        ImGui::PushID(f);
+        ImGui::SetNextItemWidth(200.0f);
+        switch (F.kind) {
+            case WFK_BOOL: {
+                bool b = v[0] != 0.0f;
+                if (ImGui::Checkbox(F.name, &b)) {
+                    beginEdit(f); v[0] = b ? 1.0f : 0.0f;
+                    w.dirty[(size_t)f] = 1; g_scene.weatherEdited = true; endEdit(f);
+                }
+                break;
+            }
+            case WFK_U32: {
+                // EffectCount is the length of the array that follows it; changing
+                // it would not resize anything, so it is shown, not edited.
+                ImGui::Text("%-17s %u", F.name, (unsigned)v[0]);
+                break;
+            }
+            case WFK_FLOAT: ImGui::DragFloat(F.name, v, 0.01f); touched(f); break;
+            case WFK_VEC2:  ImGui::DragFloat2(F.name, v, 0.01f); touched(f); break;
+            case WFK_DIR: {
+                // Edited as a compass, then renormalized: the engine stores a unit
+                // vector (|v| == 1 on 219/219) and a hand-typed triple would not be.
+                float el = asinf(std::max(-1.0f, std::min(1.0f, -v[1]))) * 57.2957795f;
+                float az = atan2f(v[2], v[0]) * 57.2957795f;
+                bool ch = false;
+                ImGui::SetNextItemWidth(96.0f);
+                ch |= ImGui::DragFloat("azimuth", &az, 0.5f, -180.0f, 180.0f, "%.1f deg");
+                if (ImGui::IsItemActivated()) beginEdit(f);
+                ImGui::SameLine(); ImGui::SetNextItemWidth(96.0f);
+                ch |= ImGui::DragFloat("elevation", &el, 0.5f, -89.9f, 89.9f, "%.1f deg");
+                if (ImGui::IsItemActivated()) beginEdit(f);
+                if (ch) {
+                    float ce = cosf(el / 57.2957795f);
+                    v[0] = ce * cosf(az / 57.2957795f);
+                    v[1] = -sinf(el / 57.2957795f);
+                    v[2] = ce * sinf(az / 57.2957795f);
+                    w.dirty[(size_t)f] = 1; g_scene.weatherEdited = true;
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) endEdit(f);
+                ImGui::Text("%-17s %.4f, %.4f, %.4f", F.name, v[0], v[1], v[2]);
+                break;
+            }
+            case WFK_RGBA: {
+                // HDR + no clamping: SunColor reaches 2.78 in shipped presets, and
+                // SunShadow's 4th component is a scalar in 0.25..2.58, not an alpha,
+                // so it gets its own drag rather than an alpha slider.
+                ImGui::ColorEdit3(F.name, v,
+                    ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR |
+                    ImGuiColorEditFlags_NoDragDrop | ImGuiColorEditFlags_NoInputs);
+                touched(f);
+                ImGui::SameLine(); ImGui::SetNextItemWidth(70.0f);
+                ImGui::DragFloat("##w", &v[3], 0.01f, 0.0f, 0.0f, "w %.2f");
+                touched(f);
+                break;
+            }
+        }
+        if (F.note && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", F.note);
+        ImGui::PopID();
+    }
+    }
+    // TimeOfTheDay reads as hours; showing the clock catches a mis-decode by eye.
+    for (int f = 0; f < kWeatherFieldCount; f++)
+        if (!strcmp(kWeatherFields[f].name, "TimeOfTheDay")) {
+            float t = w.values[(size_t)f][0];
+            ImGui::SeparatorText("");
+            ImGui::TextDisabled("time of day  %02d:%02d", (int)t, (int)((t - (int)t) * 60));
+        }
+}
+
+// --- River mode (GRVL/GRVR) --------------------------------------------------
+// Read-only. The geometry is decoded (centreline, per-node width, water level),
+// but nothing writes it yet, and the material -> texture mapping is unsolved.
+static int g_riverSel = -1;
+
+static void drawRiverPanel() {
+    if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
+    if (g_scene.rivers.empty()) {
+        ImGui::TextWrapped("This map has no river splines. 28 of the 45 shipped maps "
+                           "carry them; the rest ship an empty GRVL pool.");
+        ImGui::TextDisabled("View > Rivers toggles them where they exist.");
+        return;
+    }
+    ImGui::Text("%d river%s", (int)g_scene.rivers.size(),
+                g_scene.rivers.size() == 1 ? "" : "s");
+    ImGui::TextDisabled("read-only: decoded and drawn, no write path yet");
+    ImGui::SeparatorText("Rivers");
+    for (int k = 0; k < (int)g_scene.rivers.size(); k++) {
+        const Scene::RiverSpline& r = g_scene.rivers[(size_t)k];
+        const char* leaf = r.tex.c_str();
+        if (const char* sl = strrchr(leaf, '/')) leaf = sl + 1;
+        char lbl[192];
+        snprintf(lbl, sizeof(lbl), "%d  %s  (%d nodes)##rv%d", k, leaf, (int)r.cx.size(), k);
+        if (ImGui::Selectable(lbl, k == g_riverSel)) g_riverSel = k;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", r.tex.c_str());
+    }
+    if (g_riverSel < 0 || g_riverSel >= (int)g_scene.rivers.size()) return;
+    const Scene::RiverSpline& r = g_scene.rivers[(size_t)g_riverSel];
+    ImGui::SeparatorText("Nodes");
+    float wmin = r.w.empty() ? 0 : r.w[0], wmax = wmin;
+    for (float w : r.w) { wmin = std::min(wmin, w); wmax = std::max(wmax, w); }
+    ImGui::Text("water level  %.2f", r.level);
+    ImGui::Text("width        %.2f .. %.2f", wmin, wmax);
+    ImGui::TextDisabled("pool slot %d", r.srcSlot);
+    if (ImGui::BeginTable("rvnodes", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("#"); ImGui::TableSetupColumn("x");
+        ImGui::TableSetupColumn("z"); ImGui::TableSetupColumn("width");
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < r.cx.size(); i++) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::Text("%d", (int)i);
+            ImGui::TableNextColumn(); ImGui::Text("%.1f", r.cx[i]);
+            ImGui::TableNextColumn(); ImGui::Text("%.1f", r.cz[i]);
+            ImGui::TableNextColumn(); ImGui::Text("%.2f", i < r.w.size() ? r.w[i] : 0.0f);
+        }
+        ImGui::EndTable();
+    }
+    if (ImGui::Button("Frame this river") && !r.cx.empty()) {
+        float cx = 0, cz = 0;
+        for (size_t i = 0; i < r.cx.size(); i++) { cx += r.cx[i]; cz += r.cz[i]; }
+        cx /= r.cx.size(); cz /= r.cx.size();
+        g_cam.target = V3{ cx, r.level, cz };
+        if (g_cam.dist > 200.0f) g_cam.dist = 200.0f;
+    }
+}
+
 static void drawModePanel() {
     if (!g_showPanel) return;
     const Mode& m = kModes[g_mode];
@@ -1182,22 +1442,32 @@ static void drawModePanel() {
         ImGui::SeparatorText("Parameters");
         // Modes whose data the format work has not reached yet get an honest note
         // and a pointer at what IS available, instead of controls that do nothing.
-        if (g_mode != 0 && g_mode != 2 && g_mode != 3 && g_mode != 4) {
+        if (modeIs(MK_LIGHT)) { drawLightPanel(); ImGui::End(); return; }
+        if (modeIs(MK_RIVER)) { drawRiverPanel(); ImGui::End(); return; }
+        if (!modeIs(MK_TERRAIN) && !modeIs(MK_OBJECT)) {
             const char* why = nullptr;
-            switch (g_mode) {
-                case 1: why = "Splines (rivers) are not decoded yet."; break;
-                case 5: why = "Roads (GROA) and decals (GDEC) are decoded and rendered, "
-                              "but read-only — the write path is not built yet. "
-                              "View > Roads / Decals toggles them."; break;
-                case 6: why = "Lake/water data is not decoded yet."; break;
-                case 7: why = "The WTHR weather/lighting block is not decoded yet."; break;
-                case 8: why = "Triggers hold Lua bodies; the trigger system is not decoded yet."; break;
+            bool retired = false;
+            switch (modeKind()) {
+                case MK_OVERLAY:
+                    why = "Roads (GROA) and decals (GDEC) are decoded and rendered, "
+                          "but read-only — the write path is not built yet. "
+                          "View > Roads / Decals toggles them."; break;
+                case MK_TRIGGER: why = "Triggers hold Lua bodies; the trigger system is not decoded yet."; break;
+                case MK_RETIRED:
+                    // Not "undecoded" — measured absent. Say which, so nobody
+                    // spends a session looking for a chunk that is not there.
+                    why = "Retired: no lake or water data exists in any of the 45 CPCW maps — "
+                          "no schema declares it, and GRVL turned out to hold river splines, "
+                          "not water. This is a Gepard-1 (S.W.I.N.E.) feature the engine dropped.";
+                    retired = true; break;
                 default: why = "Not implemented yet."; break;
             }
             ImGui::TextWrapped("%s", why);
             ImGui::Spacing();
-            if (ImGui::Button("Open the raw chunk inspector")) g_showChunks = true;
-            ImGui::TextDisabled("Inspect the bytes rather than guess at fields.");
+            if (!retired) {
+                if (ImGui::Button("Open the raw chunk inspector")) g_showChunks = true;
+                ImGui::TextDisabled("Inspect the bytes rather than guess at fields.");
+            }
             ImGui::End();
             return;
         }
@@ -1209,14 +1479,14 @@ static void drawModePanel() {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Target altitude for SetPlane / Raise>Plane / Lower>Plane.");
             ImGui::SliderFloat("Pressure", &g_brushPress, 0.0f, 1.0f);
-            if (g_mode == 0) {
+            if (modeIs(MK_TERRAIN)) {
                 if (toolIsHeight(g_activeTool))
                     ImGui::TextDisabled("Hold Ctrl to invert raise/lower.");
                 if (g_activeTool == TT_GRAB)
                     ImGui::TextDisabled("Grab: drag up/down to pull the surface.");
             }
             // Texture-blend layer picker (Blend / TileFill paint the chosen layer)
-            if (g_mode == 0 && !g_scene.terrainLayers.empty()) {
+            if (modeIs(MK_TERRAIN) && !g_scene.terrainLayers.empty()) {
                 ImGui::SeparatorText("Terrain layers");
                 if (g_scene.splatOff < 0)
                     ImGui::TextColored(ImVec4(1,0.5f,0.3f,1),
@@ -1265,13 +1535,27 @@ static void drawChanges() {
     }
     int deleted = 0;
     for (const auto& kv : g_savedState) if (!live.count(kv.first)) deleted++;
+    // Non-entity edits have no row in the list, so count them separately or an
+    // unsaved change is invisible in the one panel meant to show unsaved changes.
+    int wFields = 0, wPresets = 0;
+    for (const WeatherPreset& w : g_scene.weather) {
+        int n = 0;
+        for (unsigned char d : w.dirty) n += d ? 1 : 0;
+        if (n) { wFields += n; wPresets++; }
+    }
 
     char title[96];
-    snprintf(title, sizeof(title), "Changes (%d)###changes", (int)rows.size() + deleted);
+    snprintf(title, sizeof(title), "Changes (%d)###changes",
+             (int)rows.size() + deleted + (wFields ? 1 : 0));
     if (ImGui::Begin(title, &g_showChanges)) {
         if (g_srcMap.empty()) ImGui::TextDisabled("No .map loaded.");
         ImGui::Text("+%d added   -%d deleted   %d moved   %d rotated   %d field edits",
                     added, deleted, moved, rotated, fielded);
+        if (g_scene.terrainEdited) ImGui::Text("terrain heights edited");
+        if (g_scene.splatEdited)   ImGui::Text("terrain paint edited");
+        if (wFields)
+            ImGui::Text("%d weather field%s edited across %d preset%s",
+                        wFields, wFields == 1 ? "" : "s", wPresets, wPresets == 1 ? "" : "s");
         ImGui::TextDisabled("versus %s", g_srcMap.empty() ? "(nothing)" : g_srcMap.c_str());
         ImGui::Separator();
         ImGuiListClipper clip; clip.Begin((int)rows.size());
@@ -1974,12 +2258,12 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     }
     // Terrain mode + a sculpt or paint tool => left-drag brushes the terrain
     // instead of selecting entities.
-    bool brushing = (g_mode == 0 && (toolIsHeight(g_activeTool) || toolIsPaint(g_activeTool)));
+    bool brushing = (modeIs(MK_TERRAIN) && (toolIsHeight(g_activeTool) || toolIsPaint(g_activeTool)));
     // Brush cursor ring: show the terrain area the brush covers whenever hovering
     // in Vertex/Terrain mode (any tool), matching applyTerrainBrush's radius.
     {
         float gx, gy;
-        if (over && g_mode == 0 && g_scene.loaded && terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
+        if (over && modeIs(MK_TERRAIN) && g_scene.loaded && terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
             const int N = 48; float rad = g_brushSize * 4.0f;
             std::vector<float> ring; ring.reserve(N * 3);
             for (int k = 0; k < N; k++) {
@@ -2293,6 +2577,17 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--uishot-frames") && i + 1 < argc) uiShotFrames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--uishot-select") && i + 1 < argc) uiShotSelect = atoi(argv[++i]);
+        // Overlay visibility from the command line, so a --shot pair can isolate
+        // exactly one layer's contribution ("count pixels, not records").
+        else if (!strcmp(argv[i], "--no-rivers")) g_vp.showRivers = false;
+        else if (!strcmp(argv[i], "--no-roads"))  g_vp.showRoads  = false;
+        else if (!strcmp(argv[i], "--no-decals")) g_vp.showDecals = false;
+        // Which mode's panel to capture. Without this a --uishot always shows
+        // mode 0, so a new mode's panel cannot be checked headlessly at all.
+        else if (!strcmp(argv[i], "--uishot-mode") && i + 1 < argc) {
+            int mv = atoi(argv[++i]);
+            if (mv >= 0 && mv < kNumModes) { g_mode = mv; g_activeTool = 0; }
+        }
         else if (!strcmp(argv[i], "--selftest")) selftest = true;
         else if (!strcmp(argv[i], "--picktest")) {
             pickTest = true;
@@ -2383,6 +2678,301 @@ int main(int argc, char** argv) {
                 printf("  spline[%zu] nodes=%zu %s\n", k, s.roadSplines[k].cx.size(), s.roadSplines[k].tex.c_str());
             for (size_t k=0;k<s.decals.size() && k<3;k++) printf("  decal[%zu] %s\n", k, s.decals[k].tex.c_str());
             return 0;
+        }
+        else if (!strcmp(argv[i], "--overlayscan") && i + 1 < argc) {
+            // dev: --overlayscan <map|dir> — GROL/GDCL/GRVL pool health.
+            // Beyond "the walk consumed the chunk", assert the list invariants:
+            // the used chain must visit every live slot exactly once, the free
+            // chain every free slot exactly once, and prev must be the exact
+            // inverse of next. All hold on the shipped corpus, so this is a free
+            // baseline that a future write path can regress against.
+            struct Acc { int maps=0, pools=0, ok=0, roads=0, decals=0, rivers=0, riverRecs=0,
+                         listOK=0, mono=0, monoTot=0, uhnz=0; std::vector<std::string> bad; } A;
+            auto chk = [&](const char* what, const Scene::OverlayPool& P, const std::string& nm) {
+                if (P.chunkOff < 0) return;
+                A.pools++;
+                if (!P.ok) { A.bad.push_back(nm + " " + what + ": pool walk failed (fell back to scan)"); return; }
+                A.ok++;
+                // Walk usedHead -> next and require it to visit every live slot
+                // exactly once, with prev the exact inverse and the ends -1.
+                std::map<int, const Scene::OverlaySlotRef*> bySlot;
+                for (const auto& L : P.live) bySlot[L.slot] = &L;
+                std::set<int> seen;
+                int cur = P.usedHead, guard = 0, last = -1;
+                bool chainOK = true;
+                while (cur >= 0 && guard++ <= P.cap) {
+                    auto it = bySlot.find(cur);
+                    if (it == bySlot.end() || seen.count(cur)) { chainOK = false; break; }
+                    if (it->second->prev != last) chainOK = false;   // prev is next's inverse
+                    seen.insert(cur); last = cur; cur = it->second->next;
+                }
+                if (cur >= 0) chainOK = false;                      // ran past the guard
+                if (seen.size() != P.live.size()) chainOK = false;  // missed a live slot
+                if (last != P.usedTail) chainOK = false;
+                if ((int)P.live.size() != P.used) chainOK = false;
+                if (chainOK) A.listOK++;
+                else A.bad.push_back(nm + " " + what + ": used-list invariant failed (live " +
+                                     std::to_string(P.live.size()) + ", usedCount " +
+                                     std::to_string(P.used) + ", visited " +
+                                     std::to_string(seen.size()) + ")");
+                if (strcmp(what, "GRVL")) {
+                    // Is the USED-LIST order the same as slot (= file) order?
+                    // `P.live` is built by scanning slots 0..cap, so testing it
+                    // for monotonicity would be vacuous — walk the chain instead.
+                    A.monoTot++;
+                    bool mono = true;
+                    { int c2 = P.usedHead, prev2 = -1, g2 = 0;
+                      while (c2 >= 0 && g2++ <= P.cap) {
+                          if (c2 < prev2) { mono = false; break; }
+                          prev2 = c2;
+                          auto it2 = bySlot.find(c2);
+                          if (it2 == bySlot.end()) break;
+                          c2 = it2->second->next;
+                      } }
+                    if (mono) A.mono++;
+                    if (P.usedHead != 0) A.uhnz++;
+                }
+            };
+            auto one = [&](const std::string& p) {
+                Scene s; if (!load_map_native(p, s)) return;
+                A.maps++;
+                std::string nm = p.substr(p.find_last_of("/\\") + 1);
+                chk("GROL", s.roadPool, nm); chk("GDCL", s.decalPool, nm); chk("GRVL", s.riverPool, nm);
+                A.roads += (int)s.roadPool.live.size();
+                A.decals += (int)s.decalPool.live.size();
+                A.riverRecs += (int)s.riverPool.live.size();
+                A.rivers += (int)s.rivers.size();
+                if (!s.rivers.empty()) {
+                    printf("  %-42s %2d river(s):", nm.c_str(), (int)s.rivers.size());
+                    for (size_t k = 0; k < s.rivers.size() && k < 3; k++) {
+                        const auto& r = s.rivers[k];
+                        float wmin = r.w[0], wmax2 = r.w[0];
+                        for (float w : r.w) { wmin = std::min(wmin, w); wmax2 = std::max(wmax2, w); }
+                        printf("  [%d nodes, y=%.2f, w %.1f..%.1f]", (int)r.cx.size(), r.level, wmin, wmax2);
+                    }
+                    printf("\n");
+                }
+            };
+            std::error_code ec;
+            if (std::filesystem::is_directory(argv[i+1], ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec) || it->path().extension() != ".map") continue;
+                    one(it->path().string());
+                }
+            } else one(argv[i+1]);
+            printf("overlayscan: maps=%d pools=%d walked-exact=%d counts-match=%d\n",
+                   A.maps, A.pools, A.ok, A.listOK);
+            printf("  records: %d GROA  %d GDEC  %d GRVR (%d renderable; the rest are "
+                   "single-node degenerates)\n", A.roads, A.decals, A.riverRecs, A.rivers);
+            // The engine's LOADER reads slots in file order; whether the RENDERER
+            // walks the used list instead is not established, so this is reported,
+            // not acted on. Reordering emission on a guess would be a regression
+            // risk for a measured-tiny visual difference.
+            printf("  road/decal pools whose used-list order == file order: %d/%d  (usedHead!=0 on %d)\n",
+                   A.mono, A.monoTot, A.uhnz);
+            for (const auto& b : A.bad) printf("  FAIL %s\n", b.c_str());
+            bool pass = A.pools > 0 && A.ok == A.pools && A.listOK == A.pools && A.bad.empty();
+            printf("overlayscan: %s\n", pass ? "PASS" : "FAIL");
+            return pass ? 0 : 3;
+        }
+        else if (!strcmp(argv[i], "--wthrtest") && i + 1 < argc) {
+            // dev: --wthrtest <map|dir> [out.map]
+            //
+            // Checking that the pool walk consumes the chunk exactly is NOT
+            // enough: the engine's reflection order also sums to 194 bytes, so a
+            // table in the wrong order walks every map cleanly and decodes every
+            // colour into the wrong widget. These assertions pin the ORDER by
+            // semantics — a permutation cannot satisfy them simultaneously.
+            struct Acc {
+                int maps=0, ok=0, recs=0, alphaN=0, alpha=0, eff=0, unit=0, sy=0,
+                    bools=0, tod=0, bright=0, fogOn=0, fogOrder=0;
+                float shadowLo=1e9f, shadowHi=-1e9f, fogEndLo=1e9f, cloudMax=0;
+                std::string cloudWorst;
+                std::vector<std::string> fails;
+            } A;
+            auto one = [&](const std::string& p) {
+                std::vector<unsigned char> raw;
+                { std::ifstream f(p, std::ios::binary);
+                  if (!f) return;
+                  raw.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); }
+                if (raw.size() < 8 || memcmp(raw.data(), "SCEN", 4) != 0) return;
+                A.maps++;
+                Scene s; parse_weather(raw, s);
+                if (s.weather.empty()) { A.fails.push_back(p + ": no presets decoded"); return; }
+                A.ok++;
+                auto F = [&](const WeatherPreset& w, const char* n) -> const std::array<float,4>* {
+                    for (int f = 0; f < kWeatherFieldCount; f++)
+                        if (!strcmp(kWeatherFields[f].name, n)) return &w.values[(size_t)f];
+                    return nullptr;
+                };
+                for (const WeatherPreset& w : s.weather) {
+                    A.recs++;
+                    // alpha components of the three true colours are always 1.0
+                    for (const char* n : {"SunColor", "SunAmbient", "FogColor", "SunSpecular"}) {
+                        A.alphaN++; if (fabsf((*F(w, n))[3] - 1.0f) < 1e-6f) A.alpha++;
+                    }
+                    // ...but SunShadow's 4th is not an alpha at all
+                    float sw = (*F(w, "SunShadow"))[3];
+                    A.shadowLo = std::min(A.shadowLo, sw); A.shadowHi = std::max(A.shadowHi, sw);
+                    if ((int)(*F(w, "EffectCount"))[0] == 4) A.eff++;
+                    const auto& d = *F(w, "SunDirection");
+                    float L = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                    if (fabsf(L - 1.0f) < 0.02f) A.unit++;
+                    if (d[1] < 0.0f) A.sy++;                       // index 1 is down
+                    float fe = (*F(w, "FogEnabled"))[0], ni = (*F(w, "Night"))[0];
+                    if ((fe == 0 || fe == 1) && (ni == 0 || ni == 1)) A.bools++;
+                    float t = (*F(w, "TimeOfTheDay"))[0];
+                    if (t >= 0.0f && t <= 24.0f) A.tod++;           // it is a clock
+                    if ((*F(w, "Brightness"))[0] == 1.0f && (*F(w, "Contrast"))[0] == 1.0f) A.bright++;
+                    if (fe == 1) {
+                        A.fogOn++;
+                        float fs = (*F(w, "FogStart"))[0], fend = (*F(w, "FogEnd"))[0];
+                        if (fend > fs) A.fogOrder++;
+                        A.fogEndLo = std::min(A.fogEndLo, fend);
+                    }
+                    // CloudMovementDir ~= WindDirection * CloudSpeed is a SOFT
+                    // check: 8 of 219 shipped records are not the exact product,
+                    // so report the residual and only fail past 1e-2.
+                    const auto& wd = *F(w, "WindDirection");
+                    const auto& cm = *F(w, "CloudMovementDir");
+                    float cs = (*F(w, "CloudSpeed"))[0];
+                    float cerr = std::max(fabsf(cm[0] - wd[0]*cs), fabsf(cm[1] - wd[1]*cs));
+                    if (cerr > A.cloudMax)   // parse_weather does not set Scene::name
+                        A.cloudMax = cerr, A.cloudWorst = p.substr(p.find_last_of("/\\") + 1) + " / " + w.name;
+                }
+            };
+            std::error_code ec;
+            bool dir = std::filesystem::is_directory(argv[i+1], ec);
+            if (dir) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec) || it->path().extension() != ".map") continue;
+                    one(it->path().string());
+                }
+            } else {
+                one(argv[i+1]);
+                Scene s; if (load_map_native(argv[i+1], s)) {
+                    printf("WTHR @%ld  presets=%zu  free=%d  capacity=%d  engine-active=%s\n",
+                           s.wthrOff, s.weather.size(), s.weatherFree, s.weatherCap,
+                           s.weatherActive >= 0 ? s.weather[s.weatherActive].name.c_str()
+                                                : "(none named \"Default\")");
+                    for (size_t k = 0; k < s.weather.size(); k++) {
+                        const WeatherPreset& w = s.weather[k];
+                        printf("  [slot %2d] %-24s%s\n", w.slot, w.name.c_str(),
+                               (int)k == s.weatherActive ? "  *" : "");
+                    }
+                    // write leg: flip a bool, nudge the sun, advance the clock, and
+                    // prove nothing outside the three declared spans moved.
+                    if (i + 2 < argc && !s.weather.empty()) {
+                        auto idxOf = [](const char* n) {
+                            for (int f = 0; f < kWeatherFieldCount; f++)
+                                if (!strcmp(kWeatherFields[f].name, n)) return f;
+                            return -1; };
+                        int p0 = s.weatherActive >= 0 ? s.weatherActive : 0;
+                        WeatherPreset& w = s.weather[(size_t)p0];
+                        int iFog = idxOf("FogEnabled"), iDir = idxOf("SunDirection"),
+                            iTod = idxOf("TimeOfTheDay");
+                        w.values[iFog][0] = w.values[iFog][0] != 0.0f ? 0.0f : 1.0f;
+                        float a = 1.0f * 3.14159265f / 180.0f, c = cosf(a), sn = sinf(a);
+                        float x = w.values[iDir][0], z = w.values[iDir][2];
+                        w.values[iDir][0] = x*c - z*sn; w.values[iDir][2] = x*sn + z*c;
+                        w.values[iTod][0] += 1.0f;
+                        w.dirty[iFog] = w.dirty[iDir] = w.dirty[iTod] = 1;
+                        s.weatherEdited = true;
+                        std::vector<unsigned char> b = s.raw;
+                        apply_edits_inplace(s, {}, b);
+                        // every changed byte must lie inside a declared span
+                        long spans[3][2] = {
+                            { w.tailOff + kWeatherFields[iFog].tail, 1 },
+                            { w.tailOff + kWeatherFields[iDir].tail, 12 },
+                            { w.tailOff + kWeatherFields[iTod].tail, 4 } };
+                        long changed = 0, outside = 0;
+                        for (size_t o = 0; o < b.size(); o++) {
+                            if (b[o] == s.raw[o]) continue;
+                            changed++;
+                            bool in = false;
+                            for (auto& sp : spans) if ((long)o >= sp[0] && (long)o < sp[0]+sp[1]) in = true;
+                            if (!in) outside++;
+                        }
+                        std::ofstream f(argv[i+2], std::ios::binary);
+                        f.write((const char*)b.data(), (std::streamsize)b.size());
+                        // NOTE: assert `outside == 0`, never an exact changed count —
+                        // the spans total 17 bytes but a float edit often differs in
+                        // fewer, so the real number is data-dependent.
+                        Scene s2; bool re = load_map_native(argv[i+2], s2);
+                        bool val = re && s2.weather.size() == s.weather.size() &&
+                                   fabsf(s2.weather[(size_t)p0].values[iTod][0]
+                                         - w.values[iTod][0]) < 1e-4f;
+                        printf("  write: changed=%ld outside-declared-spans=%ld reload=%d readback=%d -> %s\n",
+                               changed, outside, (int)re, (int)val,
+                               (outside == 0 && changed > 0 && val) ? "PASS" : "FAIL");
+                        if (outside || !changed || !val) return 3;
+                    }
+                }
+            }
+            if (dir || A.maps > 1) {
+                printf("wthrtest: maps=%d decoded=%d records=%d\n", A.maps, A.ok, A.recs);
+                printf("  colour alphas == 1.0            %d/%d\n", A.alpha, A.alphaN);
+                printf("  EffectCount == 4                %d/%d\n", A.eff, A.recs);
+                printf("  |SunDirection| == 1 +-0.02      %d/%d\n", A.unit, A.recs);
+                printf("  SunDirection[1] < 0 (downward)  %d/%d\n", A.sy, A.recs);
+                printf("  FogEnabled/Night in {0,1}       %d/%d\n", A.bools, A.recs);
+                printf("  TimeOfTheDay in 0..24           %d/%d\n", A.tod, A.recs);
+                printf("  Brightness/Contrast == 1.0      %d/%d\n", A.bright, A.recs);
+                printf("  FogEnd > FogStart when fog on   %d/%d  (min FogEnd %.1f)\n",
+                       A.fogOrder, A.fogOn, A.fogEndLo);
+                printf("  SunShadow.w range               %.4f .. %.4f (not an alpha)\n",
+                       A.shadowLo, A.shadowHi);
+                // Soft on purpose: 8 of the 219 shipped records are not the exact
+                // product, and the worst (M_07 "02_cloudy") sits at 0.00999999 —
+                // gating at 1e-2 would be a float-rounding coin flip, so the gate
+                // is 2e-2 and the real worst case is always printed.
+                printf("  max |CloudMovementDir - Wind*Speed| %.8f  (%s; soft, gate 2e-2)\n",
+                       A.cloudMax, A.cloudWorst.c_str());
+                for (const auto& f : A.fails) printf("  FAIL %s\n", f.c_str());
+                bool pass = A.ok == A.maps && A.alpha == A.alphaN && A.eff == A.recs &&
+                            A.unit == A.recs && A.sy == A.recs && A.bools == A.recs &&
+                            A.tod == A.recs && A.bright == A.recs &&
+                            A.fogOrder == A.fogOn && A.cloudMax <= 2e-2f;
+                printf("wthrtest: %s\n", pass ? "PASS" : "FAIL");
+                return pass ? 0 : 3;
+            }
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--chunktile") && i + 1 < argc) {
+            // dev: --chunktile <map|dir>  — the structural-integrity check that
+            // `cpcw_map.py roundtrip` is NOT (see mapfile.h). Run it on the output
+            // of every write path, not just the oracle.
+            auto one = [](const std::string& p, bool verbose) -> bool {
+                std::vector<unsigned char> raw;
+                { std::ifstream f(p, std::ios::binary);
+                  if (!f) { printf("chunktile: cannot open %s\n", p.c_str()); return false; }
+                  raw.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); }
+                if (raw.size() < 8 || memcmp(raw.data(), "SCEN", 4) != 0) return true;  // not a CPCW map: skip
+                ChunkTileReport r;
+                if (!map_chunk_tile(raw, r)) { printf("chunktile: %s PARSE FAIL\n", p.c_str()); return false; }
+                printf("%-46s %s chunks=%d containers=%d objs=%d/%d gap=%ld overlap=%ld trailer=%ld\n",
+                       p.substr(p.find_last_of("/\\") + 1).c_str(), r.ok ? "OK  " : "FAIL",
+                       r.chunks, r.containers, r.objsSchemaOk, r.objs,
+                       r.gapBytes, r.overlapBytes, r.trailerBytes);
+                if (verbose || !r.ok)
+                    for (size_t k = 0; k < r.issues.size() && k < 12; k++)
+                        printf("    %s\n", r.issues[k].c_str());
+                return r.ok;
+            };
+            std::error_code ec;
+            int n = 0, bad = 0;
+            if (std::filesystem::is_directory(argv[i+1], ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec)) continue;
+                    if (it->path().extension() != ".map") continue;
+                    n++; if (!one(it->path().string(), false)) bad++;
+                }
+                printf("chunktile: %d map(s), %d failed\n", n, bad);
+            } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
+            return bad ? 3 : 0;
         }
         else if (!strcmp(argv[i], "--addtest") && i + 4 < argc) {
             Scene s; if (!load_map_native(argv[i+1], s)) return 2;

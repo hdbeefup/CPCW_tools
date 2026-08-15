@@ -63,12 +63,28 @@ Undo/redo (`Ctrl+Z` / `Ctrl+Y`) covers field edits, gizmo and group moves, terra
 strokes, and structural add/delete — the structural commands carry the exact OBJT
 bytes, so undo and redo are byte-identical.
 
+**Edit lighting** — the `WTHR` pool is decoded, so **Light** mode lists a map's
+named weather presets (`Default`, `Rain`, `Sundown`, `Desert_night`, …) in their
+authored order and edits every field: sun direction as an azimuth/elevation
+compass, HDR sun/ambient/shadow/specular colours, fog range and colour, clouds,
+time of day. Edits are size-preserving in-place writes, so the save stays
+byte-faithful, and each drag is one undo step.
+
+**Rivers** — `GRVL`/`GRVR` river splines are decoded and drawn at their own water
+level with the per-node width the record carries. River mode lists them with a
+node table; `View > Rivers` toggles them.
+
 ## Not implemented
 
-Roads and decals are decoded and rendered but read-only. Splines (rivers), lake
-and water data, the WTHR weather/lighting block and the trigger system are not
-decoded yet; those modes say so and open a raw chunk inspector
-(`View > Map chunks`) instead of offering invented fields.
+Roads, decals and rivers are decoded and rendered but read-only. The trigger
+system is not decoded — it sits behind an undecoded `HEAP` container — and that
+mode opens a raw chunk inspector (`View > Map chunks`) rather than offering
+invented fields. Lake/Water is **retired**, not pending: no lake or water data
+exists in any of the 45 shipped maps.
+
+The lighting presets are not yet applied to the viewport: the vertical axis of
+`SunDirection` is established but its horizontal swizzle is not, and guessing it
+would light every map wrong in a way that looks plausible.
 
 ## Headless harnesses
 
@@ -86,8 +102,15 @@ Every write path has a no-window check that runs from the command line:
 | `--protoplacetest <map> <ProtoDB.bin> <out>` | place a prototype absent from the map |
 | `--addtest` `--deltest` `--heighttest` `--applytest` | structural insert/delete, height, field save |
 | `--overlaytest <map>` | GROA/GDEC decode counts and material resolution |
+| `--wthrtest <map\|dir> [out.map]` | WTHR pool walks exactly + the semantic assertions that pin the field order; with `out.map`, a write leg |
+| `--chunktile <map\|dir>` | container sizes tile exactly + every OBJS `schema_offset` points at its own SCHD |
+| `--overlayscan <map\|dir>` | GROL/GDCL/GRVL slot pools walk exactly, counts match, used-list invariants hold; river summary |
+| `--no-roads` `--no-decals` `--no-rivers` | drop one overlay layer, so a `--shot` pair isolates its pixels |
+| `--uishot-mode <n>` | which mode's panel a `--uishot` captures |
 | `--paktest` `--protodbtest` `--thumbtest` `--srmcheck` | archive, prototype DB, thumbnails, model |
 
-`cpcw_map.py` is no longer needed at runtime but remains the **oracle**: its
-`roundtrip` and `entities` commands are what the native writer is validated
-against after every change.
+`cpcw_map.py` is no longer needed at runtime but remains an **oracle**: its
+`roundtrip` and `entities` commands are part of what the native writer is
+validated against after every change — but **`roundtrip` does not check container
+sizes** (it re-emits each chunk's original span rather than recomputing one), so
+`--chunktile` is the check that actually catches a missed ancestor bump.

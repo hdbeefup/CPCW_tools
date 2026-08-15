@@ -1,5 +1,6 @@
 // Editor scene model, loaded via the JSON bridge (cpcw_map.py `scene`).
 #pragma once
+#include <array>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,22 @@ struct Entity {
     std::vector<EntityField> fields;     // every schema field, in declaration order
 };
 
+// One WRLD/WTHR lighting preset. `values` is parallel to kWeatherFields[]
+// (weather.h): one row of up to 4 floats per field, so a colour, a direction and
+// a bool all live in the same store. Every field is fixed-width, so an edit is a
+// byte-faithful in-place write at `tailOff + kWeatherFields[i].tail` — the same
+// mechanism EntityField::off gives entity fields.
+struct WeatherPreset {
+    std::string name;
+    int  slot = -1;             // pool slot; stable, and what the UI keys on
+                                // (names are NOT unique — one map ships two
+                                // live presets both called "Night_multi")
+    long nameOff = -1;          // u16 length prefix (name is not editable yet)
+    long tailOff = -1;          // first byte of the 194-byte record body
+    std::vector<std::array<float, 4>> values;
+    std::vector<unsigned char> dirty;   // per field; only dirty fields are written
+};
+
 struct Scene {
     std::string name = "(none)";
     int world_w = 0, world_h = 0;    // terrain extent in world units
@@ -55,13 +72,47 @@ struct Scene {
         std::string tex;                 // material path (e.g. Terrain/Road/.../M1_Cobblestone_01b)
         std::vector<float> verts;        // interleaved x,y,z,u,v
         std::vector<unsigned> idx;       // triangle indices
+        int srcSlot = -1;                // pool slot it came from (-1 = fallback scan)
     };
     std::vector<OverlayMesh> roads, decals;
     // Centreline roads: extruded to a ribbon at render time using the road TEXTURE's
     // dimensions for width (engine derives width from tex height; see cpcw-road-groa).
     // Area-fill roads (aprons/plazas) stay in `roads` as pre-triangulated meshes.
-    struct RoadSpline { std::string tex; std::vector<float> cx, cz; };
+    struct RoadSpline { std::string tex; std::vector<float> cx, cz; int srcSlot = -1; };
     std::vector<RoadSpline> roadSplines;
+    // Rivers (GRVL -> GRVR). Same record shape as GROA — version + nodes +
+    // per-node params + material — but the centreline sits at a CONSTANT y (the
+    // water level) and `w` is a real per-node width in world units, so a river
+    // needs none of the road's texture-dimension guessing.
+    struct RiverSpline {
+        std::string tex; float level = 0.0f;
+        std::vector<float> cx, cz, w; int srcSlot = -1;
+    };
+    std::vector<RiverSpline> rivers;
+    // GROL/GDCL/GRVL are slot pools (docs/MAP_FORMAT.md §4.9 + §9). Keeping the
+    // byte offsets of the header and of every live record is what a write path
+    // needs; the render products above are derived and carry `srcSlot` back.
+    struct OverlaySlotRef {
+        int slot = -1; long chunkOff = -1, bodyOff = -1, bodySize = 0;
+        int next = -1, prev = -1;        // the slot's own list links
+    };
+    struct OverlayPool {
+        long chunkOff = -1, hdrOff = -1, contentEnd = -1;
+        int used = 0, cap = 0;
+        int freeHead = -1, freeTail = -1, usedHead = -1, usedTail = -1;
+        bool ok = false;                 // the slot walk landed exactly on the end
+        std::vector<OverlaySlotRef> live;
+    };
+    OverlayPool roadPool, decalPool, riverPool;
+    // WRLD/WTHR lighting presets (weather.cpp). Empty when the chunk is absent,
+    // is the older flat chunk version 2, or fails to walk exactly.
+    std::vector<WeatherPreset> weather;
+    long wthrOff = -1;                  // byte offset of the WTHR chunk tag
+    int  weatherCap = 0, weatherFree = 0;
+    int  weatherActive = -1;            // index into `weather` of the preset the
+                                        // engine binds: the one literally NAMED
+                                        // "Default", or -1 if the map has none
+    bool weatherEdited = false;         // a preset field changed -> write on save
     std::vector<unsigned char> raw;     // original .map bytes (for native save), or empty
     std::string srcPath;                // original .map path, or empty (loaded from .json)
     long heightOff = -1;                // byte offset of the heightmap grid in raw

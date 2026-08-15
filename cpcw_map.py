@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import array
 import glob
 import json
 import math
@@ -546,16 +547,21 @@ class MapFile:
         dim1, pos = _u32(d, pos)
         dim2, pos = _u32(d, pos)
 
-        grid_w = dim1 // 2 if dim1 > 0 else 0
-        grid_h = dim2 // 2 if dim2 > 0 else 0
-
+        # BLCK is TWO planes at ITS OWN header dims -- a uint16 flag plane then a
+        # uint8 type plane -- not (w/2 x h/2) cells of six uint16s. Same byte
+        # count, wrong stride; see docs/MAP_FORMAT.md section 8.3 for the
+        # coherence measurement that separates them. The header dims are world*2
+        # on only 41/45 maps, so never derive them from WRLD.
         chunk.meta.update({
             'version': version,
-            'vertex_w': dim1,
+            'grid_w': dim1,
+            'grid_h': dim2,
+            'vertex_w': dim1,           # kept: older callers read these names
             'vertex_h': dim2,
-            'grid_w': grid_w,
-            'grid_h': grid_h,
+            'flags_offset': pos,
+            'types_offset': pos + dim1 * dim2 * 2,
             'grid_offset': pos,
+            'payload_size': dim1 * dim2 * 3,
         })
 
     # -- Object tree access -------------------------------------------------
@@ -820,26 +826,32 @@ class MapFile:
         return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) ** 2 / (sxx * syy)
 
     def get_blck_grid(self):
-        """Return the BLCK grid as a list of rows, each row a list of 6-tuples."""
+        """Return (flags, types, w, h) -- the two BLCK planes, row-major.
+
+        `flags` is a uint16 plane and `types` a uint8 plane, both w*h at BLCK's
+        OWN header dims (docs/MAP_FORMAT.md section 8). Both are returned as flat
+        `array`s; index a cell with [y * w + x].
+
+        Semantics are not decoded: BLCK is read-only. The old 6-uint16-per-cell
+        reading (and its (1,1,1,1,1,1)=passable table) was a misalignment.
+        """
         chunk = self.find_chunk('BLCK')
-        if not chunk or 'grid_offset' not in chunk.meta:
-            return None, 0, 0
+        if not chunk or 'flags_offset' not in chunk.meta:
+            return None, None, 0, 0
 
         d = self.data
         w = chunk.meta['grid_w']
         h = chunk.meta['grid_h']
-        offset = chunk.meta['grid_offset']
+        fo = chunk.meta['flags_offset']
+        to = chunk.meta['types_offset']
+        if to + w * h > len(d):
+            return None, None, 0, 0
 
-        grid = []
-        pos = offset
-        for y in range(h):
-            row = []
-            for x in range(w):
-                cell = struct.unpack_from('<6H', d, pos)
-                row.append(cell)
-                pos += 12
-            grid.append(row)
-        return grid, w, h
+        flags = array.array('H'); flags.frombytes(bytes(d[fo:fo + w * h * 2]))
+        if sys.byteorder != 'little':
+            flags.byteswap()
+        types = array.array('B'); types.frombytes(bytes(d[to:to + w * h]))
+        return flags, types, w, h
 
     # -- lossless re-serialization (writer foundation) ----------------------
 
@@ -1185,38 +1197,35 @@ def cmd_blck(mf, output_path):
         print('Error: Pillow is required for image output.  pip install Pillow')
         return
 
-    grid, w, h = mf.get_blck_grid()
-    if grid is None:
+    flags, types, w, h = mf.get_blck_grid()
+    if flags is None:
         print('No BLCK data found.')
         return
 
+    # The plane values are not decoded (docs/MAP_FORMAT.md section 8.4), so this
+    # is a legibility rendering, not a semantic one: a stable colour per distinct
+    # value so the spatial structure is visible and two maps can be compared.
+    # Assign colours by descending frequency, so the dominant value is always the
+    # dark background whatever its numeric code happens to be.
+    from collections import Counter
+    palette = [(30, 30, 30), (60, 120, 60), (170, 140, 60), (60, 110, 170),
+               (170, 70, 70), (140, 80, 170), (80, 170, 170), (200, 200, 120)]
+    order = [v for v, _ in Counter(types).most_common()]
+    colour = {v: palette[i % len(palette)] for i, v in enumerate(order)}
+
     img = Image.new('RGB', (w, h))
     pixels = img.load()
-
     for y in range(h):
+        row = y * w
         for x in range(w):
-            cell = grid[y][x]
-            total = sum(cell)
-            if total == 6:
-                # default passable
-                pixels[x, y] = (60, 120, 60)
-            elif total == 0:
-                # blocked
-                pixels[x, y] = (30, 30, 30)
-            else:
-                # encode values as color
-                r = min(255, (cell[0] + cell[1]) & 0xFF)
-                g = min(255, (cell[2] + cell[3]) & 0xFF)
-                b = min(255, (cell[4] + cell[5]) & 0xFF)
-                if r == 0 and g == 0 and b == 0:
-                    # non-zero total but zero RGB → use brightness from total
-                    v = min(255, total // 6)
-                    pixels[x, y] = (v, v // 2, v // 3)
-                else:
-                    pixels[x, y] = (r, g, b)
+            pixels[x, y] = colour[types[row + x]]
 
     img.save(output_path)
-    print(f'Saved {w}x{h} block grid to {output_path}')
+    fh = Counter(flags).most_common(6)
+    th = Counter(types).most_common(6)
+    print(f'Saved {w}x{h} block grid (type plane) to {output_path}')
+    print(f'  flags plane: {len(set(flags))} distinct, top {fh}')
+    print(f'  types plane: {len(set(types))} distinct, top {th}')
 
 
 def cmd_gui(mf):

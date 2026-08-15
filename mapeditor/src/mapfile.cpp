@@ -3,6 +3,7 @@
 // GTRD terrain (heightmap locator + splatmap colormap) directly into a Scene.
 #include "mapfile.h"
 #include "overlays.h"
+#include "weather.h"
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -107,9 +108,12 @@ struct Parser {
             else if (tag=="OBJS") { c.meta_schema_off=(long)D.u32(pos+8); parseChildren(c, pos+12, chunkEnd); }
             else if (tag=="WRLD") { c.meta_width=(long)D.u32(pos+12); c.meta_height=(long)D.u32(pos+16); parseChildren(c, pos+20, chunkEnd); }
             else if (tag=="GTRN") { parseChildren(c, pos+9, chunkEnd); }
-            else if (tag=="GROL") { parseChildren(c, pos+8, chunkEnd); }
             else if (tag=="UNTS") { parseChildren(c, pos+16, chunkEnd); }
-            // PATH/CAMS/WTHR/SCHD/STOR/BLCK/GTRD are leaves
+            // PATH/CAMS/WTHR/SCHD/STOR/BLCK/GTRD are leaves. So are GROL/GDCL/
+            // GRVL: their content is a slot pool (a 6-dword header then fixed
+            // slot records), not a run of chunks — recursing at pos+8 read the
+            // u32 record count as a tag, which is why they came out empty.
+            // overlays.cpp owns their real structure.
             parent.children.push_back(std::move(c));
             pos = chunkEnd;
         }
@@ -465,6 +469,14 @@ static bool reparse_entities(Scene& s, long editPos, long delta) {
     if (delta != 0) {
         if (s.heightOff >= editPos) s.heightOff += delta;
         if (s.splatOff  >= editPos) s.splatOff  += delta;
+        // WTHR sits in WRLD alongside the terrain, so its offsets shift under an
+        // entity insert/erase exactly the same way. Unsaved preset edits live in
+        // Scene::weather, so they survive; only the write targets move.
+        if (s.wthrOff >= editPos) s.wthrOff += delta;
+        for (WeatherPreset& wp : s.weather) {
+            if (wp.nameOff >= editPos) wp.nameOff += delta;
+            if (wp.tailOff >= editPos) wp.tailOff += delta;
+        }
     }
     s.raw = std::move(P.buf);
     return true;
@@ -512,6 +524,7 @@ bool load_map_native(const std::string& path, Scene& out) {
     out.srcPath = path;
     // roads (GROL/GROA) + decals (GDCL/GDEC) overlay geometry (needs heights set)
     parse_overlays(out.raw, out);
+    parse_weather(out.raw, out);       // WRLD/WTHR lighting presets
     out.loaded = true;
     return true;
 }
@@ -646,6 +659,90 @@ bool map_chunk_outline(const std::vector<unsigned char>& raw, std::vector<ChunkN
     return true;
 }
 
+// ---- chunk tiling check -----------------------------------------------------
+// The detector `cpcw_map.py roundtrip` was believed to be and is not. That
+// command re-emits every chunk's ORIGINAL byte span and never recomputes a size,
+// so a structural edit that forgets to bump an ancestor container still round-
+// trips IDENTICAL. This walk actually checks the two invariants a structural
+// edit can break:
+//   (1) each container's children TILE its content exactly — no gap, no overlap,
+//       no trailing slack — after its own fixed sub-header;
+//   (2) every OBJS chunk's absolute `schema_offset` still points at its own SCHD
+//       child (true on 225/225 OBJS across the 45 shipped maps).
+// Bytes after the root SCEN chunk are reported separately rather than treated as
+// an error: the format allows a trailer and the Python writer preserves it.
+
+// Content bytes a container reserves for itself before its first child. Must
+// stay in step with Parser::parseChildren.
+static long chunk_subheader(const std::string& tag) {
+    if (tag=="SCEN") return 4;
+    if (tag=="PREC"||tag=="SETS"||tag=="OJTS"||tag=="OBJS") return 4;
+    if (tag=="WRLD") return 12;
+    if (tag=="GTRN") return 1;
+    if (tag=="UNTS") return 8;
+    return 0;
+}
+
+static void tile_walk(const Chunk& c, ChunkTileReport& r) {
+    r.chunks++;
+    if (c.children.empty()) return;
+    r.containers++;
+    long contentStart = (long)c.offset + 8 + chunk_subheader(c.tag);
+    long contentEnd   = (long)c.offset + 8 + (long)c.size;
+    long cursor = contentStart;
+    char msg[256];
+    for (const Chunk& ch : c.children) {
+        long off = (long)ch.offset;
+        if (off != cursor) {
+            long d = off - cursor;
+            if (d > 0) r.gapBytes += d; else r.overlapBytes += -d;
+            snprintf(msg, sizeof(msg), "%s@%ld: child %s@%ld %s %ld bytes",
+                     c.tag.c_str(), (long)c.offset, ch.tag.c_str(), off,
+                     d > 0 ? "leaves a gap of" : "overlaps by", d > 0 ? d : -d);
+            r.issues.push_back(msg);
+        }
+        cursor = off + 8 + (long)ch.size;
+    }
+    if (cursor != contentEnd) {
+        long d = contentEnd - cursor;
+        if (d > 0) r.gapBytes += d; else r.overlapBytes += -d;
+        snprintf(msg, sizeof(msg), "%s@%ld: children end at %ld but the chunk ends at %ld (%+ld)",
+                 c.tag.c_str(), (long)c.offset, cursor, contentEnd, d);
+        r.issues.push_back(msg);
+    }
+    for (const Chunk& ch : c.children) tile_walk(ch, r);
+}
+
+static void tile_check_objs(const Chunk& c, ChunkTileReport& r) {
+    if (c.tag=="OBJS") {
+        r.objs++;
+        long schd = -1;
+        for (const Chunk& ch : c.children) if (ch.tag=="SCHD") { schd = (long)ch.offset; break; }
+        if (schd >= 0 && schd == c.meta_schema_off) r.objsSchemaOk++;
+        else {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "OBJS@%ld: schema_offset %ld but its SCHD child is at %ld",
+                     (long)c.offset, c.meta_schema_off, schd);
+            r.issues.push_back(msg);
+        }
+    }
+    for (const Chunk& ch : c.children) tile_check_objs(ch, r);
+}
+
+bool map_chunk_tile(const std::vector<unsigned char>& raw, ChunkTileReport& out) {
+    out = ChunkTileReport{};
+    if (raw.empty()) return false;
+    Parser P;
+    if (!P.loadBytes(raw)) return false;
+    out.fileSize = (long)raw.size();
+    tile_walk(P.root, out);
+    tile_check_objs(P.root, out);
+    out.trailerBytes = out.fileSize - (long)(P.root.offset + 8 + P.root.size);
+    out.ok = out.gapBytes == 0 && out.overlapBytes == 0 &&
+             out.objs > 0 && out.objsSchemaOk == out.objs;
+    return true;
+}
+
 // ---- file wrappers (dev harnesses --addtest / --deltest keep working) --------
 static bool write_all(const std::string& path, const std::vector<unsigned char>& b) {
     std::ofstream f(path, std::ios::binary);
@@ -735,6 +832,9 @@ void apply_edits_inplace(const Scene& s, const std::vector<long>& editedIds,
             }
         }
     }
+    // WTHR lighting presets: every field is fixed-width, so this is the same
+    // size-preserving in-place write, gated on its own edited flag.
+    apply_weather_inplace(s, b);
     for (long id : editedIds) {
         const Entity* e=nullptr;
         for (const auto& en : s.entities) if (en.id==id) { e=&en; break; }

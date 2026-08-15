@@ -449,11 +449,15 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability,
         collection.objects.link(obj)
         return obj
 
-    grid = None
+    # BLCK is a uint16 flag plane + a uint8 type plane at BLCK's own dims (see
+    # docs/MAP_FORMAT.md section 8). The plane VALUES are not decoded, so this
+    # tints by block type rather than claiming to know what is passable.
+    types = None
     gw = gh = 0
     if tint_passability:
-        grid, gw, gh = mf.get_blck_grid()
+        _flags, types, gw, gh = mf.get_blck_grid()
 
+    grid = types
     if grid and gw and gh:
         # Build a gw x gh quad grid so we can paint passability per cell.
         verts = []
@@ -475,14 +479,20 @@ def _build_terrain(mf, collection, world_w, world_h, tint_passability,
 
     if grid and gw and gh:
         try:
-            attr = mesh.color_attributes.new(name="Passability", type='BYTE_COLOR',
+            attr = mesh.color_attributes.new(name="BlockType", type='BYTE_COLOR',
                                              domain='CORNER')
+            # Stable colour per distinct type code; type 0 is the dominant
+            # background value on every map measured.
+            palette = [(0.12, 0.12, 0.12, 1.0), (0.24, 0.47, 0.24, 1.0),
+                       (0.67, 0.55, 0.24, 1.0), (0.24, 0.43, 0.67, 1.0),
+                       (0.67, 0.27, 0.27, 1.0), (0.55, 0.31, 0.67, 1.0),
+                       (0.31, 0.67, 0.67, 1.0), (0.78, 0.78, 0.47, 1.0)]
             for poly in mesh.polygons:
                 # cell index from the polygon order (row-major, matches faces)
                 cell_i = poly.index % gw
                 cell_j = poly.index // gw
-                passable = grid[cell_j][cell_i][0] != 0 if cell_j < gh else True
-                col = (0.35, 0.5, 0.3, 1.0) if passable else (0.6, 0.2, 0.2, 1.0)
+                t = grid[cell_j * gw + cell_i] if cell_j < gh else 0
+                col = palette[t % len(palette)]
                 for loop_idx in poly.loop_indices:
                     attr.data[loop_idx].color = col
         except (AttributeError, RuntimeError, IndexError):
