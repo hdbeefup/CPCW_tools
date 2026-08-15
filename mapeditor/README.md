@@ -59,6 +59,17 @@ after moving the previous bytes to `<map>.bak`. Writes are two-phase (`.tmp` the
 rename), so a failure never leaves a truncated map. The **Changes** panel lists
 everything that differs from the file on disk before you commit to it.
 
+**Settings persist.** Panel visibility, snap steps, brush parameters, view
+toggles, favourites, the data root, window size and a **File > Open recent**
+list survive a restart, in a versioned `cpcw_mapeditor.ini` beside the exe.
+Keys the build does not recognise are preserved, so an older build cannot drop
+a newer one's settings. Headless runs (`--shot`, `--uishot`, `--picktest`)
+deliberately neither read nor write it, so the same command renders the same
+pixels on any machine.
+
+An unhandled fault writes a **symbolized crash report** (`.txt` with a
+file:line stack, plus a `.dmp`) beside the exe, naming the map that was open.
+
 Undo/redo (`Ctrl+Z` / `Ctrl+Y`) covers field edits, gizmo and group moves, terrain
 strokes, and structural add/delete — the structural commands carry the exact OBJT
 bytes, so undo and redo are byte-identical.
@@ -112,6 +123,8 @@ Every write path has a no-window check that runs from the command line:
 | `--no-roads` `--no-decals` `--no-rivers` | drop one overlay layer, so a `--shot` pair isolates its pixels |
 | `--lighting {editor\|preset\|presetfog}` `--preset <name\|#slot>` | shade a `--shot` with a chosen WTHR preset |
 | `--sunprobe <map>` | score the four sun-swizzle candidates against the legacy light (reports, does not score a winner) |
+| `--settingstest <tmp.ini>` | settings parse, save/reload round-trip, unknown-key preservation, recent-list capping |
+| `--crashtest` | fault on purpose; the report must name the faulting function |
 | `--uishot-mode <n>` | which mode's panel a `--uishot` captures |
 | `--paktest` `--protodbtest` `--thumbtest` `--srmcheck` | archive, prototype DB, thumbnails, model |
 

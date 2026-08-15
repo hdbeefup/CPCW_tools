@@ -253,10 +253,17 @@ correctly rejected).
 7. **Strings are read-only in Properties** — editing one would resize the record.
    Doing it properly means patching the enclosing VOBJ/OBJT sizes as well as the
    container chain; the machinery for the container chain already exists.
-8. **No settings persistence.** Panel visibility, snap steps, brush parameters,
-   favourites and recent maps are all lost on exit. `imgui.ini` keeps only the dock
-   layout. A versioned `key value` settings file with one-time migrations is the
-   obvious next ops task.
+8. ~~No settings persistence.~~ **CLOSED.** `src/settings.{h,cpp}` — a versioned
+   `key value` file beside the exe, unknown keys preserved, one `if (v < N)`
+   migration block per bump. Two ordering constraints that are easy to get wrong:
+   it must load **before `glfwCreateWindow`** (window size is restored) *and*
+   **before the initial `loadScene`** (`Settings::load` clears the map, so a load
+   afterwards wipes the recent-map entry that scene just pushed). Headless runs
+   (`--shot`/`--uishot`/`--picktest`) neither read nor write it, so a harness
+   render can never depend on the operator's saved toggles. `--settingstest`.
+   `src/crashdump.cpp` writes a symbolized `.txt` + `.dmp` on an unhandled fault;
+   it needs the Release PDB, so `CMakeLists.txt` adds `/Zi` and `/DEBUG` — without
+   those every frame resolves to `??` and the report is worthless. `--crashtest`.
 
 ## Verified-working (leave alone unless regressing)
 Textured terrain, road/decal decode+render, THMB thumbnails, ProtoDB browser,

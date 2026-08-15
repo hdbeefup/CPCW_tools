@@ -59,6 +59,7 @@ target_link_libraries(imgui PUBLIC glfw)
 # --- editor ------------------------------------------------------------------
 add_executable(cpcw_mapeditor src/main.cpp src/mapfile.cpp src/protodb.cpp
     src/pak.cpp src/vfs.cpp src/thumb.cpp src/overlays.cpp src/weather.cpp
+    src/settings.cpp src/crashdump.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src/srm_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../viewer/src/dds.cpp)
 target_include_directories(cpcw_mapeditor PRIVATE
@@ -67,7 +68,7 @@ target_include_directories(cpcw_mapeditor PRIVATE
 target_link_libraries(cpcw_mapeditor PRIVATE zlibstatic)
 target_link_libraries(cpcw_mapeditor PRIVATE imgui glfw nlohmann_json::nlohmann_json)
 if (WIN32)
-    target_link_libraries(cpcw_mapeditor PRIVATE opengl32 comdlg32)
+    target_link_libraries(cpcw_mapeditor PRIVATE opengl32 comdlg32 dbghelp)
 elseif (APPLE)
     target_link_libraries(cpcw_mapeditor PRIVATE "-framework OpenGL")
 else()
@@ -75,4 +76,11 @@ else()
 endif()
 if (MSVC)
     target_compile_definitions(cpcw_mapeditor PRIVATE _CRT_SECURE_NO_WARNINGS)
+    # Ship a PDB with the optimised build. Without it crashdump.cpp's stack walk
+    # resolves every frame to "??" and the crash report says nothing useful --
+    # which is the whole reason it exists. /Zi does not affect code generation;
+    # /OPT:REF,ICF keep the linker's usual Release behaviour.
+    target_compile_options(cpcw_mapeditor PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(cpcw_mapeditor PRIVATE
+        $<$<CONFIG:Release>:/DEBUG> $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
 endif()

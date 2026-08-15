@@ -20,6 +20,8 @@
 #include "viewport3d.h"
 #include "mapfile.h"
 #include "weather.h"
+#include "settings.h"
+#include "crashdump.h"
 #include "protodb.h"
 #include "pak.h"
 #include "vfs.h"
@@ -88,6 +90,10 @@ static int   g_mode = 0, g_activeTool = 0, g_selected = -1, g_hovered = -1;
 static ModeKind modeKind() { return kModes[g_mode].kind; }
 static bool  modeIs(ModeKind k) { return kModes[g_mode].kind == k; }
 static int   g_lightMode = 0;      // 0 neutral, 1 map preset, 2 preset + fog
+static int   g_lightPreset = -1;   // Light panel selection (index into Scene::weather)
+static Settings    g_settings;
+static std::string g_settingsPath;
+static int   g_winW = 1360, g_winH = 850;
 static std::string g_presetArg;    // --preset <name|#slot>, for headless shots
 static float g_brushSize = 2.0f, g_brushHeight = 0.0f, g_brushPress = 0.5f;
 static bool  g_wireframe = false;
@@ -626,6 +632,10 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     if (g_glReady) { g_vp.clearModels(); g_vp.clearOverlays(); }
     resetThumbCache();
     if (!preserveView) snprintf(g_mapPath, sizeof(g_mapPath), "%s", path.c_str());
+    // Only a real user-facing open goes in the recent list — a structural edit
+    // reloads with preserveView, and those must not churn it.
+    if (!preserveView && !g_srcMap.empty()) g_settings.pushRecentMap(g_srcMap);
+    g_lightPreset = -1;              // the new map's presets are different ones
     if (selectId >= 0)
         for (int i = 0; i < (int)g_scene.entities.size(); i++)
             if (g_scene.entities[i].id == selectId) { selectOnly(i); break; }
@@ -986,6 +996,21 @@ static void drawMenuBar() {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) doOpen();
         if (ImGui::MenuItem("Open from .pak...")) doOpenPak();
+        {
+            std::vector<std::string> recent = g_settings.recentMaps();
+            if (ImGui::BeginMenu("Open recent", !recent.empty())) {
+                for (size_t r = 0; r < recent.size(); r++) {
+                    const std::string& p = recent[r];
+                    const char* leaf = p.c_str();
+                    if (const char* sl = strrchr(leaf, '/')) leaf = sl + 1;
+                    if (const char* bs = strrchr(leaf, '\\')) leaf = bs + 1;
+                    char lbl[320]; snprintf(lbl, sizeof(lbl), "%s##rc%d", leaf, (int)r);
+                    if (ImGui::MenuItem(lbl)) loadScene(p);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.c_str());
+                }
+                ImGui::EndMenu();
+            }
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Save edits", "Ctrl+S", false, !g_srcMap.empty())) doSave();
         if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, !g_srcMap.empty())) doSaveAs();
@@ -1241,7 +1266,6 @@ static void drawPrototypeBrowser() {
 // editing is a size-preserving in-place write, but the write path + undo land
 // with the editable panel. Showing the real values now is what makes the decode
 // checkable by eye rather than only by --wthrtest.
-static int g_lightPreset = -1;
 
 // Resolve --preset into an index of g_scene.weather (-1 = leave as-is).
 static int presetIndexFromArg() {
@@ -2606,9 +2630,114 @@ static int structTest(const char* mapPath, const char* outPath) {
     return ok ? 0 : 3;
 }
 
+// --- settings persistence ----------------------------------------------------
+static void loadSettings(const std::string& pathOverride = std::string()) {
+    g_settingsPath = pathOverride.empty() ? settings_default_path() : pathOverride;
+    g_settings.load(g_settingsPath);
+    const Settings& S = g_settings;
+    g_showModes    = S.getBool("panel.modes",    g_showModes);
+    g_showPanel    = S.getBool("panel.tools",    g_showPanel);
+    g_showProps    = S.getBool("panel.props",    g_showProps);
+    g_showEntities = S.getBool("panel.entities", g_showEntities);
+    g_showChanges  = S.getBool("panel.changes",  g_showChanges);
+    g_showChunks   = S.getBool("panel.chunks",   g_showChunks);
+    g_gizmoOn      = S.getBool("gizmo.on",     g_gizmoOn);
+    g_gizmoOp      = S.getInt ("gizmo.op",     g_gizmoOp);
+    g_gizmoLocal   = S.getBool("gizmo.local",  g_gizmoLocal);
+    g_snapOn       = S.getBool("snap.on",      g_snapOn);
+    g_snapGrid     = S.getFloat("snap.grid",   g_snapGrid);
+    g_snapAngle    = S.getFloat("snap.angle",  g_snapAngle);
+    g_brushSize    = S.getFloat("brush.size",     g_brushSize);
+    g_brushHeight  = S.getFloat("brush.height",   g_brushHeight);
+    g_brushPress   = S.getFloat("brush.pressure", g_brushPress);
+    g_showModels   = S.getBool("view.models",   g_showModels);
+    g_showDots     = S.getBool("view.dots",     g_showDots);
+    g_wireframe    = S.getBool("view.wireframe", g_wireframe);
+    for (int k = 0; k < 3; k++) {
+        char key[32]; snprintf(key, sizeof(key), "view.kind%d", k);
+        g_showKind[k] = S.getBool(key, g_showKind[k]);
+    }
+    g_vp.terrainMode = S.getInt ("view.terrain", g_vp.terrainMode);
+    g_vp.showRoads   = S.getBool("view.roads",   g_vp.showRoads);
+    g_vp.showDecals  = S.getBool("view.decals",  g_vp.showDecals);
+    g_vp.showRivers  = S.getBool("view.rivers",  g_vp.showRivers);
+    g_vp.cullMode    = S.getInt ("view.cull",    g_vp.cullMode);
+    g_lightMode      = S.getInt ("view.lighting", g_lightMode);
+    g_mode           = S.getInt ("mode", g_mode);
+    if (g_mode < 0 || g_mode >= kNumModes) g_mode = 0;
+    if (g_dataRoot.empty()) g_dataRoot = S.getStr("dataRoot");
+    for (const std::string& f : S.favourites()) g_favourites.insert(f);
+    g_winW = S.getInt("window.w", g_winW);
+    g_winH = S.getInt("window.h", g_winH);
+    if (g_winW < 320 || g_winW > 16384) g_winW = 1360;
+    if (g_winH < 240 || g_winH > 16384) g_winH = 850;
+}
+
+static void saveSettings() {
+    if (g_settingsPath.empty()) return;
+    Settings& S = g_settings;
+    S.setBool("panel.modes",    g_showModes);
+    S.setBool("panel.tools",    g_showPanel);
+    S.setBool("panel.props",    g_showProps);
+    S.setBool("panel.entities", g_showEntities);
+    S.setBool("panel.changes",  g_showChanges);
+    S.setBool("panel.chunks",   g_showChunks);
+    S.setBool("gizmo.on",    g_gizmoOn);
+    S.setInt ("gizmo.op",    g_gizmoOp);
+    S.setBool("gizmo.local", g_gizmoLocal);
+    S.setBool("snap.on",     g_snapOn);
+    S.setFloat("snap.grid",  g_snapGrid);
+    S.setFloat("snap.angle", g_snapAngle);
+    S.setFloat("brush.size",     g_brushSize);
+    S.setFloat("brush.height",   g_brushHeight);
+    S.setFloat("brush.pressure", g_brushPress);
+    S.setBool("view.models",    g_showModels);
+    S.setBool("view.dots",      g_showDots);
+    S.setBool("view.wireframe", g_wireframe);
+    for (int k = 0; k < 3; k++) {
+        char key[32]; snprintf(key, sizeof(key), "view.kind%d", k);
+        S.setBool(key, g_showKind[k]);
+    }
+    S.setInt ("view.terrain",  g_vp.terrainMode);
+    S.setBool("view.roads",    g_vp.showRoads);
+    S.setBool("view.decals",   g_vp.showDecals);
+    S.setBool("view.rivers",   g_vp.showRivers);
+    S.setInt ("view.cull",     g_vp.cullMode);
+    S.setInt ("view.lighting", g_lightMode);
+    S.setInt ("mode", g_mode);
+    S.setStr ("dataRoot", g_dataRoot);
+    S.setFavourites(std::vector<std::string>(g_favourites.begin(), g_favourites.end()));
+    if (g_win) { int w = 0, h = 0; glfwGetWindowSize(g_win, &w, &h);
+                 if (w > 0 && h > 0) { S.setInt("window.w", w); S.setInt("window.h", h); } }
+    S.save(g_settingsPath);
+}
+
+// One line of "what was the editor doing", for the crash report. The stack says
+// where it died; this says which map was open, which is usually the faster clue.
+static const char* crashContext() {
+    static char buf[900];
+    snprintf(buf, sizeof(buf), "map=%s entities=%d mode=%s lighting=%d save=\"%s\"",
+             g_mapPath, (int)g_scene.entities.size(),
+             (g_mode >= 0 && g_mode < kNumModes) ? kModes[g_mode].name : "?",
+             g_lightMode, g_saveStatus);
+    return buf;
+}
+
 int main(int argc, char** argv) {
+    // First statement, so a fault during startup is covered too.
+    crashdump_install(crashContext);
     std::string loadPath, shotPath, pickDump, uiShotPath; bool selftest = false, pickTest = false;
     int uiShotFrames = 0, uiShotSelect = -1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--crashtest")) {
+            // Check the handler against the thing it exists for: fault on
+            // purpose and confirm the report names this function.
+            printf("crashtest: faulting deliberately...\n"); fflush(stdout);
+            crashdump_test_fault();
+            printf("crashtest: FAIL — did not fault\n");
+            return 3;
+        }
+    }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--load") && i + 1 < argc) loadPath = argv[++i];
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
@@ -2728,6 +2857,54 @@ int main(int argc, char** argv) {
                 printf("  spline[%zu] nodes=%zu %s\n", k, s.roadSplines[k].cx.size(), s.roadSplines[k].tex.c_str());
             for (size_t k=0;k<s.decals.size() && k<3;k++) printf("  decal[%zu] %s\n", k, s.decals[k].tex.c_str());
             return 0;
+        }
+        else if (!strcmp(argv[i], "--settingstest") && i + 1 < argc) {
+            // dev: --settingstest <tmpfile>  — the settings round-trip, on a temp
+            // path so it never touches the user's real file.
+            const std::string path = argv[i+1];
+            { std::ofstream f(path, std::ios::trunc);
+              f << "# hand-written\n"
+                   "snap.grid 7.5\n"
+                   "brush.size 6.25\n"
+                   "view.rivers 0\n"
+                   "mode 5\n"
+                   "window.w 1024\n"
+                   "window.h 720\n"
+                   "some.future.key preserved value with spaces\n"
+                   "dataRoot C:/a path/with spaces\n"; }
+            loadSettings(path);
+            int fail = 0;
+            auto chk = [&](const char* what, bool ok) {
+                printf("  %-34s %s\n", what, ok ? "ok" : "FAIL"); if (!ok) fail++; };
+            chk("float parses",        fabsf(g_snapGrid - 7.5f) < 1e-6f);
+            chk("float parses (brush)",fabsf(g_brushSize - 6.25f) < 1e-6f);
+            chk("bool parses",         g_vp.showRivers == false);
+            chk("int parses",          g_mode == 5);
+            chk("window size read",    g_winW == 1024 && g_winH == 720);
+            chk("value keeps spaces",  g_settings.getStr("dataRoot") == "C:/a path/with spaces");
+            // Round-trip: change something, save, reload, confirm it survived and
+            // that a key this build knows nothing about was not dropped.
+            g_snapGrid = 3.25f; g_mode = 2; g_vp.showRivers = true;
+            g_winW = 800; g_winH = 600;
+            saveSettings();
+            g_snapGrid = 0; g_mode = 0; g_vp.showRivers = false;
+            loadSettings(path);
+            chk("survives save+reload", fabsf(g_snapGrid - 3.25f) < 1e-6f && g_mode == 2 &&
+                                        g_vp.showRivers == true);
+            chk("unknown key preserved",
+                g_settings.getStr("some.future.key") == "preserved value with spaces");
+            chk("version stamped",      g_settings.getInt("version", -1) == Settings::kVersion);
+            // Recent list: most recent first, de-duplicated, capped.
+            for (int k = 0; k < Settings::kMaxRecent + 3; k++)
+                g_settings.pushRecentMap("map" + std::to_string(k) + ".map");
+            g_settings.pushRecentMap("map5.map");        // re-open an older one
+            std::vector<std::string> r = g_settings.recentMaps();
+            chk("recent capped",        (int)r.size() == Settings::kMaxRecent);
+            chk("recent most-recent 1st", !r.empty() && r[0] == "map5.map");
+            chk("recent de-duplicated",
+                std::set<std::string>(r.begin(), r.end()).size() == r.size());
+            printf("settingstest: %s\n", fail ? "FAIL" : "PASS");
+            return fail ? 3 : 0;
         }
         else if (!strcmp(argv[i], "--sunprobe") && i + 1 < argc) {
             // dev: --sunprobe <map>
@@ -3145,8 +3322,8 @@ int main(int argc, char** argv) {
             printf("applytest %s\n", ok ? "ok" : "fail"); return ok ? 0 : 3;
         }
     }
-    if (!loadPath.empty()) loadScene(loadPath);
     if (selftest) {
+        if (!loadPath.empty()) loadScene(loadPath);
         int withScale = 0, nonUnit = 0;
         for (const auto& e : g_scene.entities) {
             if (e.scaleOff >= 0) withScale++;
@@ -3160,6 +3337,22 @@ int main(int argc, char** argv) {
         return g_scene.loaded ? 0 : 2;
     }
 
+    // Settings load BEFORE the window is created — the window size is one of the
+    // things being restored, and after glfwCreateWindow it is too late.
+    // It must also come before the initial loadScene: Settings::load() clears the
+    // map, so a load afterwards would wipe the recent-map entry that scene just
+    // pushed (and every other in-memory setting).
+    // Deliberately not applied to the headless paths above: a --shot must not
+    // pick up whatever view toggles the user last left set, or the same command
+    // renders differently on two machines.
+    // A headless render must not inherit whatever view toggles the user last left
+    // set, or the same command produces different pixels on two machines and the
+    // no-change regressions become meaningless. Such runs also must not write the
+    // user's settings back.
+    const bool headless = !shotPath.empty() || !uiShotPath.empty() || pickTest;
+    if (!headless) loadSettings();
+    if (!loadPath.empty()) loadScene(loadPath);
+
     glfwSetErrorCallback(glfwError);
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -3168,7 +3361,7 @@ int main(int argc, char** argv) {
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(1360, 850, "CPCW Map Editor", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(g_winW, g_winH, "CPCW Map Editor", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     g_win = win;
 #ifdef _WIN32
@@ -3316,6 +3509,12 @@ int main(int argc, char** argv) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    // ImGui 1.92 raises an error tooltip on conflicting widget IDs, and that
+    // tooltip carries an "Item Picker" button whose picker fires IM_DEBUG_BREAK
+    // on the next hovered item — one stray click away from killing the process
+    // in a Release build. Duplicate IDs are still a bug (use ##suffix), but they
+    // must not be able to reach a debug break.
+    ImGui::GetIO().ConfigDebugHighlightIdConflictsShowItemPicker = false;
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -3483,6 +3682,9 @@ int main(int argc, char** argv) {
         }
         glfwSwapBuffers(win);
     }
+    // Before the window goes away — saveSettings() reads its size. Skipped for
+    // headless runs, which never loaded them.
+    if (!headless) saveSettings();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
