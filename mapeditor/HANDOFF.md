@@ -27,9 +27,17 @@ $E --fieldtest      $M out.map             # one schema field written, nothing e
 $E --splattest      $M out.map             # one painted splat cell, nothing else
 $E --protoplacetest $M $D out.map          # place a prototype absent from the map
 $E --addtest --deltest --heighttest --applytest --overlaytest
+$E --chunktile  <map|dir>                  # container sizes tile exactly (see below)
+$E --overlayscan <map|dir>                 # GROL/GDCL/GRVL pools + used-list invariants
+$E --wthrtest   <map|dir> [out.map]        # WTHR layout + field-order semantics
+$E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
+$E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
+$E --crashtest                             # fault on purpose; report must name the frame
 $E --pakmap "$GD" "Maps/M_01.map" --picktest [dump.bmp]   # colour-code pick buffer
 $E --pakmap "$GD" "Maps/M_01.map" --shot out.bmp          # one rendered frame
 ```
+Headless runs (`--shot`/`--uishot`/`--picktest`) deliberately ignore the settings
+file, so a harness render never depends on the operator's saved view toggles.
 `--shot` renders into an offscreen FBO. It CANNOT show mouse-driven UI (brush ring,
 hover box, gizmo, marquee) — those need the live app; ask the user to verify.
 
@@ -67,11 +75,18 @@ correctly rejected).
   `buildSplatTextures()` + `refreshSplatWeights()`, `buildOverlays()`, `render()`.
 - `src/mapfile.cpp` — native `.map` parser + writer. `apply_edits_inplace()`,
   the in-memory structural ops, `reparse_entities()`, `map_chunk_outline()`.
-- `src/overlays.cpp` — decode roads (GROL/GROA) + decals (GDCL/GDEC).
+- `src/overlays.cpp` — decode the three overlay slot pools: roads (GROL/GROA),
+  decals (GDCL/GDEC) and rivers (GRVL/GRVR), keeping each record's byte offsets.
+- `src/weather.cpp` — WTHR lighting presets; `kWeatherFields[]` is the single
+  source of truth for the record layout (decoder, writer, UI and harness all
+  iterate it).
+- `src/settings.cpp` — versioned `key value` persistence. `src/crashdump.cpp` —
+  symbolized fault report (needs the Release PDB; see OPEN 8).
 - `src/protodb.cpp` — `protodb_full_index()` (guid -> model/name/schema),
   `protodb_map_schema()`. `src/thumb.cpp` (THMB), `src/pak.cpp`/`vfs.cpp`.
-- `docs/MAP_FORMAT.md` §7 (GTRD terrain/splat), §9 (GROA/GDEC). `docs/FORMAT_SRM.md`.
-  `cpcw_map.py` is the Python oracle.
+- `docs/MAP_FORMAT.md` §4.9 + §11 (slot pools, WTHR/SWeather), §7 (GTRD terrain/
+  splat), §8 (BLCK), §9 (GROA/GDEC/GRVR). `docs/FORMAT_SRM.md`.
+  `cpcw_map.py` is the Python oracle — but see the three-way cross-check above.
 
 ## Facts already established (don't re-derive)
 - **Handedness**: `.srm` is DirectX LH. `loadModel()` negates BOTH X and Z (a 180°
@@ -100,15 +115,16 @@ correctly rejected).
   layer must also clear the layers composited ON TOP of it or the paint is invisible.
   M_01 has NO concrete layer; the airfield base is `Gritty_ground_08c` (grey gravel),
   so the apron reads grey but not as smooth as the game's concrete asset.
-- **Roads (GROA)**: container = 24-byte header (u32 record count + 5 dwords) then
-  records = variable prefix (9 or 18 bytes) + `GROA` chunk. GROA body = `u32 type(11)`
-  + `u32 nodeCount` + `nodeCount × 36-byte nodes` + trailer(4x4 matrix/bbox) + u16
-  material path (first `Terrain/...` string) + u16 shader. Each 36-byte node = 9
-  floats: `x,y,z` (world centreline, y≈0 -> project onto heightmap) + 6 aux (aux[0]=
-  segment length, aux[3..5]/[6..8]=tangent). **No per-node width field** — width is
-  texture-derived (below). Walk records by SCANNING for the next `GROA` tag.
+- **Roads (GROA)**: body = `u32 version(11)` + `u32 N` + `N × 36-byte nodes` +
+  `u32 N2` + `N × 16-byte params` + u8 + u16 material path (first `Terrain/...`
+  string) + u16 shader + 22-byte tail. Each node = 9 floats: `x,y,z` (world
+  centreline, y≈0 -> project onto heightmap) + an `in` and an `out` Catmull-Rom
+  handle. **No per-node width field** — width is texture-derived (below).
   Decals (GDEC) = `u32(6)` + float `cx,cz,sizeX,sizeY,rot` + material -> a rotated
   terrain-projected quad. Verified: M_01 320 roads + 126 decals, all materials resolve.
+  For the CONTAINER these sit in — a slot pool, not a header-then-scan — and for
+  the river pool, see the GROL/GDCL/GRVL entry below; it supersedes the earlier
+  "24-byte header + 9-or-18-byte per-record prefix, scan for the next tag" reading.
 - **Road width — Ghidra-RE'd.** Roads are texture-projected STRIPS (engine
   `FUN_004d7a10`); width = road-texture SHORT dim (across-road px) × WPT.
   `overlays.cpp` stores centrelines in `Scene::roadSplines`; `viewport3d.h
