@@ -115,9 +115,12 @@ static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
 static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
 static bool  g_splatTexDirty = false;   // painted layers -> re-upload the weight textures
-static bool  g_overlayDirty = false;    // decal edited -> re-decode + rebuild batches
+static bool  g_overlayDirty = false;    // overlay edited -> re-decode + rebuild batches
 static std::set<int> g_decalTouched;    // pool slots edited since the last save
 static int   g_decalSel = -1;           // Decals panel selection
+static std::set<int> g_roadTouched;     // road pool slots edited since the last save
+static int   g_roadSel = -1;            // Roads panel selection (index into roadRecs)
+static int   g_roadNodeSel = 0;         // selected node within that road
 
 // Vertex/Terrain tool indices, matching kModes[0].tools word for word.
 enum { TT_GRAB=0, TT_RAISE, TT_LOWER, TT_SETPLANE, TT_RAISE_TO_PLANE,
@@ -165,7 +168,8 @@ static ImVec2 g_marqueeA{0,0};
 // CMD_DECAL is keyed on the pool SLOT, which is stable; a decal's index in
 // Scene::decalRecs is not (a re-decode reorders nothing today, but nothing
 // guarantees that once insert/delete land).
-enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH, CMD_WEATHER, CMD_DECAL };
+enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH, CMD_WEATHER, CMD_DECAL,
+       CMD_ROADNODE };
 struct EditCmd {
     int  kind = CMD_ENTITY;
     long entId = 0;
@@ -177,6 +181,8 @@ struct EditCmd {
     std::array<float,4> w0{}, w1{};
     int dSlot = -1;                                      // CMD_DECAL
     std::array<float,5> d0{}, d1{};                      // cx, cz, sx, sy, rot
+    int rSlot = -1, rNode = -1;                          // CMD_ROADNODE
+    std::vector<unsigned char> r0, r1;                   // exact node-record bytes
 };
 static std::vector<EditCmd> g_undo, g_redo;
 static bool g_snapActive = false; static EditCmd g_snap;   // pending entity snapshot
@@ -299,6 +305,21 @@ static void applyCmd(const EditCmd& c, bool useNew) {
             // it from the pending set rather than incrementing, so undo lowers it.
             g_decalTouched.insert(c.dSlot);
             g_scene.decalEdited = (int)g_decalTouched.size();
+        }
+        return;
+    }
+    if (c.kind == CMD_ROADNODE) {
+        // Restore the exact bytes rather than re-running the move backwards: an
+        // endpoint's handle magnitude is scaled by a float ratio, so inverting it
+        // is not guaranteed to reproduce the original bits.
+        const std::vector<unsigned char>& b = useNew ? c.r1 : c.r0;
+        long off = 0, len = 0;
+        if (overlay_road_node_span(g_scene, c.rSlot, c.rNode, off, len) &&
+            (long)b.size() == len && off + len <= (long)g_scene.raw.size()) {
+            memcpy(&g_scene.raw[(size_t)off], b.data(), (size_t)len);
+            g_overlayDirty = true;
+            g_roadTouched.insert(c.rSlot);
+            g_scene.roadEdited = (int)g_roadTouched.size();
         }
         return;
     }
@@ -658,6 +679,7 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     if (!preserveView && !g_srcMap.empty()) g_settings.pushRecentMap(g_srcMap);
     g_lightPreset = -1;              // the new map's presets are different ones
     g_decalSel = -1; g_decalTouched.clear();
+    g_roadSel = -1; g_roadNodeSel = 0; g_roadTouched.clear();
     if (selectId >= 0)
         for (int i = 0; i < (int)g_scene.entities.size(); i++)
             if (g_scene.entities[i].id == selectId) { selectOnly(i); break; }
@@ -734,6 +756,7 @@ static void doSaveTo(const std::string& out, bool keepBackup) {
         g_scene.splatEdited = false;
         g_scene.weatherEdited = false;
         g_decalTouched.clear(); g_scene.decalEdited = 0;
+        g_roadTouched.clear(); g_scene.roadEdited = 0;
         for (Entity& e : g_scene.entities) for (EntityField& f : e.fields) f.dirty = false;
         for (WeatherPreset& w : g_scene.weather)
             std::fill(w.dirty.begin(), w.dirty.end(), (unsigned char)0);
@@ -1560,22 +1583,15 @@ static void drawRiverPanel() {
 // read-only — dragging a road node also has to re-derive the neighbouring
 // Catmull-Rom handles, which is the next piece of work, not this one.
 
-static void drawDecalPanel() {
-    if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
+static void drawDecalSection() {
     if (g_scene.decalRecs.empty()) {
         ImGui::TextWrapped("This map has no decals.");
         return;
     }
-    ImGui::Text("%d decals, %d roads", (int)g_scene.decalRecs.size(),
-                (int)(g_scene.roadSplines.size() + g_scene.roads.size()));
     if (!g_scene.decalPool.ok)
         ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
                            "The decal pool did not walk cleanly - read-only on this map.");
-    else
-        ImGui::TextDisabled("edits are in-place and byte-faithful; Ctrl+S writes them");
-    ImGui::TextDisabled("Roads are read-only (node drag needs handle re-derivation).");
 
-    ImGui::SeparatorText("Decals");
     ImGui::BeginChild("##decallist", ImVec2(0, 180), true);
     for (int k = 0; k < (int)g_scene.decalRecs.size(); k++) {
         const Scene::DecalRec& r = g_scene.decalRecs[(size_t)k];
@@ -1642,6 +1658,112 @@ static void drawDecalPanel() {
     if (ImGui::Button("Frame this decal")) {
         g_cam.target = V3{ r.cx, terrainHeightAt(r.cx, r.cz), r.cz };
         if (g_cam.dist > 60.0f) g_cam.dist = 60.0f;
+    }
+}
+
+// Road node editing. Positions live in Scene::raw, not in a decoded struct: the
+// ribbon is baked geometry, so the panel reads the two floats straight back out
+// of the buffer each frame rather than caching a copy that could drift from it.
+static void drawRoadSection() {
+    if (g_scene.roadRecs.empty()) { ImGui::TextDisabled("This map has no roads."); return; }
+    if (!g_scene.roadPool.ok) {
+        ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
+                           "The road pool did not walk cleanly - read-only on this map.");
+        return;
+    }
+    ImGui::BeginChild("##roadlist", ImVec2(0, 140), true);
+    for (int k = 0; k < (int)g_scene.roadRecs.size(); k++) {
+        const Scene::RoadRec& r = g_scene.roadRecs[(size_t)k];
+        const char* leaf = r.tex.c_str();
+        if (const char* sl = strrchr(leaf, '/')) leaf = sl + 1;
+        char lbl[220];
+        snprintf(lbl, sizeof(lbl), "%s  (%d)%s%s##rd%d", leaf, r.nodeCount,
+                 r.isArea ? "  area" : "", g_roadTouched.count(r.slot) ? "  *" : "", k);
+        if (ImGui::Selectable(lbl, k == g_roadSel)) { g_roadSel = k; g_roadNodeSel = 0; }
+    }
+    ImGui::EndChild();
+    if (g_roadSel < 0 || g_roadSel >= (int)g_scene.roadRecs.size()) {
+        ImGui::TextDisabled("Select a road to edit its nodes.");
+        return;
+    }
+
+    const Scene::RoadRec& rr = g_scene.roadRecs[(size_t)g_roadSel];
+    if (g_roadNodeSel >= rr.nodeCount) g_roadNodeSel = 0;
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderInt("node", &g_roadNodeSel, 0, rr.nodeCount - 1);
+    const bool endpoint = (g_roadNodeSel == 0 || g_roadNodeSel == rr.nodeCount - 1);
+
+    const size_t noff = (size_t)rr.nodesOff + (size_t)g_roadNodeSel * 36;
+    if (noff + 36 > g_scene.raw.size()) { ImGui::TextDisabled("node out of range"); return; }
+    float px, pz;
+    memcpy(&px, &g_scene.raw[noff], 4);
+    memcpy(&pz, &g_scene.raw[noff + 8], 4);
+
+    // One undo step per interaction, snapshotting exact bytes on grab.
+    static int sSlot = -1, sNode = -1;
+    static std::vector<unsigned char> sBefore;
+    auto grab = [&]{
+        if (sSlot == rr.slot && sNode == g_roadNodeSel) return;
+        long off = 0, len = 0;
+        if (!overlay_road_node_span(g_scene, rr.slot, g_roadNodeSel, off, len)) return;
+        sBefore.assign(g_scene.raw.begin() + off, g_scene.raw.begin() + off + len);
+        sSlot = rr.slot; sNode = g_roadNodeSel;
+    };
+    auto write = [&](float nx, float nz) {
+        if (overlay_set_road_node(g_scene, rr.slot, g_roadNodeSel, nx, nz)) {
+            g_overlayDirty = true;
+            g_roadTouched.insert(rr.slot);
+            g_scene.roadEdited = (int)g_roadTouched.size();
+        }
+    };
+    auto release = [&]{
+        if (sSlot != rr.slot || sNode != g_roadNodeSel) return;
+        long off = 0, len = 0;
+        if (overlay_road_node_span(g_scene, rr.slot, g_roadNodeSel, off, len) &&
+            (long)sBefore.size() == len) {
+            std::vector<unsigned char> after(g_scene.raw.begin() + off,
+                                             g_scene.raw.begin() + off + len);
+            if (after != sBefore) {
+                EditCmd c; c.kind = CMD_ROADNODE;
+                c.rSlot = rr.slot; c.rNode = g_roadNodeSel;
+                c.r0 = sBefore; c.r1 = std::move(after);
+                pushCmd(std::move(c));
+            }
+        }
+        sSlot = -1; sNode = -1;
+    };
+    auto drag = [&](const char* label, float* v, bool isX) {
+        ImGui::SetNextItemWidth(200.0f);
+        float t = *v;
+        ImGui::DragFloat(label, &t, 0.25f);
+        if (ImGui::IsItemActivated()) grab();
+        if (ImGui::IsItemEdited()) write(isX ? t : px, isX ? pz : t);
+        if (ImGui::IsItemDeactivatedAfterEdit()) release();
+    };
+    drag("node X", &px, true);
+    drag("node Z", &pz, false);
+
+    if (endpoint)
+        ImGui::TextDisabled("endpoint: handle direction is preserved exactly,\n"
+                            "only its length is rescaled");
+    else
+        ImGui::TextDisabled("interior: both handles are re-derived from the neighbours");
+    ImGui::TextDisabled("pool slot %d   %s", rr.slot, rr.tex.c_str());
+    if (ImGui::Button("Frame this node")) {
+        g_cam.target = V3{ px, terrainHeightAt(px, pz), pz };
+        if (g_cam.dist > 60.0f) g_cam.dist = 60.0f;
+    }
+}
+
+static void drawDecalPanel() {
+    if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
+    ImGui::Text("%d decals, %d road records", (int)g_scene.decalRecs.size(),
+                (int)g_scene.roadRecs.size());
+    ImGui::TextDisabled("edits are in-place and byte-faithful; Ctrl+S writes them");
+    if (ImGui::BeginTabBar("##overlaytabs")) {
+        if (ImGui::BeginTabItem("Decals")) { drawDecalSection(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Roads"))  { drawRoadSection();  ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
     }
 }
 
@@ -1760,7 +1882,7 @@ static void drawChanges() {
     char title[96];
     snprintf(title, sizeof(title), "Changes (%d)###changes",
              (int)rows.size() + deleted + (wFields ? 1 : 0) +
-             (g_decalTouched.empty() ? 0 : 1));
+             (g_decalTouched.empty() ? 0 : 1) + (g_roadTouched.empty() ? 0 : 1));
     if (ImGui::Begin(title, &g_showChanges)) {
         if (g_srcMap.empty()) ImGui::TextDisabled("No .map loaded.");
         ImGui::Text("+%d added   -%d deleted   %d moved   %d rotated   %d field edits",
@@ -1773,6 +1895,9 @@ static void drawChanges() {
         if (!g_decalTouched.empty())
             ImGui::Text("%d decal%s moved", (int)g_decalTouched.size(),
                         g_decalTouched.size() == 1 ? "" : "s");
+        if (!g_roadTouched.empty())
+            ImGui::Text("%d road%s edited", (int)g_roadTouched.size(),
+                        g_roadTouched.size() == 1 ? "" : "s");
         ImGui::TextDisabled("versus %s", g_srcMap.empty() ? "(nothing)" : g_srcMap.c_str());
         ImGui::Separator();
         ImGuiListClipper clip; clip.Begin((int)rows.size());
@@ -3571,7 +3696,12 @@ int main(int argc, char** argv) {
             if (!load_map_native(argv[i+1], s)) { printf("roadwritetest: load failed\n"); return 2; }
             if (s.roadRecs.empty()) { printf("roadwritetest: no roads\n"); return 2; }
             int slot = (i + 3 < argc) ? atoi(argv[i+3]) : -1;
-            int node = (i + 4 < argc) ? atoi(argv[i+4]) : 1;
+            // Default to node 2, not 1: node 1's left neighbour is an ENDPOINT,
+            // and 1670 of the 7876 shipped endpoints carry all-zero handles, which
+            // scaling leaves untouched. Testing there made the undo-span check
+            // vacuous — a deliberately narrowed span still passed. Node 2 on a
+            // road of 5+ has interior neighbours on both sides, which always move.
+            int node = (i + 4 < argc) ? atoi(argv[i+4]) : 2;
             const Scene::RoadRec* rr = nullptr;
             for (const Scene::RoadRec& r : s.roadRecs) {
                 if (slot >= 0 ? (r.slot == slot) : (r.nodeCount >= 5)) { rr = &r; break; }
@@ -3641,20 +3771,36 @@ int main(int argc, char** argv) {
                 identity = std::max(dis(hh,ex), dis(hh+3,ex+3));
             }
 
+            // 5. the undo span must cover EXACTLY what the writer touched:
+            // restoring the pre-edit bytes over overlay_road_node_span() has to
+            // reproduce the original buffer byte for byte, or undo silently
+            // half-restores a road.
+            bool undoExact = false;
+            {
+                long uoff = 0, ulen = 0;
+                if (overlay_road_node_span(s, slot, node, uoff, ulen) &&
+                    uoff + ulen <= (long)before.size()) {
+                    std::vector<unsigned char> probe = s.raw;
+                    memcpy(&probe[(size_t)uoff], &before[(size_t)uoff], (size_t)ulen);
+                    undoExact = (probe == before);
+                }
+            }
+
             { std::ofstream f(argv[i+2], std::ios::binary);
               f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size()); }
             Scene s2; bool reload = load_map_native(argv[i+2], s2);
             bool poolIntact = reload && s2.roadPool.ok &&
                               s2.roadRecs.size() == s.roadRecs.size();
 
+            const bool pass = ok && outside == 0 && sizeSame && moved && epDir &&
+                              identity < 1e-3 && undoExact && reload && poolIntact;
             printf("roadwritetest slot %d node %d/%d: write=%d changed=%ld outside=%ld "
-                   "sizeSame=%d moved=%d endpointDir=%d identity=%.2g reload=%d pool=%d %s\n",
+                   "sizeSame=%d moved=%d endpointDir=%d identity=%.2g undoExact=%d "
+                   "reload=%d pool=%d %s\n",
                    slot, node, N, (int)ok, changed, outside, (int)sizeSame, (int)moved,
-                   (int)epDir, identity, (int)reload, (int)poolIntact,
-                   (ok && outside == 0 && sizeSame && moved && epDir &&
-                    identity < 1e-3 && reload && poolIntact) ? "OK" : "FAIL");
-            return (ok && outside == 0 && sizeSame && moved && epDir &&
-                    identity < 1e-3 && reload && poolIntact) ? 0 : 3;
+                   (int)epDir, identity, (int)undoExact, (int)reload, (int)poolIntact,
+                   pass ? "OK" : "FAIL");
+            return pass ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--heaptest") && i + 1 < argc) {
             // dev: --heaptest <map|dir> — read-only validator for the scenario
@@ -4083,10 +4229,12 @@ int main(int argc, char** argv) {
         if (g_terrainDirty && g_glReady) {  // after a terrain brush stroke
             g_vp.buildTerrain(g_scene); g_terrainDirty = false;
         }
-        if (g_overlayDirty && g_glReady) {  // after a decal edit
+        if (g_overlayDirty && g_glReady) {  // after a decal or road-node edit
             // Re-decode from the mutated raw bytes, then rebuild the batches. The
-            // decal meshes are BAKED geometry, so without this the write is
-            // correct and completely invisible — this codebase's classic failure.
+            // decal quads and road ribbons are BAKED geometry, so without this the
+            // write is correct and completely invisible — this codebase's classic
+            // failure. parse_overlays also refreshes roadRecs/decalRecs, so the
+            // panels keep pointing at live byte offsets.
             parse_overlays(g_scene.raw, g_scene);
             g_vp.clearOverlays();
             g_vp.buildOverlays(g_scene, g_dataRoot);

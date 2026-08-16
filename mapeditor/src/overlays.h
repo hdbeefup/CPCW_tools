@@ -45,3 +45,10 @@ bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
 // parse_overlays afterwards or the edit is correct and invisible (the ribbon is
 // baked geometry).
 bool overlay_set_road_node(Scene& s, int slot, int node, float x, float z);
+
+// Byte span of the node records a move of `node` can touch — that node and both
+// neighbours. Undo snapshots these bytes verbatim rather than re-running the
+// handle derivation backwards: an endpoint's magnitude is scaled by a float
+// ratio, and scaling by newLen/oldLen then oldLen/newLen is not guaranteed to
+// land on the original bits.
+bool overlay_road_node_span(const Scene& s, int slot, int node, long& off, long& len);

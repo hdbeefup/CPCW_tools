@@ -295,10 +295,18 @@ correctly rejected).
    bit-for-bit and only its magnitude is scaled by the segment-length ratio.
    `pos.y` is exactly 0.0 on all 35668 nodes — roads are 2D and projected onto
    the heightmap — so a drag must not write an elevation.
-   Still missing: the **UI**. There is no road-node selection, gizmo or panel, so
-   the writer is reachable only from `--roadwritetest`. That needs the `SelKind`
-   selection refactor (`g_selection` is a `std::set<int>` of ENTITY indices read
-   by eight call sites; tagged indices would corrupt all of them).
+   The **Shader/Decals panel now has Decals and Roads tabs**: pick a road, pick a
+   node, drag X/Z. Undo (`CMD_ROADNODE`) snapshots the exact bytes of the affected
+   span rather than re-running the move backwards — an endpoint's magnitude is
+   scaled by a float ratio and inverting it is not guaranteed to land on the
+   original bits. There is still no viewport picking or gizmo for road nodes; that
+   needs the `SelKind` selection refactor (`g_selection` is a `std::set<int>` of
+   ENTITY indices read by eight call sites, so tagged indices would corrupt them).
+   **1670 of the 7876 endpoints ship all-zero handles**, which scaling leaves
+   untouched — that made `--roadwritetest`'s first undo-span check VACUOUS (a
+   deliberately narrowed span still passed) until the default test node moved from
+   1 to 2, where both neighbours are interior and always change. If you add a
+   check here, verify it against a node that can actually fail it.
    `overlay_set_decal()` writes the five GDEC transform floats straight into
    `Scene::raw` — 20 bytes, size-preserving, so `save_map_native` stays
    byte-faithful with NO ancestor-size patching. Verified safe on the corpus:

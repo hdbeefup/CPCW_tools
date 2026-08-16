@@ -167,6 +167,19 @@ bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
     return true;
 }
 
+bool overlay_road_node_span(const Scene& s, int slot, int node, long& off, long& len) {
+    for (const Scene::RoadRec& r : s.roadRecs) {
+        if (r.slot != slot) continue;
+        if (node < 0 || node >= r.nodeCount || r.nodesOff < 0) return false;
+        const int first = std::max(0, node - 1);
+        const int last  = std::min(r.nodeCount - 1, node + 1);
+        off = r.nodesOff + (long)first * 36;
+        len = (long)(last - first + 1) * 36;
+        return off >= 0 && off + len <= (long)s.raw.size();
+    }
+    return false;
+}
+
 bool overlay_set_road_node(Scene& s, int slot, int node, float x, float z) {
     if (!s.roadPool.ok || s.raw.empty()) return false;          // fail closed
     const Scene::RoadRec* rr = nullptr;
