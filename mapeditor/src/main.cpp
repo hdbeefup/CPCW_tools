@@ -21,6 +21,7 @@
 #include "mapfile.h"
 #include "weather.h"
 #include "overlays.h"
+#include "heap.h"
 #include "settings.h"
 #include "crashdump.h"
 #include "protodb.h"
@@ -3503,6 +3504,59 @@ int main(int argc, char** argv) {
                 printf("chunktile: %d map(s), %d failed\n", n, bad);
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
+        }
+        else if (!strcmp(argv[i], "--heaptest") && i + 1 < argc) {
+            // dev: --heaptest <map|dir> — read-only validator for the scenario
+            // object trees (HEAP/HASH/ARRY). Every OBJS section must consume to
+            // exactly its own SCHD offset and every HEAP to exactly its chunk
+            // end, so a wrong width anywhere in any schema shows up here.
+            struct Acc { int maps=0, sec=0, secOk=0, heaps=0, heapsOk=0, lists=0, hashes=0;
+                         long recs=0, slots=0, live=0; int bad=0;
+                         std::map<std::string,int> byType; } A;
+            auto one = [&A](const std::string& p, bool verbose) -> bool {
+                std::vector<unsigned char> raw;
+                { std::ifstream f(p, std::ios::binary);
+                  if (!f) { printf("heaptest: cannot open %s\n", p.c_str()); return false; }
+                  raw.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); }
+                if (raw.size() < 8 || memcmp(raw.data(), "SCEN", 4) != 0) return true;
+                HeapReport r;
+                if (!map_heap_scan(raw, r)) { printf("heaptest: %s PARSE FAIL\n", p.c_str()); return false; }
+                A.maps++; A.sec += r.objsSections; A.secOk += r.objsExact;
+                A.heaps += r.heaps; A.heapsOk += r.heapsExact; A.lists += r.heapsListOk;
+                A.hashes += r.hashes; A.recs += r.objtRecords;
+                A.slots += r.slotsTotal; A.live += r.slotsLive;
+                for (auto& kv : r.heapRecordsByType) A.byType[kv.first] += kv.second;
+                if (verbose || !r.ok) {
+                    printf("%-46s %s objs=%d/%d heaps=%d/%d lists=%d hash=%d slots=%ld/%ld objt=%ld\n",
+                           p.substr(p.find_last_of("/\\") + 1).c_str(), r.ok ? "OK  " : "FAIL",
+                           r.objsExact, r.objsSections, r.heapsExact, r.heaps,
+                           r.heapsListOk, r.hashes, r.slotsLive, r.slotsTotal, r.objtRecords);
+                    for (size_t k = 0; k < r.issues.size() && k < 12; k++)
+                        printf("    %s\n", r.issues[k].c_str());
+                    if (verbose)
+                        for (auto& kv : r.heapRecordsByType)
+                            printf("    heap record %-14s %d\n", kv.first.c_str(), kv.second);
+                }
+                return r.ok;
+            };
+            std::error_code ec;
+            if (std::filesystem::is_directory(argv[i+1], ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec)) continue;
+                    if (it->path().extension() != ".map") continue;
+                    if (!one(it->path().string(), false)) A.bad++;
+                }
+            } else { if (!one(argv[i+1], true)) A.bad = 1; }
+            printf("heaptest: maps=%d objs=%d/%d heaps=%d/%d lists-ok=%d hash=%d\n",
+                   A.maps, A.secOk, A.sec, A.heapsOk, A.heaps, A.lists, A.hashes);
+            printf("heaptest: OBJT records=%ld  heap slots live/total=%ld/%ld\n",
+                   A.recs, A.live, A.slots);
+            for (auto& kv : A.byType) printf("heaptest:   %-14s %d\n", kv.first.c_str(), kv.second);
+            bool pass = A.bad == 0 && A.sec > 0 && A.secOk == A.sec &&
+                        A.heapsOk == A.heaps && A.lists == A.heaps;
+            printf("heaptest: %s\n", pass ? "PASS" : "FAIL");
+            return pass ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--addtest") && i + 4 < argc) {
             Scene s; if (!load_map_native(argv[i+1], s)) return 2;

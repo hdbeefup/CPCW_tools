@@ -57,10 +57,13 @@ FIELD_TYPE_NAMES = {
     FT_ARRAY:   'array',
 }
 
-# Map of all known types that use variable-length (length-prefix + payload)
-# encoding like strings do.  Anything else below 0x88 with size=0xFFFF is
-# assumed to follow the same pattern.
-_STRING_LIKE = {FT_STRING, FT_GUID, FT_REF, FT_FLAGS, FT_LOCSTR}
+# Types that use uint16-length-prefix + payload encoding, like strings.
+# FT_FLAGS (0x039C) is an on-disk ARRY of bools and FT_LOCSTR (0x002B) is a
+# uint32 character count + 2 bytes/char UTF-16LE -- reading either as a
+# u16-prefixed string desynchronises the rest of the record. Neither appears in
+# an entity schema, so this addon (which only reads entities) never hit it; kept
+# correct so an extension does not inherit the bug. docs/MAP_FORMAT.md §6.1.
+_STRING_LIKE = {FT_STRING, FT_GUID, FT_REF}
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
@@ -253,9 +256,18 @@ class ObjParser:
             return _u32(self.data, pos)
 
         if ftype == FT_FLOAT64:
+            # 8 bytes, but a PAIR OF FLOATS -- not a double. Same width either
+            # way, so only the values distinguish them: SLocation.Size reads
+            # 0..697 x 0..677 as vec2f and 7.5e9 / 2.3e20 as a double.
             if pos + 8 > limit: return None, limit
-            v, p = _f64(self.data, pos)
-            return round(v, 6), p
+            a, _ = _f32(self.data, pos)
+            b, _ = _f32(self.data, pos + 4)
+            return [round(a, 4), round(b, 4)], pos + 8
+
+        if ftype == FT_LOCSTR:
+            if pos + 4 > limit: return None, limit
+            n, p = _u32(self.data, pos)
+            return self.data[p:p + 2 * n].decode('utf-16-le', errors='replace'), p + 2 * n
 
         if ftype == FT_VEC3:
             if pos + 12 > limit: return None, limit

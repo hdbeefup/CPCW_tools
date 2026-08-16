@@ -24,8 +24,14 @@ enum {
     FT_INLINE1=0x0088, FT_INLINE2=0x0089, FT_BLOB=0x0165, FT_FLAGS=0x039C,
     FT_ARRAY=0x898A
 };
+// Only these three are u16-length-prefixed strings. FT_FLAGS (0x039C) is an
+// on-disk ARRY of bools and FT_LOCSTR (0x002B) is a u32 character count followed
+// by UTF-16LE — reading either as a u16-prefixed string desynchronises the rest
+// of the record. Neither appears in any entity schema, which is why the entity
+// path never noticed; the scenario trees use both. See heap.cpp for the general
+// container encoding and --heaptest for the check.
 static bool stringLike(uint32_t t) {
-    return t==FT_STRING||t==FT_GUID||t==FT_REF||t==FT_FLAGS||t==FT_LOCSTR;
+    return t==FT_STRING||t==FT_GUID||t==FT_REF;
 }
 
 // ---- little-endian readers over a raw buffer -------------------------------
@@ -163,10 +169,24 @@ struct Parser {
         if (ft==FT_INT16){ if(p+2>limit)return limit; out={V_INT}; out.i=D.i16(p); return p+2; }
         if (ft==FT_COLOR){ if(p+4>limit)return limit; out={V_INT}; out.i=(long)D.u32(p); return p+4; }
         if (ft==FT_IID||ft==FT_ENTREF){ if(p+4>limit)return limit; out={V_INT}; out.i=(long)D.u32(p); return p+4; }
-        if (ft==FT_FLOAT64){ if(p+8>limit)return limit; out={V_FLOAT}; out.f=D.f64(p); return p+8; }
+        // 0x0005 is a PAIR OF FLOATS, not a double. Both readings are 8 bytes, so
+        // no walk can tell them apart — the values do: SLocation.Size reads
+        // 0..697 x 0..677 as vec2f (ellipse half-extents in a world that tops out
+        // near 512x672) and 7.5e9 / 2.3e20 as a double.
+        if (ft==FT_FLOAT64){ if(p+8>limit)return limit; out={V_FLOAT}; out.f=D.f32(p); return p+8; }
         if (ft==FT_VEC3){ if(p+12>limit)return limit; out={V_VEC3}; out.v3[0]=D.f32(p); out.v3[1]=D.f32(p+4); out.v3[2]=D.f32(p+8); return p+12; }
         if (ft==FT_VEC2I||ft==FT_VEC2F){ if(p+8>limit)return limit; return p+8; }
-        if (ft==FT_ARRAY) return readArray(p, limit);
+        if (ft==FT_LOCSTR){ if(p+4>limit)return limit; return p+4+2*(size_t)D.u32(p); }
+        // A composite type id's LOW byte selects the container kind; the bytes
+        // above it are the element (and for HASH the key) type. 0x898A is only
+        // the commonest of these, not the only one.
+        {   uint32_t kind = ft & 0xFF;
+            if (kind==0x8A || kind==0x90 || kind==0x9C) return readArray(p, limit);
+            if (kind==0xA5 || kind==0xA6) {          // HEAP / HASH: skip the span
+                if (p+8>limit) return limit;
+                if (D.tag(p,"HEAP")||D.tag(p,"HASH")) return p+8+D.u32(p+4);
+            }
+        }
         if (ft==FT_INLINE1||ft==FT_INLINE2) return readInline(p, limit);
         if (ft==FT_BLOB){ size_t nb=(fs>0&&fs<0xFFFF)?fs:0; if(nb>0&&p+nb<=limit) return p+nb; return p; }
         if (fs>0 && fs<0xFFFF){ if(p+fs<=limit) return p+fs; return p; }
@@ -188,6 +208,7 @@ struct Parser {
         if (D.tag(p,"OBJT")) { parseObjt(p,e,tmp); return e; }
         if (D.tag(p,"VOBJ")) { parseVobj(p,e,tmp); return e; }
         if (D.tag(p,"ARRY")) return readArray(p, limit);
+        if (D.tag(p,"HEAP")||D.tag(p,"HASH")) return p+8+D.u32(p+4);
         return p;
     }
     void parseVobj(size_t pos, size_t& endOut, Obj& obj) {

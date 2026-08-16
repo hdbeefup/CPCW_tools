@@ -63,10 +63,19 @@ FIELD_TYPE_NAMES = {
     FT_ARRAY:   'array',
 }
 
-# Map of all known types that use variable-length (length-prefix + payload)
-# encoding like strings do.  Anything else below 0x88 with size=0xFFFF is
-# assumed to follow the same pattern.
-_STRING_LIKE = {FT_STRING, FT_GUID, FT_REF, FT_FLAGS, FT_LOCSTR}
+# Types that use uint16-length-prefix + payload encoding, like strings.
+# FT_FLAGS and FT_LOCSTR are deliberately NOT here: 0x039C is an on-disk ARRY of
+# bools and 0x002B is a uint32 character count + 2 bytes/char UTF-16LE. Reading
+# either as a u16-prefixed string desynchronises the rest of the record. Neither
+# appears in an entity schema, which is why the entity path never noticed.
+# See docs/MAP_FORMAT.md §6.1.
+_STRING_LIKE = {FT_STRING, FT_GUID, FT_REF}
+
+# A composite field type id's LOW byte selects the container kind; the bytes
+# above it give the element (and for HASH, the key) type.
+_KIND_ARRY = (0x8A, 0x90, 0x9C)
+_KIND_HEAP = 0xA5
+_KIND_HASH = 0xA6
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
@@ -274,9 +283,20 @@ class ObjParser:
             return _u32(self.data, pos)
 
         if ftype == FT_FLOAT64:
+            # 8 bytes, but a PAIR OF FLOATS -- not a double. Both readings are the
+            # same width so no structural walk can tell them apart; the values do.
+            # SLocation.Size reads 0..697 x 0..677 as vec2f (ellipse half-extents,
+            # world tops out near 512x672) and 7.5e9 / 2.3e20 as a double.
             if pos + 8 > limit: return None, limit
-            v, p = _f64(self.data, pos)
-            return round(v, 6), p
+            a, _ = _f32(self.data, pos)
+            b, _ = _f32(self.data, pos + 4)
+            return [round(a, 4), round(b, 4)], pos + 8
+
+        if ftype == FT_LOCSTR:
+            if pos + 4 > limit: return None, limit
+            n, p = _u32(self.data, pos)
+            raw = self.data[p:p + 2 * n]
+            return raw.decode('utf-16-le', errors='replace'), p + 2 * n
 
         if ftype == FT_VEC3:
             if pos + 12 > limit: return None, limit
@@ -297,8 +317,14 @@ class ObjParser:
             b, _ = _f32(self.data, pos + 4)
             return [round(a, 4), round(b, 4)], pos + 8
 
-        if ftype == FT_ARRAY:
-            return self._read_array(pos, limit)
+        kind = ftype & 0xFF
+        if kind in _KIND_ARRY:
+            return self._read_array(pos, limit, (ftype >> 8) & 0xFF)
+        if kind == _KIND_HEAP:
+            return self._read_heap(pos, limit)
+        if kind == _KIND_HASH:
+            return self._read_hash(pos, limit, (ftype >> 8) & 0xFF,
+                                   (ftype >> 16) & 0xFF)
 
         if ftype in (FT_INLINE1, FT_INLINE2):
             return self._read_inline(pos, limit)
@@ -317,7 +343,7 @@ class ObjParser:
         if fsize == 0xFFFF or fsize == 0:
             # Could be a string-like type or a nested chunk
             tag = self.data[pos:pos + 4]
-            if tag in (b'ARRY', b'OBJT', b'VOBJ'):
+            if tag in (b'ARRY', b'OBJT', b'VOBJ', b'HEAP', b'HASH'):
                 return self._read_inline(pos, limit)
             if pos + 2 <= limit:
                 slen, _ = _u16(self.data, pos)
@@ -327,7 +353,10 @@ class ObjParser:
 
         return f'<unknown:0x{ftype:04x}>', pos
 
-    def _read_array(self, pos, limit):
+    def _read_array(self, pos, limit, elem=0x89):
+        """Read an ARRY. `elem` is the element type from the field's composite id
+        (high byte) -- elements are NOT always OBJT. Deriving a width from
+        (size-4)/count instead gives non-integral results on real data."""
         if pos + 12 > limit or self.data[pos:pos + 4] != b'ARRY':
             return [], pos
         arr_size, _ = _u32(self.data, pos + 4)
@@ -339,13 +368,60 @@ class ObjParser:
         for _ in range(arr_count):
             if p >= arr_end:
                 break
-            if self.data[p:p + 4] == b'OBJT':
+            if elem in (FT_INLINE1, FT_INLINE2):
+                if self.data[p:p + 4] != b'OBJT':
+                    break
                 obj, p = self._parse_objt(p)
                 if obj:
                     items.append(obj)
             else:
-                break
+                val, p = self._read_field(p, elem, 0, arr_end)
+                items.append(val)
         return items, arr_end
+
+    def _read_heap(self, pos, limit):
+        """Read a HEAP slot pool. See docs/MAP_FORMAT.md §5.6. Returns the LIVE
+        records, each tagged with its slot index -- the slot index is the stable
+        key (SLocation carries a field literally named HeapIndex), and the used
+        chain is non-monotonic in slot index on 58 of the 924 shipped heaps."""
+        if pos + 32 > limit or self.data[pos:pos + 4] != b'HEAP':
+            return [], pos
+        size, _ = _u32(self.data, pos + 4)
+        end = pos + 8 + size
+        slot_count, _ = _u32(self.data, pos + 8)
+        p = pos + 32
+        items = []
+        for slot in range(slot_count):
+            if p + 9 > end:
+                break
+            is_free = self.data[p + 8]
+            p += 9
+            if is_free == 0:
+                obj, p = self._parse_objt(p)
+                if obj:
+                    obj['_heapIndex'] = slot
+                    items.append(obj)
+        return items, end
+
+    def _read_hash(self, pos, limit, keyft=FT_STRING, valft=FT_INLINE2):
+        """Read a HASH (string-keyed object map). See docs/MAP_FORMAT.md §5.7."""
+        if pos + 12 > limit or self.data[pos:pos + 4] != b'HASH':
+            return OrderedDict(), pos
+        size, _ = _u32(self.data, pos + 4)
+        end = pos + 8 + size
+        count, _ = _u32(self.data, pos + 8)
+        p = pos + 12
+        out = OrderedDict()
+        for _ in range(count):
+            if p >= end:
+                break
+            key, p = self._read_field(p, keyft, 0, end)
+            if valft in (FT_INLINE1, FT_INLINE2):
+                val, p = self._parse_objt(p)
+            else:
+                val, p = self._read_field(p, valft, 0, end)
+            out[str(key)] = val
+        return out, end
 
     def _read_inline(self, pos, limit):
         if pos + 8 > limit:
@@ -357,6 +433,10 @@ class ObjParser:
             return self._parse_vobj(pos)
         if tag == b'ARRY':
             return self._read_array(pos, limit)
+        if tag == b'HEAP':
+            return self._read_heap(pos, limit)
+        if tag == b'HASH':
+            return self._read_hash(pos, limit)
         return None, pos
 
 

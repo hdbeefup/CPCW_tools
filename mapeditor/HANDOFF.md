@@ -30,6 +30,7 @@ $E --addtest --deltest --heighttest --applytest --overlaytest
 $E --chunktile  <map|dir>                  # container sizes tile exactly (see below)
 $E --overlayscan <map|dir>                 # GROL/GDCL/GRVL pools + used-list invariants
 $E --wthrtest   <map|dir> [out.map]        # WTHR layout + field-order semantics
+$E --heaptest   <map|dir>                  # scenario trees: every OBJS section walks to its SCHD
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -235,6 +236,32 @@ correctly rejected).
   six lanes, the signature of one field read at six offsets). The old
   `(1,1,1,1,1,1)`=passable table and the "251 cell patterns" figure were both
   artifacts of that misalignment. Values are still undecoded: **read-only**.
+- **A schema field's type id is COMPOSITE: the low byte is the container kind.**
+  `0x8A`/`0x90`/`0x9C` -> `ARRY`, `0xA5` -> `HEAP`, `0xA6` -> `HASH`; the bytes
+  above it are the element (and for HASH the key) type. So `0x148A` is an array
+  of entrefs, `0x1790` an array of bytes, `0x039C` an array of *bools* (not the
+  "flags string" the tools assumed), `0x89A5` a heap of objects and `0x8904A6` a
+  string->object hash. `0x??90` and `0x??8A` are indistinguishable on disk — both
+  write a plain `ARRY`. Do NOT derive an element width from `(size-4)/count`: it
+  gives 18.00/23.27/32.40/24.50 on four real trigger folders.
+- **`HEAP`'s six header dwords are in a DIFFERENT ORDER from the other slot
+  pools**: `slotCount, usedCount, freeHead, freeTail, listHead, listTail` — count
+  first, no trailing capacity — then `slotCount × {i32 prev, i32 next, u8 isFree}`
+  with an `OBJT` only when `isFree == 0`. Note `prev` precedes `next`. `SLocation`
+  has a field literally named `HeapIndex`: the **slot index is the stable key**,
+  and the used chain is non-monotonic in slot index on 58 of 924 heaps.
+- **Three field-type readings were wrong, and all three are invisible on
+  entities.** `0x0011` GUID and `0x0012` ref are u16-length-prefixed *strings*,
+  not 4-byte handles (fixing them at 4 desynchronises 133/225 OBJS sections);
+  `0x002B` locstr is a **u32 character count + 2 bytes/char UTF-16LE**, not a
+  u16-prefixed string; `0x0005` is a **pair of floats, not a double**. The last
+  one cannot be settled by any structural walk — both readings are 8 bytes — only
+  by values: `SLocation.Size` reads 0..697 x 0..677 as vec2f (ellipse
+  half-extents, world tops out near 512x672) and 7.5e9/2.3e20 as a double.
+  Entity records reach exactly `{0x01,0x02,0x03,0x04,0x06,0x12,0x14,0x17,0x19,
+  0x88,0x898A}` across all 45 maps, which contains none of the corrected types —
+  so the fixes are inert on entities **by construction**, and `--selftest` is
+  byte-identical before and after.
 
 ## OPEN issues
 1. **Merged-tank "track explosion" (17 heavy tanks) — DEFERRED, the one genuinely
@@ -262,10 +289,15 @@ correctly rejected).
    handles), river editing, and create/delete for any of them (structural).
    NOTE `g_overlayDirty` — the decal meshes are BAKED geometry, so an edit
    without a re-decode + `buildOverlays` is correct and completely invisible.
-6. **Not decoded at all**: the trigger system (Lua bodies), which is behind an
-   undecoded `HEAP` (type 0x89A5) — a tag-first walk reaches 0 of 1265 SLocation.
-   `View > Map chunks` is the read-only starting point — inspect the bytes, don't
-   invent fields, and land the layout in `docs/MAP_FORMAT.md` before building UI.
+6. **The scenario object trees are DECODED (read-only); only the Lua trigger
+   bodies remain.** The `HEAP` (type `0x89A5`) that used to block this is solved
+   and documented in `docs/MAP_FORMAT.md` §5.6/§5.7/§6.1. `--heaptest` walks all
+   45 maps: **225/225 OBJS sections consume to exactly their own SCHD offset**
+   (164,540 OBJT records, 924 HEAPs, 45 HASHes, 0 bytes left over), and the walk
+   reaches all 1265 SLocation / 260 SGroup / 167 SObjective / 139 TriggerVar /
+   116 SCameraPath — the counts a brute-force VOBJ tag scan finds. A tag-first
+   walk reached **none** of them. Still open: what a trigger's Lua body *means*,
+   and any UI or write path (deliberately out of scope — this was a decode spike).
    - `WTHR` is **decoded and editable** (Light mode). Still open: the horizontal
      sun swizzle, so nothing lights the viewport yet.
    - `GRVL`/`GRVR` rivers are **decoded and drawn** (River mode, read-only). Still
@@ -278,6 +310,13 @@ correctly rejected).
 7. **Strings are read-only in Properties** — editing one would resize the record.
    Doing it properly means patching the enclosing VOBJ/OBJT sizes as well as the
    container chain; the machinery for the container chain already exists.
+   Now unblocked on the format side: `OBJS.schema_offset` is the **only** absolute
+   file offset in a `.map`, so a resize needs the ancestor sizes plus that one
+   dword and nothing else. Checked by enumerating all 285,272 integer-typed field
+   values in the scenario trees of all 45 maps — hits on chunk-tag positions run
+   at 1.22x the local-density chance rate and no field exceeds a ~5% hit rate,
+   where a real pointer field would sit at 100%. Use `--chunktile` **and**
+   `--heaptest` as the detectors; the oracle validates neither.
 8. ~~No settings persistence.~~ **CLOSED.** `src/settings.{h,cpp}` — a versioned
    `key value` file beside the exe, unknown keys preserved, one `if (v < N)`
    migration block per bump. Two ordering constraints that are easy to get wrong:

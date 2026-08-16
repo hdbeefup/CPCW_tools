@@ -273,21 +273,79 @@ the parser).
 0x00    4     tag     "ARRY"
 0x04    4     uint32  Content size
 0x08    4     uint32  Element count
-0x0C    ...           OBJT elements (repeated [count] times)
+0x0C    ...           count x element
 ```
 
-### 5.6 HEAP — Object Heap / Index
+Elements are **not** always `OBJT`. The element type comes from the field's own
+composite type id (§6.1): `0x898A` is an array of objects, `0x148A` an array of
+4-byte entrefs, `0x1790` an array of bytes, and so on. Deriving an element width
+from `(size - 4) / count` instead gives non-integral results (18.00, 23.27,
+32.40, 24.50 on four real trigger folders) — use the schema, not the arithmetic.
+
+### 5.6 HEAP — object slot pool — **SOLVED**
+
+`HEAP` is the container the whole scenario layer hangs off: locations,
+objectives, trigger variables, groups and camera paths all live in one. It is
+the same slot pool the engine uses for `WTHR`/`PATH`/`CAMS` and
+`GROL`/`GDCL`/`GRVL` (§4.9, §9), but **its six header dwords are in a different
+order** — `slotCount` leads and there is no trailing capacity:
 
 ```
 0x00    4     tag     "HEAP"
 0x04    4     uint32  Content size
-0x08    4     uint32  Capacity
-0x0C    4     uint32  Count (active entries)
-0x10    ...           Index entries + inline OBJT data
+0x08    4     uint32  slotCount     -- physical slots that follow
+0x0C    4     uint32  usedCount     -- live records
+0x10    4     int32   freeHead      -- -1 when nothing is free
+0x14    4     int32   freeTail
+0x18    4     int32   listHead      -- head of the USED chain
+0x1C    4     int32   listTail
+0x20    ...           slotCount x slot
 ```
 
-Used for indexed collections (e.g. cursor hotkey bindings, location heaps).
-Entries contain sentinel values (0xFFFFFFFF) for unused slots.
+Each slot is a 9-byte header, followed by an `OBJT` **only when the slot is
+live**:
+
+```
++0x00   4     int32   prev          -- -1 at the head of its chain
++0x04   4     int32   next          -- -1 at the tail
++0x08   1     uint8   isFree        -- 0 = live, 1 = free
++0x09   ...           OBJT record   -- present only when isFree == 0
+```
+
+An empty pool ships `slotCount = 0` and all four indices `-1`; 765 of the 924
+shipped heaps are empty this way.
+
+**Slot index is the stable key, not position in the chain.** `SLocation` carries
+a field literally named `HeapIndex` — the engine's own name for it. The used
+chain is non-monotonic in slot index on 58 of the 924 shipped heaps, so
+iterating the slot array and walking `listHead → next` give different orders.
+
+Verified across all 45 shipped maps by `mapeditor --heaptest`:
+
+| Measure | Result |
+|---|---|
+| HEAPs walking to exactly their chunk end | 924 / 924 |
+| Both chains valid (length, `prev`/`next` inverse, `-1` ends, disjoint) | 924 / 924 |
+| Live slots | 1947 of 2616 |
+| `SLocation` / `SGroup` / `SObjective` / `TriggerVar` / `SCameraPath` | 1265 / 260 / 167 / 139 / 116 |
+
+Those five counts equal a brute-force scan of every `VOBJ` tag carrying the
+matching per-map type id, so the walk reaches **all** of them — a tag-first scan,
+which is what the tools did before, reached **none**.
+
+### 5.7 HASH — string-keyed object map — **SOLVED**
+
+```
+0x00    4     tag     "HASH"
+0x04    4     uint32  Content size
+0x08    4     uint32  Entry count
+0x0C    ...           count x { key, value }
+```
+
+Key and value types come from the field's own type id (§6), not from the chunk.
+The only instance in a shipped map is `SLuaHandler.Triggers` (type `0x8904A6`,
+one per map, 45 total): a `uint16`-length-prefixed ASCII key such as
+`joinUs4_OnLocationEntered` mapping to an `OBJT`. This is the trigger table.
 
 ---
 
@@ -299,7 +357,7 @@ Entries contain sentinel values (0xFFFFFFFF) for unused slots.
 | `0x0002` | float     | 4       | IEEE 754 single-precision |
 | `0x0003` | bool      | 1       | 0 = false, nonzero = true |
 | `0x0004` | string    | var     | uint16 length + ASCII bytes |
-| `0x0005` | float64   | 8       | 64-bit double or 2D double-vector |
+| `0x0005` | **vec2f** | 8       | **2 floats, NOT a double** — see below |
 | `0x0006` | vec3      | 12      | 3 consecutive floats (x, y, z) |
 | `0x0011` | GUID      | var     | uint16 length + ASCII GUID string |
 | `0x0012` | ref       | var     | uint16 length + reference path |
@@ -310,17 +368,83 @@ Entries contain sentinel values (0xFFFFFFFF) for unused slots.
 | `0x0017` | uint8     | 1       | Unsigned byte |
 | `0x0018` | color     | 4       | RGBA packed uint32 |
 | `0x0019` | int16     | 2       | Signed 16-bit integer |
-| `0x002B` | locstr    | var     | Localized string (uint16 len + data) |
+| `0x002B` | locstr    | var     | **uint32 char count + 2 bytes/char UTF-16LE** |
 | `0x0088` | object    | var     | Inline OBJT chunk |
 | `0x0089` | object2   | var     | Inline OBJT or VOBJ chunk |
 | `0x0165` | blob      | fixed   | Raw binary (size from schema) |
-| `0x018A` | int_arr   | var     | Packed integer array |
-| `0x039C` | flags     | var     | uint16 length + flags string |
-| `0x898A` | array     | var     | ARRY chunk |
 
-Additional type codes seen in specific schemas (0x0390, 0x0490, 0x1290, 0x1490,
-0x1790, 0x1990, 0x8990, 0x89A5, 0x8904A6, etc.) are variants of array/inline
-types used by specific subsystems. They follow the ARRY or OBJT encoding.
+### 6.1 Composite type ids — the container encoding — **SOLVED**
+
+Everything above `0x0165` is a **composite** id, not a distinct type. The **low
+byte selects the container kind** and the bytes above it give the element type
+(and for `HASH`, the key type as well):
+
+| Low byte | Container | On-disk form |
+|---|---|---|
+| `0x8A` | ARRY | `'ARRY' u32 size u32 count` + elements |
+| `0x90` | ARRY | identical on disk to `0x8A` |
+| `0x9C` | ARRY | identical on disk to `0x8A` |
+| `0xA5` | HEAP | §5.6 |
+| `0xA6` | HASH | §5.7 |
+
+So the "extra" codes decode mechanically:
+
+| Id | Reads as | Example field |
+|---|---|---|
+| `0x018A` | ARRY of int32 | `SP2ScenarioSettings.ActiveTimeLimits` |
+| `0x048A` | ARRY of string | `STriggerFolderEntry.Triggers` |
+| `0x128A` | ARRY of ref | `SBuyableUnit.ForbiddenSkills` |
+| `0x148A` | ARRY of entref | `SGroup.Members` |
+| `0x898A` | ARRY of object | the common case |
+| `0x0190` | ARRY of int32 | `SP2Player.PredefinedGroupIndex` |
+| `0x0390` | ARRY of bool | `SGeneralSpeech.SpeechEnabled` |
+| `0x1790` | ARRY of uint8 | `SAlliance.Table` (count 256) |
+| `0x8990` | ARRY of object | `SP2TeamInfo.Players` |
+| `0x039C` | ARRY of bool | `SP2ScenarioSettings.CanChangeSettings` |
+| `0x89A5` | HEAP of object | `SP2World.LocationsHeap` |
+| `0x8904A6` | HASH string → object | `SLuaHandler.Triggers` |
+
+`0x??90` and `0x??8A` are the *same thing on disk* — both write a plain `ARRY`
+chunk. The distinction is a runtime one (fixed-capacity vs growable) that leaves
+no trace in the file. `0x039C`, which the tools called `flags`, is simply an
+`ARRY` of bools, consistent with its high byte `0x03` = bool.
+
+### 6.2 Three corrections these rules make to earlier readings
+
+1. **`0x0011` GUID and `0x0012` ref are variable-length strings, not 4-byte
+   handles.** Reading them as 4 bytes desynchronises 133 of the 225 `OBJS`
+   sections.
+2. **`0x002B` locstr is *not* `uint16` length + bytes.** It is a `uint32`
+   *character* count followed by two bytes per character.
+3. **`0x0005` is a pair of floats, not a double.** Both readings are 8 bytes, so
+   no structural walk can tell them apart — only the values can.
+   `SLocation.Size` (ellipse half-extents) reads `0..697 × 0..677` as a vec2f in
+   a world that tops out near 512×672, and `7.5e9` / `2.3e20` as a double, over
+   all 1265 records.
+
+None of the three appears in an entity schema, which is why the entity path
+never noticed: entity schemas use only
+`{0x01,0x02,0x03,0x04,0x06,0x12,0x14,0x17,0x19,0x88,0x898A}`. Applying all three
+fixes leaves `--selftest` byte-identical on every map.
+
+### 6.3 Verification
+
+With these rules, **all 225 `OBJS` sections in all 45 shipped maps parse to
+exactly the byte where their own `SCHD` table begins** — 164,540 `OBJT` records,
+924 `HEAP`s, 45 `HASH`es, zero bytes left over. A wrong width anywhere in any
+schema desynchronises the remainder of the tree, so this is a statement about
+every field of every record, not just about the containers.
+
+Two independent implementations agree on every count: `mapeditor --heaptest`
+(`mapeditor/src/heap.cpp`) and the Python probe used to derive the layout.
+
+**Absolute offsets.** `OBJS.schema_offset` is the only absolute file offset in a
+`.map`. Checked by enumerating all 285,272 integer-typed field values in the
+scenario trees of all 45 maps and testing whether any lands on a chunk-tag
+position: hits run at 1.22× the local-density chance rate, and no field exceeds a
+~5% hit rate where a real pointer field would sit at 100%. This is what makes
+variable-length string editing tractable — only the ancestor chunk sizes and that
+one dword need patching.
 
 ---
 
