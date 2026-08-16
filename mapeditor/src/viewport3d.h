@@ -171,7 +171,7 @@ public:
             "#version 330 core\n"
             "in vec3 vN; in vec2 vUV; in vec3 vWorld; out vec4 F;\n"
             "uniform vec3 uLight, uColor, uSunCol, uAmb; uniform sampler2D uTex;\n"
-            "uniform int uHasTex, uAlphaTest, uLightMode;\n"
+            "uniform int uHasTex, uAlphaTest, uLightMode; uniform float uAlpha;\n"
             "uniform vec3 uFogCol, uEye; uniform float uFogNear, uFogFar; uniform int uFogOn;\n"
             "void main(){\n"
             " vec4 tx = uHasTex==1 ? texture(uTex, vec2(vUV.x, 1.0-vUV.y)) : vec4(uColor,1.0);\n"
@@ -188,7 +188,8 @@ public:
             " if(uLightMode==0){ lit=vec3(amb + 0.60*key + 0.16*fill); }\n"
             " else { lit=uAmb*mix(0.85,1.15,n.y*0.5+0.5) + uSunCol*(0.60*key) + 0.16*fill; }\n"
             " vec3 c=pow(tx.rgb*lit, vec3(1.0/2.2));\n"                      // gamma (fixes muddy)
-            " F=vec4(c,1.0);\n"
+            " F=vec4(c,uAlpha);\n"                                           // uAlpha=1 except the ghost
+
             " if(uFogOn==1){ float fg=clamp((distance(vWorld,uEye)-uFogNear)/max(uFogFar-uFogNear,1e-3),0.0,1.0);\n"
             "   F.rgb=mix(F.rgb,uFogCol,fg); }\n"
             "}\n");
@@ -198,6 +199,7 @@ public:
         uMdlColor=glGetUniformLocation(modelProg,"uColor");
         uMdlHasTex=glGetUniformLocation(modelProg,"uHasTex");
         uMdlAlphaTest=glGetUniformLocation(modelProg,"uAlphaTest");
+        uMdlAlpha=glGetUniformLocation(modelProg,"uAlpha");
         uMdlSun=glGetUniformLocation(modelProg,"uSunCol");
         uMdlAmb=glGetUniformLocation(modelProg,"uAmb");
         uMdlLightMode=glGetUniformLocation(modelProg,"uLightMode");
@@ -398,6 +400,32 @@ public:
         if (scale > 0.0f && scale != 1.0f) xf = mul(xf, scaleM(scale, scale, scale));
         return xf;
     }
+    // ---- placement ghost ----------------------------------------------------
+    // A translucent preview of the armed prototype, following the cursor. It is
+    // deliberately NOT a ModelInst and NOT in `instances`: everything that can
+    // select, box, probe or hit-test a model iterates that vector, so keeping the
+    // ghost out of it is what guarantees it can never be picked, never widens a
+    // selection AABB and never shows up in the pick buffer. Render-only, always.
+    GLModel* ghostModel = nullptr;
+    M4       ghostXf;
+    bool     ghostOn = false;
+
+    // `modelPath` is the LOGICAL path from ProtoDB; it must go through the VFS to
+    // become a real file (or an extracted-from-.pak temp), exactly as buildModels
+    // does. Handing loadModel the logical path silently resolves nothing.
+    void setGhost(const std::string& modelPath, const std::string& dataRoot,
+                  const V3& wp, float yawDeg, float scale) {
+        if (modelPath.empty()) { ghostOn = false; return; }
+        buildTexIndex(dataRoot);
+        std::string real = vfs_resolve(modelPath, dataRoot);
+        ghostModel = real.empty() ? nullptr : loadModel(real);
+        if (!ghostModel) { ghostOn = false; return; }
+        ghostXf = entityXform(wp, yawDeg, scale);
+        ghostOn = true;
+    }
+    void clearGhost() { ghostOn = false; ghostModel = nullptr; }
+    V3 ghostCenter() const { return V3{ ghostXf.m[12], ghostXf.m[13], ghostXf.m[14] }; }
+
     // Live-update one entity's model transform (fast: just its matrix, no rebuild)
     // so drag-move is smooth.
     void moveInstance(int entIdx, const V3& wp, float yawDeg, float scale = 1.0f) {
@@ -960,6 +988,7 @@ public:
             glUniform3fv(uMdlSun,1,sunColor);
             glUniform3fv(uMdlAmb,1,ambient);
             glUniform1i(uMdlLightMode, lightMode);
+            glUniform1f(uMdlAlpha, 1.0f);        // opaque; only the ghost lowers it
             setFogUniforms(uMdlFogCol,uMdlFogNear,uMdlFogFar,uMdlFogOn,uMdlEye,cam);
             float col[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,col);
             // flipModelX reflects each model in its LOCAL X. Combined with loadModel's
@@ -1050,6 +1079,35 @@ public:
                 }
             glDepthMask(GL_TRUE);
             glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_BLEND);
+        }
+        // Placement ghost, last: it is translucent, so it must composite over the
+        // finished scene. Depth test ON (it should be hidden behind a building it
+        // is standing behind) but depth WRITE off, so it never occludes anything
+        // real and leaves no trace in the depth buffer for later passes.
+        if (ghostOn && ghostModel && !wireframe) {
+            glUseProgram(modelProg);
+            glUniform3fv(uMdlLight,1,sunDir);
+            glUniform3fv(uMdlSun,1,sunColor);
+            glUniform3fv(uMdlAmb,1,ambient);
+            glUniform1i(uMdlLightMode, lightMode);
+            glUniform1i(uMdlFogOn, 0);           // a cursor preview should not fade out
+            float gcol[3]={0.72f,0.72f,0.75f}; glUniform3fv(uMdlColor,1,gcol);
+            glUniform1f(uMdlAlpha, 0.45f);
+            M4 mvpG = mul(mvp, ghostXf);
+            glUniformMatrix4fv(uMdlMVP,1,GL_FALSE,mvpG.m);
+            glUniformMatrix4fv(uMdlModel,1,GL_FALSE,ghostXf.m);
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glBindVertexArray(ghostModel->vao);
+            for (auto& part : ghostModel->parts) {
+                glUniform1i(uMdlHasTex, part.tex ? 1 : 0);
+                glUniform1i(uMdlAlphaTest, part.alphaTest ? 1 : 0);
+                if (part.tex) glBindTexture(GL_TEXTURE_2D, part.tex);
+                glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT,
+                               (void*)(size_t)(part.off * sizeof(unsigned)));
+            }
+            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+            glUniform1f(uMdlAlpha, 1.0f);
         }
         if (showDots && entCount) {
             glUseProgram(entProg);
@@ -1315,7 +1373,7 @@ private:
     GLuint modelProg=0;
     GLint uMdlMVP=-1, uMdlModel=-1, uMdlLight=-1, uMdlColor=-1, uMdlHasTex=-1, uMdlAlphaTest=-1;
     GLint uMdlSun=-1, uMdlAmb=-1, uMdlLightMode=-1, uMdlFogCol=-1, uMdlFogNear=-1,
-          uMdlFogFar=-1, uMdlFogOn=-1, uMdlEye=-1;
+          uMdlFogFar=-1, uMdlFogOn=-1, uMdlEye=-1, uMdlAlpha=-1;
     bool modelsBuilt=false;
     std::map<std::string, GLuint> texCache;    // basename -> GL texture
     std::map<std::string, std::pair<int,int>> texDim;  // basename -> (w,h) pixels

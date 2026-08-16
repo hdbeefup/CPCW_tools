@@ -44,7 +44,11 @@ it), `G` drops the selection onto the terrain. Drag an entity to move it,
 
 **Edit entities** — place any of the ~2000 ProtoDB prototypes (searchable browser
 with thumbnails, categories and favourites), cut/copy/paste including paste-in-
-place, duplicate, delete. A schema-driven Properties panel exposes every
+place, duplicate, delete. With the Place tool armed, a **translucent ghost of the
+model follows the cursor** so you can see where and at what angle it will land —
+`[` / `]` aim it before the click, and grid/angle snap applies to both. The ghost
+is render-only: it is never a scene instance, so it can never be picked, never
+widens a selection box and never reaches the pick buffer. A schema-driven Properties panel exposes every
 fixed-width field the record declares — HP, Level, XP, Ammo, armour, Scale,
 Elevation, garrison, and so on.
 
@@ -125,6 +129,7 @@ Every write path has a no-window check that runs from the command line:
 | `--sunprobe <map>` | score the four sun-swizzle candidates against the legacy light (reports, does not score a winner) |
 | `--settingstest <tmp.ini>` | settings parse, save/reload round-trip, unknown-key preservation, recent-list capping |
 | `--crashtest` | fault on purpose; the report must name the faulting function |
+| `--ghost <guid\|#N> <wx> <wy>` | arm the placement ghost headlessly — with `--shot` it must draw, with `--picktest` the counts must be unchanged |
 | `--uishot-mode <n>` | which mode's panel a `--uishot` captures |
 | `--paktest` `--protodbtest` `--thumbtest` `--srmcheck` | archive, prototype DB, thumbnails, model |
 

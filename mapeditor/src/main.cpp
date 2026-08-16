@@ -958,7 +958,7 @@ static int templateForProto(const std::string& guid, std::string& why) {
 }
 
 // Place `guid` at world XZ, grounded. Returns the new entity ID or -1.
-static long placePrototypeAt(const std::string& guid, float wx, float wy) {
+static long placePrototypeAt(const std::string& guid, float wx, float wy, float yaw = 0.0f) {
     if (g_scene.raw.empty() || g_srcMap.empty()) return -1;
     std::string why;
     int ti = templateForProto(guid, why);
@@ -977,6 +977,14 @@ static long placePrototypeAt(const std::string& guid, float wx, float wy) {
         return -1;
     }
     afterStructural(newId);
+    // Apply the ghost's yaw to the placed copy, so what you previewed is what you
+    // get. Done after the insert because the entity does not exist until then;
+    // the CMD_ADD below still carries the original OBJT bytes, so undo removes
+    // the whole record regardless.
+    if (yaw != 0.0f) {
+        int ni = entityIndexById(newId);
+        if (ni >= 0) { g_scene.entities[(size_t)ni].dir = yaw; g_edited.insert(newId); }
+    }
     EditCmd c; c.kind = CMD_ADD; c.entId = newId; c.objt = std::move(blob);
     c.entIndex = entityIndexById(newId);
     pushCmd(std::move(c));
@@ -1144,6 +1152,32 @@ static bool  g_browseFavOnly = false;
 static bool  g_browseOnMapOnly = false;
 static std::set<std::string> g_favourites;      // proto guids
 static std::string g_placeProto;                // guid selected for placement
+static float g_placeYaw = 0.0f;                 // ghost heading; [ / ] aim it
+static std::string g_ghostArg;                  // --ghost <guid|#N> <wx> <wy>
+static float g_ghostAt[2] = {0, 0};
+
+// Arm the ghost from --ghost, for headless checks. Returns false when not asked.
+static bool applyGhostArg() {
+    if (g_ghostArg.empty() || !g_scene.loaded) return false;
+    std::string guid = g_ghostArg;
+    if (guid[0] == '#') {                        // Nth distinct prototype on the map
+        int want = atoi(guid.c_str() + 1), seen = 0;
+        std::set<std::string> uniq;
+        guid.clear();
+        for (const Entity& e : g_scene.entities) {
+            if (e.proto.empty() || !uniq.insert(e.proto).second) continue;
+            if (seen++ == want) { guid = e.proto; break; }
+        }
+        if (guid.empty()) return false;
+    }
+    std::string mp = modelPathForProto(guid);
+    V3 wp{ g_ghostAt[0], terrainHeightAt(g_ghostAt[0], g_ghostAt[1]), g_ghostAt[1] };
+    if (!mp.empty()) g_vp.setGhost(mp, g_dataRoot, wp, g_placeYaw, 1.0f);
+    printf("ghost: guid=%s model=%s at (%.1f,%.1f,%.1f) armed=%d\n",
+           guid.c_str(), mp.empty() ? "(unresolved)" : mp.c_str(),
+           wp.x, wp.y, wp.z, (int)g_vp.ghostOn);
+    return g_vp.ghostOn;
+}
 
 static void drawPrototypeBrowser() {
     ensureProtoIndex();
@@ -2363,10 +2397,31 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
     // Place-on-click: with a browser prototype selected and the Place tool active
     // (Object/Unit/Ambient), left-click on terrain drops a grounded instance there.
     bool placing = g_scene.loaded && !g_placeProto.empty() && activeToolIsPlace();
+    // Ghost preview: show WHERE and at WHAT ANGLE the click will drop the model,
+    // before committing to it. Render-only — see Viewport3D::setGhost for why it
+    // is deliberately not a scene instance.
+    {
+        float gx, gy;
+        if (over && placing && terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
+            if (g_snapOn && g_snapGrid > 0.0f) {     // land where the gizmo would
+                gx = std::round(gx / g_snapGrid) * g_snapGrid;
+                gy = std::round(gy / g_snapGrid) * g_snapGrid;
+            }
+            std::string mp = modelPathForProto(g_placeProto);
+            V3 wp{ gx, terrainHeightAt(gx, gy), gy };
+            g_vp.setGhost(mp, g_dataRoot, wp, g_placeYaw, 1.0f);
+        } else {
+            g_vp.clearGhost();
+        }
+    }
     if (over && placing && ImGui::IsMouseClicked(0)) {
         float gx, gy;
         if (terrainHit(io.MousePos, cmin, cmax, gx, gy)) {
-            placePrototypeAt(g_placeProto, gx, gy);
+            if (g_snapOn && g_snapGrid > 0.0f) {
+                gx = std::round(gx / g_snapGrid) * g_snapGrid;
+                gy = std::round(gy / g_snapGrid) * g_snapGrid;
+            }
+            placePrototypeAt(g_placeProto, gx, gy, g_placeYaw);
             return;   // consumed the click; don't also pick/move an entity
         }
     }
@@ -2758,6 +2813,15 @@ int main(int argc, char** argv) {
         // Accepts a name OR "#<slot>" — preset names are not unique (one map ships
         // two live presets both called Night_multi).
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc) g_presetArg = argv[++i];
+        // dev: --ghost <guid|#N> <wx> <wy> — arm the placement ghost at a fixed
+        // world point, so a headless --shot / --picktest pair can check both that
+        // it DRAWS and that it stays out of the pick buffer. There is no mouse in
+        // a headless run, so the cursor path cannot be exercised any other way.
+        else if (!strcmp(argv[i], "--ghost") && i + 3 < argc) {
+            g_ghostArg = argv[++i];
+            g_ghostAt[0] = (float)atof(argv[++i]);
+            g_ghostAt[1] = (float)atof(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--no-rivers")) g_vp.showRivers = false;
         else if (!strcmp(argv[i], "--no-roads"))  g_vp.showRoads  = false;
         else if (!strcmp(argv[i], "--no-decals")) g_vp.showDecals = false;
@@ -3399,6 +3463,17 @@ int main(int argc, char** argv) {
         glViewport(0, 0, fbw, fbh);
         glEnable(GL_DEPTH_TEST);
         syncEnvironment();
+        // Frame the camera on the ghost for a --shot. Without this the default
+        // whole-map view renders a doodad at one or two pixels and a pixel diff
+        // cannot tell "drawn" from "not drawn" — the first run of this check
+        // reported 1 changed pixel for a metal barrel and 0 for a bush, which
+        // proved nothing either way. Deliberately NOT done for --picktest: moving
+        // the camera there would push 3164 of 3191 instances off-screen and make
+        // the with/without-ghost counts incomparable.
+        if (applyGhostArg()) {
+            g_cam.target = g_vp.ghostCenter();
+            if (g_cam.dist > 25.0f) g_cam.dist = 25.0f;
+        }
         // Clear to the fog colour when fog is on, or distant terrain fades into a
         // band of sky that the background then cuts off.
         if (g_vp.fogOn) glClearColor(g_vp.fogColor[0], g_vp.fogColor[1], g_vp.fogColor[2], 1.0f);
@@ -3422,6 +3497,11 @@ int main(int argc, char** argv) {
         g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
         g_vp.buildSplatTextures(g_scene, g_dataRoot);
         g_vp.buildModels(g_scene, g_dataRoot);
+        // Arming the ghost here is the point of `--picktest --ghost ...`: the
+        // numbers below must come out IDENTICAL with and without it. The ghost
+        // being unpickable is a structural claim (it is not in `instances`, which
+        // is the only thing renderPickBuffer walks) and this is what checks it.
+        applyGhostArg();
         const int W = 1360, H = 850;
         if (!g_vp.pickPassReady()) { printf("picktest: pick program failed to build\n"); return 3; }
         Camera wideCam = g_cam;
@@ -3595,6 +3675,17 @@ int main(int argc, char** argv) {
             Entity& e = g_scene.entities[g_selected];
             if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { snapEntity(g_selected); e.dir -= 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
             if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { snapEntity(g_selected); e.dir += 5; g_edited.insert(e.id); g_modelsDirty = true; commitEntity(); }
+        }
+        // ...and with nothing selected they aim the placement ghost instead, so a
+        // model can be oriented BEFORE it is dropped rather than placed and then
+        // fixed up.
+        else if (!kio.WantCaptureKeyboard && !g_placeProto.empty() && activeToolIsPlace()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  g_placeYaw -= 5.0f;
+            if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) g_placeYaw += 5.0f;
+            if (g_snapOn && g_snapAngle > 0.0f)
+                g_placeYaw = std::round(g_placeYaw / g_snapAngle) * g_snapAngle;
+            while (g_placeYaw >= 360.0f) g_placeYaw -= 360.0f;
+            while (g_placeYaw < 0.0f)    g_placeYaw += 360.0f;
         }
 
         ImGui::SetNextWindowBgAlpha(0.35f);
