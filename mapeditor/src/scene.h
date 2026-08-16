@@ -127,6 +127,14 @@ struct Scene {
     };
     std::vector<RoadRec> roadRecs;
     int roadEdited = 0;                  // how many road nodes differ from the file
+    // BLCK block grid: TWO planes at BLCK's OWN header dims (docs §8). The dims
+    // are world*2 on only 41 of 45 maps — the other four are padded by exactly 32
+    // texels (16 world units) on one or both axes — so never derive them from
+    // WRLD. Resolution is 0.5 world units per texel with the padding at the far
+    // edge, so the plane covers blckW*0.5 x blckH*0.5 world units. READ-ONLY.
+    int blckW = 0, blckH = 0;
+    std::vector<unsigned short> blckFlags;
+    std::vector<unsigned char>  blckTypes;
     // Scenario records (locations / objectives / trigger vars / groups / camera
     // paths) out of the HEAP slot pools. READ-ONLY — see docs/MAP_FORMAT.md §5.6.
     ScenarioData scen;

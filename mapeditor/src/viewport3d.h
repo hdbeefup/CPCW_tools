@@ -113,11 +113,16 @@ public:
             "in vec3 vN; in float vH; in vec3 vCol; in vec3 vWorld; out vec4 F;\n"
             "uniform vec3 uLight, uSunCol, uAmb; uniform int uUseColor, uLightMode;\n"
             "uniform vec3 uFogCol, uEye; uniform float uFogNear, uFogFar; uniform int uFogOn;\n"
+            "uniform sampler2D uBlockTex; uniform int uBlockOn; uniform vec2 uBlockScale;\n"
             "void main(){ vec3 n=normalize(vN);\n"
             " float nl=max(dot(n,normalize(uLight)),0.0);\n"
             " float d=nl*0.75+0.25;\n"
             " vec3 col;\n"
-            " if(uUseColor==1){ col=vCol; }\n"
+            // Blockmap: the plane is 0.5 world units per texel with the padding at
+            // the far edge, so it spans blckW*0.5 x blckH*0.5 world units — NOT the
+            // world rect. uBlockScale carries 1/that span.
+            " if(uBlockOn==1){ col=texture(uBlockTex, vWorld.xz*uBlockScale).rgb; }\n"
+            " else if(uUseColor==1){ col=vCol; }\n"
             " else if(vH<0.0){ col=mix(vec3(0.20,0.30,0.50),vec3(0.34,0.44,0.32),clamp(vH/-20.0+1.0,0.0,1.0)); }\n"
             " else { col=mix(vec3(0.34,0.44,0.30),vec3(0.55,0.50,0.40),clamp(vH/25.0,0.0,1.0));\n"
             "        col=mix(col,vec3(0.9),clamp((vH-18.0)/12.0,0.0,1.0)); }\n"
@@ -145,6 +150,9 @@ public:
         uTerrFogFar = glGetUniformLocation(terrainProg, "uFogFar");
         uTerrFogOn = glGetUniformLocation(terrainProg, "uFogOn");
         uTerrEye = glGetUniformLocation(terrainProg, "uEye");
+        uTerrBlockTex = glGetUniformLocation(terrainProg, "uBlockTex");
+        uTerrBlockOn = glGetUniformLocation(terrainProg, "uBlockOn");
+        uTerrBlockScale = glGetUniformLocation(terrainProg, "uBlockScale");
 
         entProg = glProgram(
             "#version 330 core\n"
@@ -1053,6 +1061,13 @@ public:
                 glUniform1i(uTerrLightMode, lightMode);
                 setFogUniforms(uTerrFogCol,uTerrFogNear,uTerrFogFar,uTerrFogOn,uTerrEye,cam);
                 glUniform1i(uTerrUseColor, (terrainMode!=2 && terrainHasColor) ? 1 : 0);
+                const bool blockOn = (terrainMode==3 && blockTex != 0);
+                glUniform1i(uTerrBlockOn, blockOn ? 1 : 0);
+                if (blockOn) {
+                    glUniform2f(uTerrBlockScale, blockScaleX, blockScaleY);
+                    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, blockTex);
+                    glUniform1i(uTerrBlockTex, 0);
+                }
             }
             glBindVertexArray(terrainVAO);
             glDrawElements(GL_TRIANGLES, terrainCount, GL_UNSIGNED_INT, 0);
@@ -1385,6 +1400,8 @@ private:
     GLint uTerrMVP=-1, uTerrLight=-1, uTerrUseColor=-1, uEntMVP=-1, uEntSize=-1, uEntWhite=-1;
     GLint uTerrSun=-1, uTerrAmb=-1, uTerrLightMode=-1, uTerrFogCol=-1, uTerrFogNear=-1,
           uTerrFogFar=-1, uTerrFogOn=-1, uTerrEye=-1;
+    GLint uTerrBlockTex=-1, uTerrBlockOn=-1, uTerrBlockScale=-1;
+    GLuint blockTex=0; float blockScaleX=0, blockScaleY=0;
     int terrainCount=0, entCount=0;
     bool terrainHasColor=false;
 
@@ -1432,6 +1449,53 @@ public:
     int   terrainMode=0;          // 0 Textured, 1 Palette, 2 Height ramp
     float terrainTile=0.125f;     // texture repeats every 1/tile world units (uvScale=1)
     bool  showRoads=true, showDecals=true, showRivers=true;
+
+    // ---- BLCK block grid (read-only visualisation) ---------------------------
+    // Builds one RGB texture from the type plane, tinted where the flag plane is
+    // non-zero. The plane is 0.5 world units per texel and is padded at the far
+    // edge on 4 of 45 maps, so the sampler scale comes from blck dims, NOT world.
+    void buildBlockmap(const Scene& s) {
+        clearBlockmap();
+        if (s.blckW <= 0 || s.blckH <= 0 ||
+            (long)s.blckTypes.size() != (long)s.blckW * s.blckH) return;
+        const int W = s.blckW, H = s.blckH;
+        std::vector<unsigned char> rgb((size_t)W * H * 3);
+        // Categorical palette: the type plane holds a handful of distinct values
+        // (4-6 per map), and their MEANING is undecoded — so use clearly distinct
+        // hues and label nothing, rather than implying "green = passable".
+        static const unsigned char kPal[8][3] = {
+            { 30, 34, 40}, {235, 90, 70}, { 70,190,120}, { 80,150,240},
+            {240,200, 70}, {200,110,230}, { 90,220,225}, {245,245,245},
+        };
+        const bool haveFlags = ((long)s.blckFlags.size() == (long)W * H);
+        for (size_t k = 0; k < (size_t)W * H; k++) {
+            const unsigned char t = s.blckTypes[k];
+            const unsigned char* c = kPal[t & 7];
+            float m = 1.0f;
+            if (haveFlags && s.blckFlags[k] != 0) m = 1.35f;   // flagged: brighter
+            for (int j = 0; j < 3; j++) {
+                float v = c[j] * m;
+                rgb[k*3+j] = (unsigned char)(v > 255.0f ? 255.0f : v);
+            }
+        }
+        glGenTextures(1, &blockTex);
+        glBindTexture(GL_TEXTURE_2D, blockTex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, W, H, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+        // NEAREST: these are category ids, and interpolating between two ids
+        // invents a third that is not in the data.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        blockScaleX = 1.0f / ((float)W * 0.5f);
+        blockScaleY = 1.0f / ((float)H * 0.5f);
+    }
+    void clearBlockmap() {
+        if (blockTex) { glDeleteTextures(1, &blockTex); blockTex = 0; }
+    }
+    bool blockmapReady() const { return blockTex != 0; }
 
     // ---- lighting environment (WTHR) ----------------------------------------
     // lightMode 0 = Editor/neutral: the legacy hard-coded light, kept EXACTLY so

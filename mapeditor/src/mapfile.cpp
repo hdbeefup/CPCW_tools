@@ -556,6 +556,24 @@ bool load_map_native(const std::string& path, Scene& out) {
             out.heights.assign((size_t)out.grid_w*out.grid_h, 0.0f);
         }
     }
+    // BLCK block grid (read-only). Dims come from BLCK's own header, never WRLD.
+    if (const Chunk* bc = P.find(P.root, "BLCK")) {
+        size_t p0 = bc->data_off, end = bc->offset + 8 + bc->size;
+        if (p0 + 12 <= end) {
+            uint32_t ver = P.D.u32(p0);
+            int bw = (int)P.D.u32(p0 + 4), bh = (int)P.D.u32(p0 + 8);
+            size_t need = (size_t)bw * bh * 3;
+            if (ver == 3 && bw > 0 && bh > 0 && p0 + 12 + need <= end) {
+                out.blckW = bw; out.blckH = bh;
+                size_t fp = p0 + 12, tp = fp + (size_t)bw * bh * 2;
+                out.blckFlags.resize((size_t)bw * bh);
+                for (size_t k = 0; k < out.blckFlags.size(); k++)
+                    out.blckFlags[k] = P.D.u16(fp + k * 2);
+                out.blckTypes.assign(P.D.d + tp, P.D.d + tp + (size_t)bw * bh);
+            }
+        }
+    }
+
     lift_containers(P, out);
 
     out.raw = std::move(P.buf);   // keep the bytes for native in-place save

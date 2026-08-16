@@ -1125,6 +1125,10 @@ static void drawMenuBar() {
             if (ImGui::MenuItem("Textured", nullptr, g_vp.terrainMode==0)) g_vp.terrainMode=0;
             if (ImGui::MenuItem("Palette",  nullptr, g_vp.terrainMode==1)) g_vp.terrainMode=1;
             if (ImGui::MenuItem("Height ramp", nullptr, g_vp.terrainMode==2)) g_vp.terrainMode=2;
+            // Read-only: the block VALUES are undecoded, so the palette is
+            // categorical and deliberately unlabelled — see docs/MAP_FORMAT.md §8.4.
+            if (ImGui::MenuItem("Blockmap (BLCK)", nullptr, g_vp.terrainMode==3,
+                                g_vp.blockmapReady())) g_vp.terrainMode=3;
             ImGui::EndMenu();
         }
         ImGui::MenuItem("Roads", nullptr, &g_vp.showRoads);
@@ -3400,6 +3404,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--uishot-select") && i + 1 < argc) uiShotSelect = atoi(argv[++i]);
         // dev: preset a road-node selection so a headless shot can show the node
         // handles, which are otherwise only reachable by clicking.
+        else if (!strcmp(argv[i], "--terrainmode") && i + 1 < argc) g_vp.terrainMode = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--uishot-road") && i + 1 < argc) uiShotRoad = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--uishot-roadnode") && i + 1 < argc) uiShotRoadNode = atoi(argv[++i]);
         // Overlay visibility from the command line, so a --shot pair can isolate
@@ -3987,6 +3992,58 @@ int main(int argc, char** argv) {
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
         }
+        else if (!strcmp(argv[i], "--blcktest") && i + 1 < argc) {
+            // dev: --blcktest <map|dir> — BLCK decode. The dims must come from
+            // BLCK's OWN header: they are world*2 on only 41 of 45 maps, and the
+            // other four are padded by exactly 32 texels (16 world units) on one
+            // or both axes. Deriving them from WRLD reads past or short of the
+            // payload on exactly those four.
+            struct Acc { int maps=0, ok=0, exact2x=0, padded=0, bad=0;
+                         long cells=0; std::set<int> types; } A;
+            auto one = [&A](const std::string& p, bool verbose) -> bool {
+                Scene s;
+                if (!load_map_native(p, s)) return true;
+                A.maps++;
+                if (s.blckW <= 0 || s.blckH <= 0) {
+                    printf("blcktest: %s NO BLCK\n", p.c_str()); return false;
+                }
+                bool sized = (long)s.blckTypes.size() == (long)s.blckW * s.blckH &&
+                             (long)s.blckFlags.size() == (long)s.blckW * s.blckH;
+                if (!sized) { printf("blcktest: %s PLANE SIZE MISMATCH\n", p.c_str()); return false; }
+                A.ok++; A.cells += (long)s.blckW * s.blckH;
+                const bool is2x = (s.blckW == s.world_w*2 && s.blckH == s.world_h*2);
+                if (is2x) A.exact2x++; else A.padded++;
+                // The plane must COVER the world: a shorter one would leave the
+                // far edge of the map sampling outside the data.
+                bool covers = (s.blckW * 0.5f >= (float)s.world_w - 0.01f) &&
+                              (s.blckH * 0.5f >= (float)s.world_h - 0.01f);
+                std::set<int> t;
+                for (unsigned char v : s.blckTypes) t.insert((int)v);
+                for (int v : t) A.types.insert(v);
+                if (verbose || !covers) {
+                    printf("%-42s world %dx%d  blck %dx%d  %s  types=%d  pad=%+.0f,%+.0f\n",
+                           p.substr(p.find_last_of("/\\") + 1).c_str(),
+                           s.world_w, s.world_h, s.blckW, s.blckH,
+                           is2x ? "2x  " : "PAD ", (int)t.size(),
+                           s.blckW*0.5f - s.world_w, s.blckH*0.5f - s.world_h);
+                }
+                return covers;
+            };
+            std::error_code ec;
+            if (std::filesystem::is_directory(argv[i+1], ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec)) continue;
+                    if (it->path().extension() != ".map") continue;
+                    if (!one(it->path().string(), false)) A.bad++;
+                }
+            } else { if (!one(argv[i+1], true)) A.bad = 1; }
+            printf("blcktest: maps=%d decoded=%d exact-2x=%d padded=%d cells=%ld distinct-types=%d\n",
+                   A.maps, A.ok, A.exact2x, A.padded, A.cells, (int)A.types.size());
+            bool pass = A.bad == 0 && A.ok == A.maps && A.maps > 0;
+            printf("blcktest: %s\n", pass ? "PASS" : "FAIL");
+            return pass ? 0 : 3;
+        }
         else if (!strcmp(argv[i], "--scentest") && i + 1 < argc) {
             // dev: --scentest <map|dir> — scenario record VALUES, not just the
             // walk. --heaptest already proves the tree consumes exactly; this
@@ -4447,6 +4504,7 @@ int main(int argc, char** argv) {
     if (!shotPath.empty()) {
         g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
         g_vp.buildSplatTextures(g_scene, g_dataRoot);
+        g_vp.buildBlockmap(g_scene);
         g_vp.buildOverlays(g_scene, g_dataRoot);
         g_vp.buildModels(g_scene, g_dataRoot);
         g_sceneDirty = false;
@@ -4500,6 +4558,7 @@ int main(int argc, char** argv) {
     if (pickTest) {
         g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
         g_vp.buildSplatTextures(g_scene, g_dataRoot);
+        g_vp.buildBlockmap(g_scene);
         g_vp.buildModels(g_scene, g_dataRoot);
         // Arming the ghost here is the point of `--picktest --ghost ...`: the
         // numbers below must come out IDENTICAL with and without it. The ghost
@@ -4707,6 +4766,7 @@ int main(int argc, char** argv) {
         if (g_sceneDirty && g_glReady) {
             g_vp.buildTerrain(g_scene); g_vp.buildEntities(g_scene, g_showKind);
             g_vp.buildSplatTextures(g_scene, g_dataRoot);
+        g_vp.buildBlockmap(g_scene);
             g_vp.buildOverlays(g_scene, g_dataRoot);   // roads + decals (was missing -> no roads)
             g_vp.buildModels(g_scene, g_dataRoot);
             g_sceneDirty = false;

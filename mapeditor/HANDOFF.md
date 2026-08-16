@@ -35,6 +35,7 @@ $E --roadauxtest <map|dir>                 # GROA Catmull-Rom handle identity (n
 $E --roadwritetest <map> out.map [slot] [node]   # move a road node + re-derive handles
 $E --overlaypicktest <map>                 # world-space core of decal / road-node picking
 $E --scentest   <map|dir>                  # scenario record VALUES (semantics, not just the walk)
+$E --blcktest   <map|dir>                  # BLCK two-plane decode + world coverage
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -240,6 +241,17 @@ correctly rejected).
   six lanes, the signature of one field read at six offsets). The old
   `(1,1,1,1,1,1)`=passable table and the "251 cell patterns" figure were both
   artifacts of that misalignment. Values are still undecoded: **read-only**.
+  **Now RENDERED** as `View > Terrain > Blockmap (BLCK)` (terrainMode 3), a
+  categorical unlabelled palette over the type plane, brightened where the flag
+  plane is non-zero, sampled NEAREST (interpolating category ids invents a third).
+  The mapping is **0.5 world units per texel with the padding at the far edge**,
+  so the plane spans `blckW*0.5 x blckH*0.5` world units — NOT the world rect.
+  That was measured, not assumed: on Domination/(2) Urban Legend (padded 16 units
+  in width) road nodes concentrate on one block type **81.7%** of the time under
+  that mapping vs **57.9%** under stretch-to-world. Two other padded maps are
+  ties, and M_01 confirms the two readings coincide when dims are exactly 2x.
+  A hypothesis that dims are `2*ceil(world/32)*32` was **falsified** — 37/45,
+  worse than the plain 2x rule's 41/45. There is no derivation: read the header.
 - **A schema field's type id is COMPOSITE: the low byte is the container kind.**
   `0x8A`/`0x90`/`0x9C` -> `ARRY`, `0xA5` -> `HEAP`, `0xA6` -> `HASH`; the bytes
   above it are the element (and for HASH the key) type. So `0x148A` is an array
