@@ -33,6 +33,7 @@ $E --wthrtest   <map|dir> [out.map]        # WTHR layout + field-order semantics
 $E --heaptest   <map|dir>                  # scenario trees: every OBJS section walks to its SCHD
 $E --roadauxtest <map|dir>                 # GROA Catmull-Rom handle identity (no NEW mismatch)
 $E --roadwritetest <map> out.map [slot] [node]   # move a road node + re-derive handles
+$E --overlaypicktest <map>                 # world-space core of decal / road-node picking
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -295,13 +296,27 @@ correctly rejected).
    bit-for-bit and only its magnitude is scaled by the segment-length ratio.
    `pos.y` is exactly 0.0 on all 35668 nodes — roads are 2D and projected onto
    the heightmap — so a drag must not write an elevation.
-   The **Shader/Decals panel now has Decals and Roads tabs**: pick a road, pick a
-   node, drag X/Z. Undo (`CMD_ROADNODE`) snapshots the exact bytes of the affected
-   span rather than re-running the move backwards — an endpoint's magnitude is
-   scaled by a float ratio and inverting it is not guaranteed to land on the
-   original bits. There is still no viewport picking or gizmo for road nodes; that
-   needs the `SelKind` selection refactor (`g_selection` is a `std::set<int>` of
-   ENTITY indices read by eight call sites, so tagged indices would corrupt them).
+   The **Shader/Decals panel has Decals and Roads tabs**, and overlays are also
+   **clickable and draggable in the viewport** in that mode. Undo (`CMD_ROADNODE`)
+   snapshots the exact bytes of the affected span rather than re-running the move
+   backwards — an endpoint's magnitude is scaled by a float ratio and inverting it
+   is not guaranteed to land on the original bits.
+   **Overlay selection is a SECOND domain** (`g_ovlSel` +
+   `g_decalSel`/`g_roadSel`/`g_roadNodeSel`), deliberately kept out of
+   `g_selection`: that `std::set<int>` holds ENTITY indices and is read by eight
+   call sites, so tagged indices would corrupt every one. The two are mutually
+   exclusive. Picking is a **CPU test against the terrain hit point**, not a
+   colour-code pass — decals are flat on the terrain and nodes are points, so the
+   ray already resolves both, and the entity pick buffer is untouched
+   (`--picktest` unchanged: 3191 instances, 44.3% self, 92.0% resolved). It
+   ignores occlusion on purpose, so a node under a tree stays grabbable.
+   **Pick priority was measured, not chosen**: nodes of the ALREADY-selected road
+   first, then decals, then any road node. Giving all road nodes priority — the
+   obvious reading of "nodes are precise handles" — made **112 of M_01's 126
+   decals unpickable**, because sidewalk and asphalt decals are road-adjacent by
+   nature so a node is almost always nearer. `--overlaypicktest` reports that
+   shadowing count; it must stay 0. Still missing: a gizmo for overlays (drag is
+   direct-manipulation only) and river editing.
    **1670 of the 7876 endpoints ship all-zero handles**, which scaling leaves
    untouched — that made `--roadwritetest`'s first undo-span check VACUOUS (a
    deliberately narrowed span still passed) until the default test node moved from
