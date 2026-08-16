@@ -251,8 +251,17 @@ correctly rejected).
    runtime constant. TUNE if widths look off; verify tiling on maps other than M_01.
 4. **Area fills** (aprons/plazas) are still centroid-fan triangulated in
    `overlays.cpp` (a convexity assumption), and detected by a name+bbox heuristic.
-5. **Roads and decals are read-only.** They decode and render; there is no write
-   path, so the Shader/Decals mode says so and opens the chunk inspector.
+5. **Decals are editable; roads and rivers are still read-only.**
+   `overlay_set_decal()` writes the five GDEC transform floats straight into
+   `Scene::raw` — 20 bytes, size-preserving, so `save_map_native` stays
+   byte-faithful with NO ancestor-size patching. Verified safe on the corpus:
+   decals at genuinely different positions ship byte-identical trailing data
+   (Domination/(4) Islands Of Hope has one trailing body shared by four
+   transforms), so nothing after the transform derives from it. `--decalwritetest`.
+   Still open: road node drag (must re-derive the neighbouring Catmull-Rom
+   handles), river editing, and create/delete for any of them (structural).
+   NOTE `g_overlayDirty` — the decal meshes are BAKED geometry, so an edit
+   without a re-decode + `buildOverlays` is correct and completely invisible.
 6. **Not decoded at all**: the trigger system (Lua bodies), which is behind an
    undecoded `HEAP` (type 0x89A5) — a tag-first walk reaches 0 of 1265 SLocation.
    `View > Map chunks` is the read-only starting point — inspect the bytes, don't

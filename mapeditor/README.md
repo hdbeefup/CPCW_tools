@@ -89,9 +89,15 @@ byte-faithful, and each drag is one undo step.
 level with the per-node width the record carries. River mode lists them with a
 node table; `View > Rivers` toggles them.
 
+**Edit decals** — Shader/Decals mode lists a map's GDEC decals and edits each
+one's centre, size and rotation. All five are fixed-width floats, so a move is 20
+in-place bytes with no ancestor-size patching, and each drag is one undo step.
+
 ## Not implemented
 
-Roads, decals and rivers are decoded and rendered but read-only. The trigger
+Roads and rivers are decoded and rendered but read-only — dragging a road node
+also has to re-derive the neighbouring Catmull-Rom handles, which is the next
+piece of work. Decal create/delete is structural and not built either. The trigger
 system is not decoded — it sits behind an undecoded `HEAP` container — and that
 mode opens a raw chunk inspector (`View > Map chunks`) rather than offering
 invented fields. Lake/Water is **retired**, not pending: no lake or water data
@@ -129,6 +135,8 @@ Every write path has a no-window check that runs from the command line:
 | `--sunprobe <map>` | score the four sun-swizzle candidates against the legacy light (reports, does not score a winner) |
 | `--settingstest <tmp.ini>` | settings parse, save/reload round-trip, unknown-key preservation, recent-list capping |
 | `--crashtest` | fault on purpose; the report must name the faulting function |
+| `--decalwritetest <map> <out>` | one decal moved/resized/rotated; exactly the 5 declared floats change, pool intact, value reads back |
+| `--dataroot <path>` | force the asset root, so a harness output rendered from a temp dir still resolves textures |
 | `--ghost <guid\|#N> <wx> <wy>` | arm the placement ghost headlessly — with `--shot` it must draw, with `--picktest` the counts must be unchanged |
 | `--uishot-mode <n>` | which mode's panel a `--uishot` captures |
 | `--paktest` `--protodbtest` `--thumbtest` `--srmcheck` | archive, prototype DB, thumbnails, model |

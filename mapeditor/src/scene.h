@@ -104,6 +104,15 @@ struct Scene {
         std::vector<OverlaySlotRef> live;
     };
     OverlayPool roadPool, decalPool, riverPool;
+    // Decoded GDEC transforms, parallel to `decals`. The render meshes are baked
+    // geometry; these are the five editable floats and where they live.
+    struct DecalRec {
+        int slot = -1; long xformOff = -1;      // first of 5 floats (body + 4)
+        float cx = 0, cz = 0, sx = 0, sy = 0, rot = 0;
+        std::string tex;
+    };
+    std::vector<DecalRec> decalRecs;
+    int decalEdited = 0;                 // how many decals differ from the file
     // WRLD/WTHR lighting presets (weather.cpp). Empty when the chunk is absent,
     // is the older flat chunk version 2, or fails to walk exactly.
     std::vector<WeatherPreset> weather;

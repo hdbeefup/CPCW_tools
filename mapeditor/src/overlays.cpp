@@ -155,8 +155,21 @@ std::vector<Rec> readPool(const std::vector<unsigned char>& d, size_t off, size_
 }
 } // namespace
 
+bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
+                       float sx, float sy, float rot) {
+    if (!s.decalPool.ok || s.raw.empty()) return false;   // fail closed
+    long off = -1;
+    for (const Scene::DecalRec& r : s.decalRecs)
+        if (r.slot == slot) { off = r.xformOff; break; }
+    if (off < 0 || off + 20 > (long)s.raw.size()) return false;
+    const float v[5] = { cx, cz, sx, sy, rot };
+    for (int k = 0; k < 5; k++) std::memcpy(&s.raw[(size_t)off + 4 * k], &v[k], 4);
+    return true;
+}
+
 void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
     s.roads.clear(); s.decals.clear(); s.roadSplines.clear(); s.rivers.clear();
+    s.decalRecs.clear();
     s.roadPool = Scene::OverlayPool{}; s.decalPool = Scene::OverlayPool{};
     s.riverPool = Scene::OverlayPool{};
     // Locate GTRN through the chunk tree (SCEN -> WRLD -> GTRN) rather than
@@ -267,6 +280,13 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
             om.idx = {0,1,2, 0,2,3};
             om.srcSlot = r.slot;
             s.decals.push_back(std::move(om));
+            // Keep the editable floats and where they live, alongside the baked
+            // geometry — the mesh cannot be edited back into a transform.
+            Scene::DecalRec dr;
+            dr.slot = r.slot; dr.xformOff = (long)(b + 4);
+            dr.cx = cx; dr.cz = cz; dr.sx = sx; dr.sy = sy; dr.rot = rot;
+            dr.tex = mat;
+            s.decalRecs.push_back(std::move(dr));
         }
     }
 

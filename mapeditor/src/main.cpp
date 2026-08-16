@@ -20,6 +20,7 @@
 #include "viewport3d.h"
 #include "mapfile.h"
 #include "weather.h"
+#include "overlays.h"
 #include "settings.h"
 #include "crashdump.h"
 #include "protodb.h"
@@ -113,6 +114,9 @@ static bool  g_entDirty = false;
 static bool  g_showModels = true, g_showDots = true;
 static bool  g_draggingEnt = false, g_modelsDirty = false, g_terrainDirty = false;
 static bool  g_splatTexDirty = false;   // painted layers -> re-upload the weight textures
+static bool  g_overlayDirty = false;    // decal edited -> re-decode + rebuild batches
+static std::set<int> g_decalTouched;    // pool slots edited since the last save
+static int   g_decalSel = -1;           // Decals panel selection
 
 // Vertex/Terrain tool indices, matching kModes[0].tools word for word.
 enum { TT_GRAB=0, TT_RAISE, TT_LOWER, TT_SETPLANE, TT_RAISE_TO_PLANE,
@@ -157,7 +161,10 @@ static ImVec2 g_marqueeA{0,0};
 // CMD_WEATHER is keyed on (pool slot, field index), not an entity id: a preset is
 // not an entity. Both keys are stable because nothing creates or deletes a preset
 // yet, and an entity edit never touches the WTHR pool.
-enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH, CMD_WEATHER };
+// CMD_DECAL is keyed on the pool SLOT, which is stable; a decal's index in
+// Scene::decalRecs is not (a re-decode reorders nothing today, but nothing
+// guarantees that once insert/delete land).
+enum { CMD_ENTITY, CMD_TERRAIN, CMD_ADD, CMD_DELETE, CMD_BATCH, CMD_WEATHER, CMD_DECAL };
 struct EditCmd {
     int  kind = CMD_ENTITY;
     long entId = 0;
@@ -167,6 +174,8 @@ struct EditCmd {
     std::vector<EntSnap> ents;                           // CMD_BATCH (gizmo, group ops)
     int wSlot = -1, wField = -1;                         // CMD_WEATHER
     std::array<float,4> w0{}, w1{};
+    int dSlot = -1;                                      // CMD_DECAL
+    std::array<float,5> d0{}, d1{};                      // cx, cz, sx, sy, rot
 };
 static std::vector<EditCmd> g_undo, g_redo;
 static bool g_snapActive = false; static EditCmd g_snap;   // pending entity snapshot
@@ -278,6 +287,17 @@ static void applyCmd(const EditCmd& c, bool useNew) {
             w.dirty[(size_t)c.wField] = 1;
             g_scene.weatherEdited = true;
             break;
+        }
+        return;
+    }
+    if (c.kind == CMD_DECAL) {
+        const std::array<float,5>& v = useNew ? c.d1 : c.d0;
+        if (overlay_set_decal(g_scene, c.dSlot, v[0], v[1], v[2], v[3], v[4])) {
+            g_overlayDirty = true;
+            // decalEdited is a count of decals differing from the file; recompute
+            // it from the pending set rather than incrementing, so undo lowers it.
+            g_decalTouched.insert(c.dSlot);
+            g_scene.decalEdited = (int)g_decalTouched.size();
         }
         return;
     }
@@ -636,6 +656,7 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     // reloads with preserveView, and those must not churn it.
     if (!preserveView && !g_srcMap.empty()) g_settings.pushRecentMap(g_srcMap);
     g_lightPreset = -1;              // the new map's presets are different ones
+    g_decalSel = -1; g_decalTouched.clear();
     if (selectId >= 0)
         for (int i = 0; i < (int)g_scene.entities.size(); i++)
             if (g_scene.entities[i].id == selectId) { selectOnly(i); break; }
@@ -711,6 +732,7 @@ static void doSaveTo(const std::string& out, bool keepBackup) {
         g_scene.terrainEdited = false;
         g_scene.splatEdited = false;
         g_scene.weatherEdited = false;
+        g_decalTouched.clear(); g_scene.decalEdited = 0;
         for (Entity& e : g_scene.entities) for (EntityField& f : e.fields) f.dirty = false;
         for (WeatherPreset& w : g_scene.weather)
             std::fill(w.dirty.begin(), w.dirty.end(), (unsigned char)0);
@@ -1154,6 +1176,7 @@ static std::set<std::string> g_favourites;      // proto guids
 static std::string g_placeProto;                // guid selected for placement
 static float g_placeYaw = 0.0f;                 // ghost heading; [ / ] aim it
 static std::string g_ghostArg;                  // --ghost <guid|#N> <wx> <wy>
+static std::string g_dataRootArg;               // --dataroot <path> override
 static float g_ghostAt[2] = {0, 0};
 
 // Arm the ghost from --ghost, for headless checks. Returns false when not asked.
@@ -1530,6 +1553,97 @@ static void drawRiverPanel() {
     }
 }
 
+// --- Shader / Decals mode ----------------------------------------------------
+// Decals are editable: their five transform floats are fixed-width, so a move is
+// 20 in-place bytes and needs no ancestor-size patching. Roads are still
+// read-only — dragging a road node also has to re-derive the neighbouring
+// Catmull-Rom handles, which is the next piece of work, not this one.
+
+static void drawDecalPanel() {
+    if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
+    if (g_scene.decalRecs.empty()) {
+        ImGui::TextWrapped("This map has no decals.");
+        return;
+    }
+    ImGui::Text("%d decals, %d roads", (int)g_scene.decalRecs.size(),
+                (int)(g_scene.roadSplines.size() + g_scene.roads.size()));
+    if (!g_scene.decalPool.ok)
+        ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
+                           "The decal pool did not walk cleanly - read-only on this map.");
+    else
+        ImGui::TextDisabled("edits are in-place and byte-faithful; Ctrl+S writes them");
+    ImGui::TextDisabled("Roads are read-only (node drag needs handle re-derivation).");
+
+    ImGui::SeparatorText("Decals");
+    ImGui::BeginChild("##decallist", ImVec2(0, 180), true);
+    for (int k = 0; k < (int)g_scene.decalRecs.size(); k++) {
+        const Scene::DecalRec& r = g_scene.decalRecs[(size_t)k];
+        const char* leaf = r.tex.c_str();
+        if (const char* sl = strrchr(leaf, '/')) leaf = sl + 1;
+        char lbl[200];
+        snprintf(lbl, sizeof(lbl), "%s%s##dc%d", leaf,
+                 g_decalTouched.count(r.slot) ? "  *" : "", k);
+        if (ImGui::Selectable(lbl, k == g_decalSel)) g_decalSel = k;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("slot %d\n%s\n(%.1f, %.1f)  %.1f x %.1f",
+                              r.slot, r.tex.c_str(), r.cx, r.cz, r.sx, r.sy);
+    }
+    ImGui::EndChild();
+    if (g_decalSel < 0 || g_decalSel >= (int)g_scene.decalRecs.size()) return;
+
+    Scene::DecalRec& r = g_scene.decalRecs[(size_t)g_decalSel];
+    ImGui::SeparatorText("Transform");
+    if (!g_scene.decalPool.ok) {
+        ImGui::Text("centre  %.2f, %.2f", r.cx, r.cz);
+        ImGui::Text("size    %.2f x %.2f", r.sx, r.sy);
+        ImGui::Text("rot     %.1f deg", r.rot * 57.2957795f);
+        return;
+    }
+    // One undo step per interaction: snapshot on grab, commit on release.
+    static int   sSlot = -1;
+    static std::array<float,5> sBefore{};
+    auto cur = [&]{ return std::array<float,5>{ r.cx, r.cz, r.sx, r.sy, r.rot }; };
+    auto grab = [&]{ if (sSlot != r.slot) { sSlot = r.slot; sBefore = cur(); } };
+    auto write = [&]{
+        if (overlay_set_decal(g_scene, r.slot, r.cx, r.cz, r.sx, r.sy, r.rot)) {
+            g_overlayDirty = true;
+            g_decalTouched.insert(r.slot);
+            g_scene.decalEdited = (int)g_decalTouched.size();
+        }
+    };
+    auto release = [&]{
+        if (sSlot != r.slot) return;
+        std::array<float,5> now = cur();
+        if (now != sBefore) {
+            EditCmd c; c.kind = CMD_DECAL; c.dSlot = r.slot; c.d0 = sBefore; c.d1 = now;
+            pushCmd(std::move(c));
+        }
+        sSlot = -1;
+    };
+    auto field = [&](const char* label, float* v, float step) {
+        ImGui::SetNextItemWidth(200.0f);
+        ImGui::DragFloat(label, v, step);
+        if (ImGui::IsItemActivated()) grab();
+        if (ImGui::IsItemEdited()) write();
+        if (ImGui::IsItemDeactivatedAfterEdit()) release();
+    };
+    field("centre X", &r.cx, 0.25f);
+    field("centre Z", &r.cz, 0.25f);
+    field("size X",   &r.sx, 0.25f);
+    field("size Y",   &r.sy, 0.25f);
+    float deg = r.rot * 57.2957795f;
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::DragFloat("rotation", &deg, 1.0f, 0.0f, 0.0f, "%.1f deg");
+    if (ImGui::IsItemActivated()) grab();
+    if (ImGui::IsItemEdited()) { r.rot = deg / 57.2957795f; write(); }
+    if (ImGui::IsItemDeactivatedAfterEdit()) release();
+    ImGui::TextDisabled("pool slot %d   %s", r.slot, r.tex.c_str());
+    if (ImGui::Button("Frame this decal")) {
+        g_cam.target = V3{ r.cx, terrainHeightAt(r.cx, r.cz), r.cz };
+        if (g_cam.dist > 60.0f) g_cam.dist = 60.0f;
+    }
+}
+
 static void drawModePanel() {
     if (!g_showPanel) return;
     const Mode& m = kModes[g_mode];
@@ -1545,14 +1659,11 @@ static void drawModePanel() {
         // and a pointer at what IS available, instead of controls that do nothing.
         if (modeIs(MK_LIGHT)) { drawLightPanel(); ImGui::End(); return; }
         if (modeIs(MK_RIVER)) { drawRiverPanel(); ImGui::End(); return; }
+        if (modeIs(MK_OVERLAY)) { drawDecalPanel(); ImGui::End(); return; }
         if (!modeIs(MK_TERRAIN) && !modeIs(MK_OBJECT)) {
             const char* why = nullptr;
             bool retired = false;
             switch (modeKind()) {
-                case MK_OVERLAY:
-                    why = "Roads (GROA) and decals (GDEC) are decoded and rendered, "
-                          "but read-only — the write path is not built yet. "
-                          "View > Roads / Decals toggles them."; break;
                 case MK_TRIGGER: why = "Triggers hold Lua bodies; the trigger system is not decoded yet."; break;
                 case MK_RETIRED:
                     // Not "undecoded" — measured absent. Say which, so nobody
@@ -1647,7 +1758,8 @@ static void drawChanges() {
 
     char title[96];
     snprintf(title, sizeof(title), "Changes (%d)###changes",
-             (int)rows.size() + deleted + (wFields ? 1 : 0));
+             (int)rows.size() + deleted + (wFields ? 1 : 0) +
+             (g_decalTouched.empty() ? 0 : 1));
     if (ImGui::Begin(title, &g_showChanges)) {
         if (g_srcMap.empty()) ImGui::TextDisabled("No .map loaded.");
         ImGui::Text("+%d added   -%d deleted   %d moved   %d rotated   %d field edits",
@@ -1657,6 +1769,9 @@ static void drawChanges() {
         if (wFields)
             ImGui::Text("%d weather field%s edited across %d preset%s",
                         wFields, wFields == 1 ? "" : "s", wPresets, wPresets == 1 ? "" : "s");
+        if (!g_decalTouched.empty())
+            ImGui::Text("%d decal%s moved", (int)g_decalTouched.size(),
+                        g_decalTouched.size() == 1 ? "" : "s");
         ImGui::TextDisabled("versus %s", g_srcMap.empty() ? "(nothing)" : g_srcMap.c_str());
         ImGui::Separator();
         ImGuiListClipper clip; clip.Begin((int)rows.size());
@@ -2822,6 +2937,12 @@ int main(int argc, char** argv) {
             g_ghostAt[0] = (float)atof(argv[++i]);
             g_ghostAt[1] = (float)atof(argv[++i]);
         }
+        // Force the asset root instead of walking up from the map path. A map
+        // written somewhere else (a harness output in a temp dir) otherwise
+        // resolves no ProtoDB and no textures, and renders untextured — which
+        // silently invalidates any before/after pixel comparison against the
+        // original. Set AFTER the load, since loadScene recomputes it.
+        else if (!strcmp(argv[i], "--dataroot") && i + 1 < argc) g_dataRootArg = argv[++i];
         else if (!strcmp(argv[i], "--no-rivers")) g_vp.showRivers = false;
         else if (!strcmp(argv[i], "--no-roads"))  g_vp.showRoads  = false;
         else if (!strcmp(argv[i], "--no-decals")) g_vp.showDecals = false;
@@ -2969,6 +3090,46 @@ int main(int argc, char** argv) {
                 std::set<std::string>(r.begin(), r.end()).size() == r.size());
             printf("settingstest: %s\n", fail ? "FAIL" : "PASS");
             return fail ? 3 : 0;
+        }
+        else if (!strcmp(argv[i], "--decalwritetest") && i + 2 < argc) {
+            // dev: --decalwritetest <map> <out.map>
+            // Move, resize and rotate one decal; exactly the five declared floats
+            // may change, and the value must read back after a reload.
+            Scene s;
+            if (!load_map_native(argv[i+1], s)) { printf("decalwritetest: load failed\n"); return 2; }
+            if (s.decalRecs.empty() || !s.decalPool.ok) {
+                printf("decalwritetest: no writable decal pool\n"); return 2; }
+            const std::vector<unsigned char> raw0 = s.raw;
+            const Scene::DecalRec d0 = s.decalRecs[s.decalRecs.size() / 2];
+            const float nx = d0.cx + 3.5f, nz = d0.cz - 2.25f;
+            const float nsx = d0.sx * 1.5f, nsy = d0.sy * 0.75f, nrot = d0.rot + 0.4f;
+            if (!overlay_set_decal(s, d0.slot, nx, nz, nsx, nsy, nrot)) {
+                printf("decalwritetest: write refused\n"); return 3; }
+            long changed = 0, outside = 0;
+            for (size_t o = 0; o < s.raw.size() && o < raw0.size(); o++) {
+                if (s.raw[o] == raw0[o]) continue;
+                changed++;
+                if ((long)o < d0.xformOff || (long)o >= d0.xformOff + 20) outside++;
+            }
+            std::ofstream f(argv[i+2], std::ios::binary);
+            f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size());
+            f.close();
+            Scene s2; bool re = load_map_native(argv[i+2], s2);
+            const Scene::DecalRec* back = nullptr;
+            if (re) for (const auto& r : s2.decalRecs) if (r.slot == d0.slot) { back = &r; break; }
+            bool val = back && fabsf(back->cx - nx) < 1e-4f && fabsf(back->cz - nz) < 1e-4f &&
+                       fabsf(back->sx - nsx) < 1e-4f && fabsf(back->sy - nsy) < 1e-4f &&
+                       fabsf(back->rot - nrot) < 1e-4f;
+            bool sameSize = s.raw.size() == raw0.size();
+            bool poolSame = re && s2.decalPool.ok &&
+                            s2.decalPool.used == s.decalPool.used &&
+                            s2.decalPool.cap  == s.decalPool.cap &&
+                            s2.decalRecs.size() == s.decalRecs.size();
+            printf("decalwritetest slot %d: changed=%ld outsideXform=%ld sizeSame=%d "
+                   "reload=%d readback=%d poolIntact=%d %s\n",
+                   d0.slot, changed, outside, (int)sameSize, (int)re, (int)val, (int)poolSame,
+                   (changed > 0 && outside == 0 && sameSize && val && poolSame) ? "OK" : "FAIL");
+            return (changed > 0 && outside == 0 && sameSize && val && poolSame) ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--sunprobe") && i + 1 < argc) {
             // dev: --sunprobe <map>
@@ -3416,6 +3577,7 @@ int main(int argc, char** argv) {
     const bool headless = !shotPath.empty() || !uiShotPath.empty() || pickTest;
     if (!headless) loadSettings();
     if (!loadPath.empty()) loadScene(loadPath);
+    if (!g_dataRootArg.empty()) g_dataRoot = g_dataRootArg;   // after the load
 
     glfwSetErrorCallback(glfwError);
     if (!glfwInit()) return 1;
@@ -3715,6 +3877,15 @@ int main(int argc, char** argv) {
         }
         if (g_terrainDirty && g_glReady) {  // after a terrain brush stroke
             g_vp.buildTerrain(g_scene); g_terrainDirty = false;
+        }
+        if (g_overlayDirty && g_glReady) {  // after a decal edit
+            // Re-decode from the mutated raw bytes, then rebuild the batches. The
+            // decal meshes are BAKED geometry, so without this the write is
+            // correct and completely invisible — this codebase's classic failure.
+            parse_overlays(g_scene.raw, g_scene);
+            g_vp.clearOverlays();
+            g_vp.buildOverlays(g_scene, g_dataRoot);
+            g_overlayDirty = false;
         }
         if (g_splatTexDirty && g_glReady) { // after a texture-blend stroke
             g_vp.refreshSplatWeights(g_scene); g_splatTexDirty = false;

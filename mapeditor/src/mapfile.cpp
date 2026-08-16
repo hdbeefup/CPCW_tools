@@ -477,6 +477,22 @@ static bool reparse_entities(Scene& s, long editPos, long delta) {
             if (wp.nameOff >= editPos) wp.nameOff += delta;
             if (wp.tailOff >= editPos) wp.tailOff += delta;
         }
+        // Overlay pool + decal transform offsets, same rule. In the shipped chunk
+        // order UNTS is the LAST child of WRLD, so an entity edit never actually
+        // moves any of this — but nothing enforces that order, and a stale
+        // xformOff would write a decal transform into the middle of the terrain.
+        auto shiftPool = [&](Scene::OverlayPool& p) {
+            if (p.chunkOff   >= editPos) p.chunkOff   += delta;
+            if (p.hdrOff     >= editPos) p.hdrOff     += delta;
+            if (p.contentEnd >= editPos) p.contentEnd += delta;
+            for (Scene::OverlaySlotRef& sl : p.live) {
+                if (sl.chunkOff >= editPos) sl.chunkOff += delta;
+                if (sl.bodyOff  >= editPos) sl.bodyOff  += delta;
+            }
+        };
+        shiftPool(s.roadPool); shiftPool(s.decalPool); shiftPool(s.riverPool);
+        for (Scene::DecalRec& dr : s.decalRecs)
+            if (dr.xformOff >= editPos) dr.xformOff += delta;
     }
     s.raw = std::move(P.buf);
     return true;
