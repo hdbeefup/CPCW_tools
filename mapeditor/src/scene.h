@@ -1,5 +1,6 @@
 // Editor scene model, loaded via the JSON bridge (cpcw_map.py `scene`).
 #pragma once
+#include "heap.h"
 #include <array>
 #include <string>
 #include <vector>
@@ -126,6 +127,9 @@ struct Scene {
     };
     std::vector<RoadRec> roadRecs;
     int roadEdited = 0;                  // how many road nodes differ from the file
+    // Scenario records (locations / objectives / trigger vars / groups / camera
+    // paths) out of the HEAP slot pools. READ-ONLY — see docs/MAP_FORMAT.md §5.6.
+    ScenarioData scen;
     // WRLD/WTHR lighting presets (weather.cpp). Empty when the chunk is absent,
     // is the older flat chunk version 2, or fails to walk exactly.
     std::vector<WeatherPreset> weather;

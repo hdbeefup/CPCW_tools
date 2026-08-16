@@ -36,3 +36,53 @@ struct HeapReport {
 // map at all; a structural mismatch is reported through HeapReport::ok/issues so
 // the caller can print every failure rather than the first.
 bool map_heap_scan(const std::vector<unsigned char>& raw, HeapReport& out);
+
+// ---- scenario records (read-only) -------------------------------------------
+// The five headline types that live in HEAP slot pools. Everything here is
+// READ-ONLY: byte offsets are kept so a later milestone can write them back, but
+// nothing in this file writes.
+
+struct ScenLocation {
+    std::string name;
+    float pos[3] = {0,0,0};       // map coords: x, y, elevation as stored
+    float dir[3] = {0,0,0};
+    float size[2] = {0,0};        // ellipse HALF-extents (0x0005 is a vec2f)
+    unsigned color = 0;           // packed RGBA
+    int  startId = 0, startTeam = 0, heapIndex = -1;
+    bool isStart = false, active = false;
+    int  triggerCount = 0;
+    long posOff = -1;             // byte offset of Pos, for a future write path
+};
+struct ScenObjective {
+    std::string id;
+    int type = 0, prestige = 0, messageId = 0, status = 0;
+    bool hidden = false;
+};
+struct ScenTriggerVar {
+    std::string name, trigger;
+    int value = 0, delta = 0;
+    bool active = false;
+};
+struct ScenGroup {
+    std::string name;
+    int type = 0, index = 0, player = 0, members = 0;
+};
+struct ScenCameraPath {
+    std::string name;
+    int eyeIndex = 0, targetIndex = 0;
+    float seconds = 0;
+};
+struct ScenarioData {
+    std::vector<ScenLocation>   locations;
+    std::vector<ScenObjective>  objectives;
+    std::vector<ScenTriggerVar> vars;
+    std::vector<ScenGroup>      groups;
+    std::vector<ScenCameraPath> cameras;
+    int  triggerHandlers = 0;     // entries in the SLuaHandler.Triggers HASH
+    bool ok = false;              // false when a tree failed to walk exactly
+};
+
+// Read the scenario records out of `raw`. Same walk as map_heap_scan, so it is
+// only as trustworthy as --heaptest says it is: if that fails on a map, `ok` is
+// false here and the caller must show the data as unreliable rather than pretend.
+bool map_scenario_read(const std::vector<unsigned char>& raw, ScenarioData& out);

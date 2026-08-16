@@ -66,12 +66,24 @@ int fixedWidth(unsigned ft) {
 }
 bool strLike(unsigned ft) { return ft==0x0004 || ft==0x0011 || ft==0x0012; }
 
+// A captured record: the schema name plus where each of its fields starts.
+// Values are read afterwards, so the walk itself stays a pure structural check.
+struct FieldHit { size_t off; unsigned type; };
+struct RecordHit { std::string type; std::map<std::string, FieldHit> fields; };
+
 struct Walker {
     D D_;
     std::map<unsigned short, Schema> schemas;
     HeapReport* rep = nullptr;
     bool failed = false;
     std::string err;
+    // Set to a schema name to capture that record's field offsets. Only the
+    // OUTERMOST VOBJ of that name is captured: SLocation.Triggers holds nested
+    // HandlerEntryType objects whose fields would otherwise overwrite the
+    // parent's by name.
+    const char* capture = nullptr;
+    std::vector<RecordHit>* hits = nullptr;
+    bool capturing = false;
 
     void fail(const std::string& m) { if (!failed) { failed = true; err = m; } }
 
@@ -99,11 +111,16 @@ struct Walker {
         p += 2;                                     // u16 version
         auto it = schemas.find(tid);
         if (it == schemas.end()) return end;         // no schema: skip the span
+        const bool mine = capture && !capturing && hits && it->second.name == capture;
+        if (mine) { capturing = true; hits->push_back(RecordHit{ it->second.name, {} }); }
         for (const Field& f : it->second.fields) {
-            if (failed) return end;
-            if (p > end) { fail(it->second.name + "." + f.name + " starts past end"); return end; }
+            if (failed) { if (mine) capturing = false; return end; }
+            if (p > end) { fail(it->second.name + "." + f.name + " starts past end");
+                           if (mine) capturing = false; return end; }
+            if (mine) hits->back().fields[f.name] = FieldHit{ p, f.type };
             p = field(p, f.type, f.size, end, it->second.name + "." + f.name);
         }
+        if (mine) capturing = false;
         if (!failed && p != end)
             fail("VOBJ " + it->second.name + " @" + std::to_string(pos) + " consumed to " +
                  std::to_string(p) + ", ends " + std::to_string(end));
@@ -325,5 +342,163 @@ bool map_heap_scan(const std::vector<unsigned char>& raw, HeapReport& out) {
              (out.heapsExact == out.heaps) &&
              (out.heapsListOk == out.heaps) &&
              out.issues.empty();
+    return true;
+}
+
+// ---- scenario records --------------------------------------------------------
+
+namespace {
+
+// Value readers. Each returns a default rather than throwing when the field is
+// absent — a schema version that predates a field is normal, not an error.
+struct Vals {
+    const D* d;
+    const std::map<std::string, FieldHit>* f;
+    const FieldHit* get(const char* n, unsigned wantType = 0) const {
+        auto it = f->find(n);
+        if (it == f->end()) return nullptr;
+        if (wantType && it->second.type != wantType) return nullptr;
+        return &it->second;
+    }
+    std::string str(const char* n) const {
+        const FieldHit* h = get(n, 0x0004);
+        if (!h) return {};
+        unsigned short L = d->u16(h->off);
+        if (h->off + 2 + L > d->n) return {};
+        return std::string((const char*)d->d + h->off + 2, L);
+    }
+    int i32(const char* n) const { const FieldHit* h = get(n, 0x0001); return h ? d->i32(h->off) : 0; }
+    unsigned u32v(const char* n, unsigned t) const { const FieldHit* h = get(n, t); return h ? d->u32(h->off) : 0u; }
+    bool boolean(const char* n) const { const FieldHit* h = get(n, 0x0003); return h && d->u8(h->off) != 0; }
+    int u8v(const char* n) const { const FieldHit* h = get(n, 0x0017); return h ? (int)d->u8(h->off) : 0; }
+    float f32(const char* n) const {
+        const FieldHit* h = get(n, 0x0002);
+        if (!h) return 0.0f;
+        unsigned v = d->u32(h->off); float r; std::memcpy(&r, &v, 4); return r;
+    }
+    void vec3(const char* n, float o[3]) const {
+        const FieldHit* h = get(n, 0x0006);
+        if (!h) return;
+        for (int k = 0; k < 3; k++) { unsigned v = d->u32(h->off + 4*k); std::memcpy(&o[k], &v, 4); }
+    }
+    void vec2(const char* n, float o[2]) const {
+        const FieldHit* h = get(n, 0x0005);       // vec2f, NOT a double
+        if (!h) return;
+        for (int k = 0; k < 2; k++) { unsigned v = d->u32(h->off + 4*k); std::memcpy(&o[k], &v, 4); }
+    }
+    long offOf(const char* n) const { auto it = f->find(n); return it == f->end() ? -1 : (long)it->second.off; }
+    // Element count of an on-disk ARRY field, without walking it.
+    int arrayCount(const char* n) const {
+        auto it = f->find(n);
+        if (it == f->end()) return 0;
+        size_t p = it->second.off;
+        if (!d->tag(p, "ARRY")) return 0;
+        return (int)d->u32(p + 8);
+    }
+};
+
+// Run the full walk once with `capture` set, returning the captured records.
+bool collect(const D& d, Walker& w,
+             const std::vector<std::pair<size_t, size_t>>& objs,
+             const char* type, std::vector<RecordHit>& out) {
+    out.clear();
+    w.capture = type; w.hits = &out; w.capturing = false;
+    bool allExact = true;
+    for (auto& sec : objs) {
+        size_t dataOff = sec.first + 8;
+        size_t schemaOff = d.u32(dataOff);
+        size_t p = dataOff + 4;
+        if (schemaOff <= p || schemaOff > sec.second) { allExact = false; continue; }
+        w.failed = false; w.err.clear(); w.capturing = false;
+        while (!w.failed && p < schemaOff) p = w.objt(p);
+        if (w.failed || p != schemaOff) allExact = false;
+    }
+    w.capture = nullptr; w.hits = nullptr;
+    return allExact;
+}
+
+}  // namespace
+
+bool map_scenario_read(const std::vector<unsigned char>& raw, ScenarioData& out) {
+    D d; d.d = raw.data(); d.n = raw.size();
+    if (!d.tag(0, "SCEN")) return false;
+
+    std::vector<std::pair<size_t, size_t>> schd, objs;
+    chunkWalk(d, 12, std::min((size_t)8 + d.u32(4), d.n), schd, objs);
+
+    HeapReport sink;                       // the walk needs somewhere to count
+    Walker w; w.D_ = d; w.rep = &sink;
+    for (auto& s : schd) w.parseSchd(s.first, s.second);
+
+    bool ok = true;
+    std::vector<RecordHit> hits;
+
+    ok &= collect(d, w, objs, "SLocation", hits);
+    for (const RecordHit& r : hits) {
+        Vals v{ &d, &r.fields };
+        ScenLocation L;
+        L.name = v.str("Name");
+        v.vec3("Pos", L.pos); v.vec3("Dir", L.dir); v.vec2("Size", L.size);
+        L.color = v.u32v("Color", 0x0018);
+        L.isStart = v.boolean("IsStartLocaion");     // sic: the engine's spelling
+        L.startId = v.u8v("StartLocationID");
+        L.startTeam = v.i32("StartLocationTeam");
+        L.active = v.boolean("IsActive");
+        L.heapIndex = v.i32("HeapIndex");
+        L.triggerCount = v.arrayCount("Triggers");
+        L.posOff = v.offOf("Pos");
+        out.locations.push_back(std::move(L));
+    }
+
+    ok &= collect(d, w, objs, "SObjective", hits);
+    for (const RecordHit& r : hits) {
+        Vals v{ &d, &r.fields };
+        ScenObjective O;
+        O.id = v.str("ID");
+        O.type = v.i32("Type"); O.prestige = v.i32("Prestige");
+        O.messageId = v.i32("MessageId"); O.status = v.i32("Status");
+        O.hidden = v.boolean("Hidden");
+        out.objectives.push_back(std::move(O));
+    }
+
+    ok &= collect(d, w, objs, "TriggerVar", hits);
+    for (const RecordHit& r : hits) {
+        Vals v{ &d, &r.fields };
+        ScenTriggerVar T;
+        T.name = v.str("Name"); T.trigger = v.str("Trigger");
+        T.value = v.i32("Value"); T.delta = v.i32("Delta");
+        T.active = v.boolean("IsActive");
+        out.vars.push_back(std::move(T));
+    }
+
+    ok &= collect(d, w, objs, "SGroup", hits);
+    for (const RecordHit& r : hits) {
+        Vals v{ &d, &r.fields };
+        ScenGroup G;
+        G.name = v.str("Name");
+        G.type = v.i32("Type"); G.index = v.i32("Index");
+        G.player = v.u8v("PlayerIndex");
+        G.members = v.arrayCount("Members");
+        out.groups.push_back(std::move(G));
+    }
+
+    ok &= collect(d, w, objs, "SCameraPath", hits);
+    for (const RecordHit& r : hits) {
+        Vals v{ &d, &r.fields };
+        ScenCameraPath C;
+        C.name = v.str("Name");
+        C.eyeIndex = v.i32("EyeIndex"); C.targetIndex = v.i32("TargetIndex");
+        C.seconds = v.f32("TotalPlayingTimeInSec");
+        out.cameras.push_back(std::move(C));
+    }
+
+    // The trigger table is one HASH per map (SLuaHandler.Triggers); its entry
+    // count is the honest "how many trigger handlers" number, so read it rather
+    // than infer it. One forward pass.
+    out.triggerHandlers = 0;
+    for (size_t k = 0; k + 12 <= d.n; k++)
+        if (d.tag(k, "HASH")) { out.triggerHandlers += (int)d.u32(k + 8); k += 3; }
+
+    out.ok = ok;
     return true;
 }

@@ -129,6 +129,7 @@ static int   g_roadNodeSel = 0;         // selected node within that road
 enum OvlKind { OVL_NONE, OVL_DECAL, OVL_ROADNODE };
 static OvlKind g_ovlSel = OVL_NONE;
 static bool  g_draggingOvl = false;
+static int   g_locSel = -1;             // Trigger panel: selected scenario location
 
 // Vertex/Terrain tool indices, matching kModes[0].tools word for word.
 enum { TT_GRAB=0, TT_RAISE, TT_LOWER, TT_SETPLANE, TT_RAISE_TO_PLANE,
@@ -688,6 +689,7 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     g_lightPreset = -1;              // the new map's presets are different ones
     g_decalSel = -1; g_decalTouched.clear();
     g_roadSel = -1; g_roadNodeSel = 0; g_roadTouched.clear();
+    g_locSel = -1;
     if (selectId >= 0)
         for (int i = 0; i < (int)g_scene.entities.size(); i++)
             if (g_scene.entities[i].id == selectId) { selectOnly(i); break; }
@@ -1763,6 +1765,102 @@ static void drawRoadSection() {
     }
 }
 
+// Scenario logic, READ-ONLY. Everything here comes out of the HEAP slot pools
+// (docs/MAP_FORMAT.md §5.6); the Lua bodies a trigger runs are still opaque, so
+// the panel names the handler and stops rather than inventing an editor for it.
+static void drawTriggerPanel() {
+    if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
+    const ScenarioData& sc = g_scene.scen;
+    if (!sc.ok) {
+        ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
+                           "The scenario tree did not walk cleanly on this map.");
+        ImGui::TextDisabled("Run --heaptest on it before trusting anything below.");
+        return;
+    }
+    ImGui::Text("%d locations, %d objectives, %d variables, %d groups, %d camera paths",
+                (int)sc.locations.size(), (int)sc.objectives.size(), (int)sc.vars.size(),
+                (int)sc.groups.size(), (int)sc.cameras.size());
+    ImGui::TextDisabled("%d trigger handlers registered; their Lua bodies are not decoded",
+                        sc.triggerHandlers);
+    ImGui::TextDisabled("read-only");
+
+    if (ImGui::BeginTabBar("##scentabs")) {
+        if (ImGui::BeginTabItem("Locations")) {
+            ImGui::TextDisabled("shown in the viewport as ellipses; double-click to frame one");
+            ImGui::BeginChild("##loclist", ImVec2(0, 260), true);
+            for (int k = 0; k < (int)sc.locations.size(); k++) {
+                const ScenLocation& L = sc.locations[(size_t)k];
+                char lbl[220];
+                snprintf(lbl, sizeof(lbl), "%s%s##loc%d",
+                         L.name.empty() ? "(unnamed)" : L.name.c_str(),
+                         L.isStart ? "   [start]" : "", k);
+                if (ImGui::Selectable(lbl, k == g_locSel)) g_locSel = k;
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                    g_cam.target = V3{ L.pos[0], terrainHeightAt(L.pos[0], L.pos[1]), L.pos[1] };
+                    if (g_cam.dist > 120.0f) g_cam.dist = 120.0f;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("heap slot %d\ncentre (%.1f, %.1f)\n"
+                                      "half-extents %.1f x %.1f\n%d trigger%s",
+                                      L.heapIndex, L.pos[0], L.pos[1], L.size[0], L.size[1],
+                                      L.triggerCount, L.triggerCount == 1 ? "" : "s");
+            }
+            ImGui::EndChild();
+            if (g_locSel >= 0 && g_locSel < (int)sc.locations.size()) {
+                const ScenLocation& L = sc.locations[(size_t)g_locSel];
+                ImGui::SeparatorText("Location");
+                ImGui::Text("centre        %.2f, %.2f", L.pos[0], L.pos[1]);
+                ImGui::Text("half-extents  %.2f x %.2f", L.size[0], L.size[1]);
+                ImGui::Text("active        %s", L.active ? "yes" : "no");
+                ImGui::Text("triggers      %d", L.triggerCount);
+                if (L.isStart)
+                    ImGui::Text("start location  id %d, team %d", L.startId, L.startTeam);
+                ImGui::TextDisabled("heap slot %d (stable key; chain order is not)", L.heapIndex);
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Objectives")) {
+            ImGui::BeginChild("##objlist", ImVec2(0, 300), true);
+            for (const ScenObjective& O : sc.objectives) {
+                ImGui::Text("%-30s type %d   prestige %d   status %d%s",
+                            O.id.empty() ? "(unnamed)" : O.id.c_str(),
+                            O.type, O.prestige, O.status, O.hidden ? "   hidden" : "");
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Variables")) {
+            ImGui::BeginChild("##varlist", ImVec2(0, 300), true);
+            for (const ScenTriggerVar& T : sc.vars) {
+                ImGui::Text("%-26s = %-8d %s", T.name.c_str(), T.value,
+                            T.active ? "" : "(inactive)");
+                if (!T.trigger.empty()) ImGui::TextDisabled("      -> %s", T.trigger.c_str());
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Groups")) {
+            ImGui::BeginChild("##grplist", ImVec2(0, 300), true);
+            for (const ScenGroup& G : sc.groups)
+                ImGui::Text("%-26s type %d   index %d   player %d   %d member%s",
+                            G.name.empty() ? "(unnamed)" : G.name.c_str(),
+                            G.type, G.index, G.player, G.members, G.members == 1 ? "" : "s");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Cameras")) {
+            ImGui::BeginChild("##camlist", ImVec2(0, 300), true);
+            for (const ScenCameraPath& C : sc.cameras)
+                ImGui::Text("%-26s eye %d  target %d  %.1f s",
+                            C.name.empty() ? "(unnamed)" : C.name.c_str(),
+                            C.eyeIndex, C.targetIndex, C.seconds);
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
 static void drawDecalPanel() {
     if (!g_scene.loaded) { ImGui::TextDisabled("Load a map."); return; }
     ImGui::Text("%d decals, %d road records", (int)g_scene.decalRecs.size(),
@@ -1791,6 +1889,7 @@ static void drawModePanel() {
         if (modeIs(MK_LIGHT)) { drawLightPanel(); ImGui::End(); return; }
         if (modeIs(MK_RIVER)) { drawRiverPanel(); ImGui::End(); return; }
         if (modeIs(MK_OVERLAY)) { drawDecalPanel(); ImGui::End(); return; }
+        if (modeIs(MK_TRIGGER)) { drawTriggerPanel(); ImGui::End(); return; }
         if (!modeIs(MK_TERRAIN) && !modeIs(MK_OBJECT)) {
             const char* why = nullptr;
             bool retired = false;
@@ -2466,6 +2565,52 @@ static void drawSelectionOverlay(const ImVec2& cmin, const ImVec2& cmax) {
     const ImU32 kHandle = IM_COL32(255, 255, 255, 255);
     const ImU32 kEdge   = IM_COL32(0, 0, 0, 200);
 
+    // Scenario locations: ellipses on the ground, in Trigger mode only. `Size` is
+    // HALF-extents (the 0x0005 vec2f), and `Color` is the artists' own per-location
+    // colour, so use it rather than inventing a palette.
+    if (modeIs(MK_TRIGGER) && g_scene.scen.ok) {
+        const ScenarioData& sc = g_scene.scen;
+        for (int k = 0; k < (int)sc.locations.size(); k++) {
+            const ScenLocation& L = sc.locations[(size_t)k];
+            if (L.size[0] <= 0.01f && L.size[1] <= 0.01f) continue;
+            const bool sel = (k == g_locSel);
+            // Colour is packed as one uint32; the low three bytes read as RGB on
+            // this corpus (alpha is the high byte and is 0xFF nearly everywhere).
+            unsigned cc = L.color;
+            int cr = (int)((cc >> 16) & 0xFF), cg = (int)((cc >> 8) & 0xFF), cb = (int)(cc & 0xFF);
+            if (cr + cg + cb < 40) { cr = 120; cg = 200; cb = 255; }   // near-black: unreadable
+            const ImU32 col = sel ? IM_COL32(255, 210, 40, 255)
+                                  : IM_COL32(cr, cg, cb, L.active ? 190 : 90);
+            ImVec2 pts[33]; int n = 0; bool ok = true;
+            for (int a = 0; a < 32 && ok; a++) {
+                float t = (float)a * 6.2831853f / 32.0f;
+                float wx = L.pos[0] + std::cos(t) * L.size[0];
+                float wz = L.pos[1] + std::sin(t) * L.size[1];
+                ok = projectToView(vp, V3{ wx, terrainHeightAt(wx, wz) + 0.5f, wz },
+                                   cmin, W, H, pts[n]);
+                if (ok) n++;
+            }
+            if (ok && n >= 3) {
+                dl->AddPolyline(pts, n, col, sel ? 2.5f : 1.5f, ImDrawFlags_Closed);
+                if (sel) dl->AddConvexPolyFilled(pts, n, IM_COL32(255, 210, 40, 30));
+            }
+            // Name the selected one and every start location — labelling all 73
+            // at once is unreadable.
+            if (sel || L.isStart) {
+                ImVec2 sp;
+                if (projectToView(vp, V3{ L.pos[0], terrainHeightAt(L.pos[0], L.pos[1]) + 0.5f,
+                                          L.pos[1] }, cmin, W, H, sp)) {
+                    const char* nm = L.name.empty() ? "(unnamed)" : L.name.c_str();
+                    ImVec2 ts = ImGui::CalcTextSize(nm);
+                    dl->AddRectFilled(ImVec2(sp.x - ts.x*0.5f - 3, sp.y - ts.y - 4),
+                                      ImVec2(sp.x + ts.x*0.5f + 3, sp.y + 1),
+                                      IM_COL32(0, 0, 0, 150));
+                    dl->AddText(ImVec2(sp.x - ts.x*0.5f, sp.y - ts.y - 2), col, nm);
+                }
+            }
+        }
+    }
+
     // Overlay editing: draw the node handles of the selected road so there is
     // something to aim at, and outline a selected decal. Only in overlay mode —
     // 320 roads' worth of dots would bury every other mode.
@@ -2502,7 +2647,8 @@ static void drawSelectionOverlay(const ImVec2& cmin, const ImVec2& cmax) {
                 ok = projectToView(vp, V3{ wx, terrainHeightAt(wx, wz) + 0.4f, wz },
                                    cmin, W, H, pts[k]);
             }
-            if (ok) dl->AddPolyline(pts, 4, IM_COL32(255, 210, 40, 235), true, 2.0f);
+            if (ok) dl->AddPolyline(pts, 4, IM_COL32(255, 210, 40, 235), 2.0f,
+                                    ImDrawFlags_Closed);
         }
     }
 
@@ -3840,6 +3986,87 @@ int main(int argc, char** argv) {
                 printf("chunktile: %d map(s), %d failed\n", n, bad);
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
+        }
+        else if (!strcmp(argv[i], "--scentest") && i + 1 < argc) {
+            // dev: --scentest <map|dir> — scenario record VALUES, not just the
+            // walk. --heaptest already proves the tree consumes exactly; this
+            // proves the fields we surface are the right ones, by asserting
+            // semantics no wrong field assignment would satisfy.
+            struct Acc { int maps=0, loc=0, obj=0, var=0, grp=0, cam=0, trg=0;
+                         int named=0, inWorld=0, sizePos=0, startLoc=0, bad=0;
+                         float maxSx=0; std::string maxWhere; } A;
+            auto one = [&A](const std::string& p, bool verbose) -> bool {
+                Scene s;
+                if (!load_map_native(p, s)) return true;      // not a CPCW map: skip
+                const ScenarioData& sc = s.scen;
+                if (!sc.ok) { printf("scentest: %s TREE FAILED\n", p.c_str()); return false; }
+                A.maps++;
+                A.loc += (int)sc.locations.size(); A.obj += (int)sc.objectives.size();
+                A.var += (int)sc.vars.size();      A.grp += (int)sc.groups.size();
+                A.cam += (int)sc.cameras.size();   A.trg += sc.triggerHandlers;
+                const float W = (float)s.world_w, H = (float)s.world_h;
+                for (const ScenLocation& L : sc.locations) {
+                    if (!L.name.empty()) A.named++;
+                    // A location is a place on THIS map: its centre must land in
+                    // the world rect (with a margin — some sit just outside).
+                    if (L.pos[0] > -64 && L.pos[0] < W + 64 &&
+                        L.pos[1] > -64 && L.pos[1] < H + 64) A.inWorld++;
+                    // Ellipse half-extents: non-negative and not absurd.
+                    if (L.size[0] >= 0 && L.size[1] >= 0 &&
+                        L.size[0] < 4096 && L.size[1] < 4096) A.sizePos++;
+                    if (L.isStart) A.startLoc++;
+                    float mx = std::max(L.size[0], L.size[1]);
+                    if (mx > A.maxSx) { A.maxSx = mx; A.maxWhere = L.name; }
+                }
+                if (verbose) {
+                    printf("%-40s loc=%d obj=%d var=%d grp=%d cam=%d triggers=%d\n",
+                           p.substr(p.find_last_of("/\\") + 1).c_str(),
+                           (int)sc.locations.size(), (int)sc.objectives.size(),
+                           (int)sc.vars.size(), (int)sc.groups.size(),
+                           (int)sc.cameras.size(), sc.triggerHandlers);
+                    for (size_t k = 0; k < sc.locations.size() && k < 6; k++) {
+                        const ScenLocation& L = sc.locations[k];
+                        printf("   loc[%d] %-28s pos(%.1f, %.1f) size(%.1f x %.1f) "
+                               "active=%d start=%d triggers=%d\n", L.heapIndex,
+                               L.name.c_str(), L.pos[0], L.pos[1], L.size[0], L.size[1],
+                               (int)L.active, (int)L.isStart, L.triggerCount);
+                    }
+                    for (size_t k = 0; k < sc.objectives.size() && k < 4; k++)
+                        printf("   obj  %-30s type=%d prestige=%d status=%d hidden=%d\n",
+                               sc.objectives[k].id.c_str(), sc.objectives[k].type,
+                               sc.objectives[k].prestige, sc.objectives[k].status,
+                               (int)sc.objectives[k].hidden);
+                    for (size_t k = 0; k < sc.vars.size() && k < 4; k++)
+                        printf("   var  %-24s = %d  trigger=%s\n", sc.vars[k].name.c_str(),
+                               sc.vars[k].value, sc.vars[k].trigger.c_str());
+                }
+                return true;
+            };
+            std::error_code ec;
+            if (std::filesystem::is_directory(argv[i+1], ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec)) continue;
+                    if (it->path().extension() != ".map") continue;
+                    if (!one(it->path().string(), false)) A.bad++;
+                }
+            } else { if (!one(argv[i+1], true)) A.bad = 1; }
+            printf("scentest: maps=%d locations=%d objectives=%d vars=%d groups=%d "
+                   "cameras=%d triggerHandlers=%d\n",
+                   A.maps, A.loc, A.obj, A.var, A.grp, A.cam, A.trg);
+            printf("scentest: named=%d/%d  centre-in-world=%d/%d  size-sane=%d/%d  "
+                   "start-locations=%d  largest-half-extent=%.1f (%s)\n",
+                   A.named, A.loc, A.inWorld, A.loc, A.sizePos, A.loc, A.startLoc,
+                   A.maxSx, A.maxWhere.c_str());
+            // The corpus totals are already pinned by --heaptest; assert the
+            // semantics here. Every location is named, sized sanely, and lands on
+            // its own map — none of which holds if a field is read at the wrong
+            // offset or with the wrong width.
+            bool pass = A.bad == 0 && A.loc > 0 &&
+                        A.named == A.loc && A.sizePos == A.loc &&
+                        A.inWorld == A.loc && A.startLoc > 0;
+            printf("scentest: %s\n", pass ? "PASS" : "FAIL");
+            return pass ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--overlaypicktest") && i + 1 < argc) {
             // dev: --overlaypicktest <map> — the world-space core of overlay

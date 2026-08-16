@@ -133,6 +133,7 @@ Every write path has a no-window check that runs from the command line:
 | `--roadauxtest <map\|dir>` | GROA Catmull-Rom handle identity on untouched files; asserts no NEW mismatch, not zero (2 of 27792 shipped nodes are genuinely off) |
 | `--roadwritetest <map> out.map [slot] [node]` | move a road node: only the three node records change, endpoint handle direction bit-identical, identity restored at the moved node |
 | `--overlaypicktest <map>` | world-space core of overlay picking: every road node resolves to itself, every decal centre to a decal, and no decal is shadowed by a nearer road node |
+| `--scentest <map\|dir>` | scenario record values: every location named, sized sanely, and centred inside its own map |
 | `--overlayscan <map\|dir>` | GROL/GDCL/GRVL slot pools walk exactly, counts match, used-list invariants hold; river summary |
 | `--no-roads` `--no-decals` `--no-rivers` | drop one overlay layer, so a `--shot` pair isolates its pixels |
 | `--lighting {editor\|preset\|presetfog}` `--preset <name\|#slot>` | shade a `--shot` with a chosen WTHR preset |

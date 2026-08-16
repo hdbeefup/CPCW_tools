@@ -4,6 +4,7 @@
 #include "mapfile.h"
 #include "overlays.h"
 #include "weather.h"
+#include "heap.h"
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -562,6 +563,7 @@ bool load_map_native(const std::string& path, Scene& out) {
     // roads (GROL/GROA) + decals (GDCL/GDEC) overlay geometry (needs heights set)
     parse_overlays(out.raw, out);
     parse_weather(out.raw, out);       // WRLD/WTHR lighting presets
+    map_scenario_read(out.raw, out.scen);   // locations / objectives / triggers
     out.loaded = true;
     return true;
 }

@@ -34,6 +34,7 @@ $E --heaptest   <map|dir>                  # scenario trees: every OBJS section 
 $E --roadauxtest <map|dir>                 # GROA Catmull-Rom handle identity (no NEW mismatch)
 $E --roadwritetest <map> out.map [slot] [node]   # move a road node + re-derive handles
 $E --overlaypicktest <map>                 # world-space core of decal / road-node picking
+$E --scentest   <map|dir>                  # scenario record VALUES (semantics, not just the walk)
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -340,7 +341,16 @@ correctly rejected).
    reaches all 1265 SLocation / 260 SGroup / 167 SObjective / 139 TriggerVar /
    116 SCameraPath — the counts a brute-force VOBJ tag scan finds. A tag-first
    walk reached **none** of them. Still open: what a trigger's Lua body *means*,
-   and any UI or write path (deliberately out of scope — this was a decode spike).
+   **Trigger mode is now LIVE and read-only**: locations
+   (drawn as ellipses in their own `Color`, `Size` being HALF-extents), objectives,
+   trigger variables, groups and camera paths, all off `Scene::scen`
+   (`map_scenario_read`). `--scentest` asserts SEMANTICS, not just the walk: every
+   one of 1265 locations is named, sized sanely, and has its centre inside its own
+   map's rect — none of which holds if a field is read at the wrong offset or
+   width. Largest half-extent in the corpus is **697.3, a location literally named
+   `AllOnMap`**, so whole-map zones are real data, not a decode bug; M_01's largest
+   is 192.6 (`newObjHq`). Sorting locations by AREA hides these — sort by max
+   extent. Still open: what a trigger's Lua body *means*, and any write path.
    - `WTHR` is **decoded and editable** (Light mode). Still open: the horizontal
      sun swizzle, so nothing lights the viewport yet.
    - `GRVL`/`GRVR` rivers are **decoded and drawn** (River mode, read-only). Still
