@@ -113,6 +113,19 @@ struct Scene {
     };
     std::vector<DecalRec> decalRecs;
     int decalEdited = 0;                 // how many decals differ from the file
+    // Decoded GROA node arrays. Roads render as a baked ribbon (area fills as a
+    // triangulated polygon), so as with decals the geometry cannot be edited
+    // back into node positions — keep the byte offsets alongside it.
+    // Each node is 36 bytes: 3f pos, 3f in-handle, 3f out-handle. The handles
+    // are Catmull-Rom tangents and must be re-derived when a node moves.
+    struct RoadRec {
+        int slot = -1; long nodesOff = -1;  // first node (body + 8)
+        int nodeCount = 0;
+        bool isArea = false;                // area fill, not a centreline
+        std::string tex;
+    };
+    std::vector<RoadRec> roadRecs;
+    int roadEdited = 0;                  // how many road nodes differ from the file
     // WRLD/WTHR lighting presets (weather.cpp). Empty when the chunk is absent,
     // is the older flat chunk version 2, or fails to walk exactly.
     std::vector<WeatherPreset> weather;

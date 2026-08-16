@@ -130,6 +130,8 @@ Every write path has a no-window check that runs from the command line:
 | `--wthrtest <map\|dir> [out.map]` | WTHR pool walks exactly + the semantic assertions that pin the field order; with `out.map`, a write leg |
 | `--chunktile <map\|dir>` | container sizes tile exactly + every OBJS `schema_offset` points at its own SCHD |
 | `--heaptest <map\|dir>` | scenario object trees: every OBJS section consumes to exactly its own SCHD offset, every HEAP to its chunk end, both slot-pool chains valid |
+| `--roadauxtest <map\|dir>` | GROA Catmull-Rom handle identity on untouched files; asserts no NEW mismatch, not zero (2 of 27792 shipped nodes are genuinely off) |
+| `--roadwritetest <map> out.map [slot] [node]` | move a road node: only the three node records change, endpoint handle direction bit-identical, identity restored at the moved node |
 | `--overlayscan <map\|dir>` | GROL/GDCL/GRVL slot pools walk exactly, counts match, used-list invariants hold; river summary |
 | `--no-roads` `--no-decals` `--no-rivers` | drop one overlay layer, so a `--shot` pair isolates its pixels |
 | `--lighting {editor\|preset\|presetfog}` `--preset <name\|#slot>` | shade a `--shot` with a chosen WTHR preset |

@@ -167,9 +167,87 @@ bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
     return true;
 }
 
+bool overlay_set_road_node(Scene& s, int slot, int node, float x, float z) {
+    if (!s.roadPool.ok || s.raw.empty()) return false;          // fail closed
+    const Scene::RoadRec* rr = nullptr;
+    for (const Scene::RoadRec& r : s.roadRecs) if (r.slot == slot) { rr = &r; break; }
+    if (!rr || rr->nodeCount < 2) return false;
+    const int N = rr->nodeCount;
+    if (node < 0 || node >= N) return false;
+    const long base = rr->nodesOff;
+    if (base < 0 || base + (long)N * 36 > (long)s.raw.size()) return false;
+
+    auto posAt = [&](int i, float out[3]) {
+        std::memcpy(out, &s.raw[(size_t)base + (size_t)i * 36], 12);
+    };
+    auto dist = [](const float a[3], const float b[3]) {
+        float dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
+        return std::sqrt(dx*dx + dy*dy + dz*dz);
+    };
+
+    // Old positions of the three nodes whose handles can change, captured BEFORE
+    // the move so an endpoint's segment-length ratio is measurable.
+    float oldP[3][3];
+    for (int k = -1; k <= 1; k++) {
+        int i = node + k;
+        if (i >= 0 && i < N) posAt(i, oldP[k + 1]);
+    }
+
+    // Move the node. pos.y is 0.0 on all 35668 shipped nodes — roads are 2D and
+    // projected onto the heightmap at render time — so it is deliberately not
+    // written here; a drag must not invent an elevation the format never carries.
+    std::memcpy(&s.raw[(size_t)base + (size_t)node * 36 + 0], &x, 4);
+    std::memcpy(&s.raw[(size_t)base + (size_t)node * 36 + 8], &z, 4);
+
+    // Re-derive the Catmull-Rom handles of the moved node and both neighbours.
+    // Interior nodes are reproducible from the neighbouring positions on
+    // 27790/27792 shipped nodes; endpoints are NOT (the stored direction departs
+    // from the chord by up to 83 degrees), so an endpoint keeps its direction
+    // bit-for-bit and only its magnitude is scaled by the segment-length ratio —
+    // exact for a drag next to an endpoint, a no-op when the length is unchanged.
+    for (int k = -1; k <= 1; k++) {
+        const int i = node + k;
+        if (i < 0 || i >= N) continue;
+        const size_t hoff = (size_t)base + (size_t)i * 36 + 12;   // in[3], out[3]
+        if (i > 0 && i < N - 1) {
+            float Pm[3], P[3], Pp[3];
+            posAt(i - 1, Pm); posAt(i, P); posAt(i + 1, Pp);
+            float T[3] = { Pp[0]-Pm[0], Pp[1]-Pm[1], Pp[2]-Pm[2] };
+            float L = std::sqrt(T[0]*T[0] + T[1]*T[1] + T[2]*T[2]);
+            if (L < 1e-9f) continue;                    // degenerate: leave as-is
+            T[0]/=L; T[1]/=L; T[2]/=L;
+            const float dPrev = dist(P, Pm), dNext = dist(Pp, P);
+            float h[6] = { -T[0]*dPrev, -T[1]*dPrev, -T[2]*dPrev,
+                            T[0]*dNext,  T[1]*dNext,  T[2]*dNext };
+            std::memcpy(&s.raw[hoff], h, 24);
+        } else {
+            // Endpoint: scale magnitude, preserve direction exactly. Its only
+            // adjacent segment is i–j, and j is always inside the [node-1,node+1]
+            // window we captured: an endpoint reached from that window is either
+            // `node` itself or one step from it, and its neighbour steps back
+            // toward `node`. Guarded anyway rather than argued.
+            const int j = (i == 0) ? 1 : N - 2;
+            const int oi = i - node + 1, oj = j - node + 1;
+            if (oi < 0 || oi > 2 || oj < 0 || oj > 2) continue;
+            float Pj[3], Pi[3];
+            posAt(j, Pj); posAt(i, Pi);
+            const float newLen = dist(Pj, Pi);
+            const float oldLen = dist(oldP[oj], oldP[oi]);
+            if (oldLen < 1e-6f || newLen < 1e-6f) continue;
+            const float ratio = newLen / oldLen;
+            if (ratio == 1.0f) continue;                // bit-exact no-op
+            float h[6];
+            std::memcpy(h, &s.raw[hoff], 24);
+            for (int c = 0; c < 6; c++) h[c] *= ratio;
+            std::memcpy(&s.raw[hoff], h, 24);
+        }
+    }
+    return true;
+}
+
 void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
     s.roads.clear(); s.decals.clear(); s.roadSplines.clear(); s.rivers.clear();
-    s.decalRecs.clear();
+    s.decalRecs.clear(); s.roadRecs.clear();
     s.roadPool = Scene::OverlayPool{}; s.decalPool = Scene::OverlayPool{};
     s.riverPool = Scene::OverlayPool{};
     // Locate GTRN through the chunk tree (SCEN -> WRLD -> GTRN) rather than
@@ -255,6 +333,12 @@ void parse_overlays(const std::vector<unsigned char>& d, Scene& s) {
                 rs.cx = std::move(px); rs.cz = std::move(pz);
                 s.roadSplines.push_back(std::move(rs));
             }
+            // Where the editable nodes live, kept for BOTH shapes: an area fill
+            // is still a node array, it is only drawn differently.
+            Scene::RoadRec rr;
+            rr.slot = r.slot; rr.nodesOff = (long)(b + 8);
+            rr.nodeCount = (int)nv; rr.isArea = isArea; rr.tex = mat;
+            s.roadRecs.push_back(std::move(rr));
         }
     }
 

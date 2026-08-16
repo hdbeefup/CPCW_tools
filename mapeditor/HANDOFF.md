@@ -31,6 +31,8 @@ $E --chunktile  <map|dir>                  # container sizes tile exactly (see b
 $E --overlayscan <map|dir>                 # GROL/GDCL/GRVL pools + used-list invariants
 $E --wthrtest   <map|dir> [out.map]        # WTHR layout + field-order semantics
 $E --heaptest   <map|dir>                  # scenario trees: every OBJS section walks to its SCHD
+$E --roadauxtest <map|dir>                 # GROA Catmull-Rom handle identity (no NEW mismatch)
+$E --roadwritetest <map> out.map [slot] [node]   # move a road node + re-derive handles
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -278,16 +280,34 @@ correctly rejected).
    runtime constant. TUNE if widths look off; verify tiling on maps other than M_01.
 4. **Area fills** (aprons/plazas) are still centroid-fan triangulated in
    `overlays.cpp` (a convexity assumption), and detected by a name+bbox heuristic.
-5. **Decals are editable; roads and rivers are still read-only.**
+5. **Decals and road nodes have write paths; rivers are read-only, and roads have
+   no UI yet.** `overlay_set_road_node()` moves a GROA node and re-derives the
+   Catmull-Rom handles of that node and both neighbours — size-preserving, only
+   the three 36-byte node records change (`--roadwritetest`). Measured facts you
+   should not re-derive: the handle identity `T = normalize(P[i+1]-P[i-1]);
+   in = -T*|P[i]-P[i-1]|; out = T*|P[i+1]-P[i]|` holds on **27790 of 27792**
+   shipped interior nodes (median error 5e-07; the 2 exceptions are both in
+   Domination/(4) The Last Village, worst 0.187) — it is a re-derivable DEFAULT a
+   designer can perturb, so `--roadauxtest` asserts **no NEW mismatch**, never
+   zero. **Endpoints are NOT reproducible**: `|in| == |out|` holds 7876/7876 but
+   the stored direction departs from the chord by up to **83 degrees** (median
+   0.89, only 3226/6206 within 1 degree), so an endpoint keeps its direction
+   bit-for-bit and only its magnitude is scaled by the segment-length ratio.
+   `pos.y` is exactly 0.0 on all 35668 nodes — roads are 2D and projected onto
+   the heightmap — so a drag must not write an elevation.
+   Still missing: the **UI**. There is no road-node selection, gizmo or panel, so
+   the writer is reachable only from `--roadwritetest`. That needs the `SelKind`
+   selection refactor (`g_selection` is a `std::set<int>` of ENTITY indices read
+   by eight call sites; tagged indices would corrupt all of them).
    `overlay_set_decal()` writes the five GDEC transform floats straight into
    `Scene::raw` — 20 bytes, size-preserving, so `save_map_native` stays
    byte-faithful with NO ancestor-size patching. Verified safe on the corpus:
    decals at genuinely different positions ship byte-identical trailing data
    (Domination/(4) Islands Of Hope has one trailing body shared by four
    transforms), so nothing after the transform derives from it. `--decalwritetest`.
-   Still open: road node drag (must re-derive the neighbouring Catmull-Rom
-   handles), river editing, and create/delete for any of them (structural).
-   NOTE `g_overlayDirty` — the decal meshes are BAKED geometry, so an edit
+   Still open beyond the road UI: river editing, and create/delete for any of
+   them (structural — free-list surgery, the one unproven inference).
+   NOTE `g_overlayDirty` — decal and road meshes are BAKED geometry, so an edit
    without a re-decode + `buildOverlays` is correct and completely invisible.
 6. **The scenario object trees are DECODED (read-only); only the Lua trigger
    bodies remain.** The `HEAP` (type `0x89A5`) that used to block this is solved

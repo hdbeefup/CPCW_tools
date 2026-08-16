@@ -24,3 +24,24 @@ void parse_overlays(const std::vector<unsigned char>& raw, Scene& s);
 // not live. Re-run parse_overlays afterwards or the edit is correct and invisible.
 bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
                        float sx, float sy, float rot);
+
+// Move one GROA road node, re-deriving the Catmull-Rom handles of that node and
+// both neighbours. Size-preserving like overlay_set_decal — nothing outside the
+// three 36-byte node records changes, so the save stays byte-faithful with no
+// ancestor-size patching.
+//
+// The handle identity `T = normalize(P[i+1]-P[i-1]); in = -T*|P[i]-P[i-1]|;
+// out = T*|P[i+1]-P[i]|` reproduces the shipped bytes on 27790 of 27792 interior
+// nodes (median error 5e-07; the 2 exceptions are both in Domination/(4) The Last
+// Village). It is therefore a re-derivable DEFAULT a designer can perturb, not an
+// invariant — see --roadauxtest, which asserts no NEW mismatch rather than zero.
+//
+// Endpoints are NOT reproducible: |in| == |out| holds on 7876/7876, but the
+// stored direction departs from the chord by up to 83 degrees, so an endpoint
+// keeps its direction bit-for-bit and only its magnitude is scaled.
+//
+// `slot` is the POOL SLOT, not an index into `roadSplines`. Returns false if the
+// map has no writable road pool or that slot/node is not live. Re-run
+// parse_overlays afterwards or the edit is correct and invisible (the ribbon is
+// baked geometry).
+bool overlay_set_road_node(Scene& s, int slot, int node, float x, float z);

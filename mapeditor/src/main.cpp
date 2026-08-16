@@ -3505,6 +3505,157 @@ int main(int argc, char** argv) {
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
         }
+        else if (!strcmp(argv[i], "--roadauxtest") && i + 1 < argc) {
+            // dev: --roadauxtest <map|dir> — the Catmull-Rom handle identity on
+            // UNTOUCHED files. This is a re-derivable default a designer can
+            // perturb, not an invariant: 2 of 27792 shipped interior nodes are
+            // off by more than 0.01 (max 0.187, both in Domination/(4) The Last
+            // Village). So the bar is "no NEW mismatch", never "zero mismatch" —
+            // a harness that is red on day one gets weakened and stops anchoring.
+            auto scan = [](const std::string& p, int& interior, int& bad,
+                           double& worst, std::string& worstWhere) -> bool {
+                Scene s;
+                if (!load_map_native(p, s)) return false;
+                for (const Scene::RoadRec& r : s.roadRecs) {
+                    if (r.nodeCount < 3 || r.nodesOff < 0) continue;
+                    if (r.nodesOff + (long)r.nodeCount * 36 > (long)s.raw.size()) continue;
+                    auto P = [&](int k, float o[3]) {
+                        memcpy(o, &s.raw[(size_t)r.nodesOff + (size_t)k * 36], 12); };
+                    for (int k = 1; k < r.nodeCount - 1; k++) {
+                        float Pm[3], Pc[3], Pp[3], h[6];
+                        P(k-1, Pm); P(k, Pc); P(k+1, Pp);
+                        memcpy(h, &s.raw[(size_t)r.nodesOff + (size_t)k * 36 + 12], 24);
+                        float T[3] = { Pp[0]-Pm[0], Pp[1]-Pm[1], Pp[2]-Pm[2] };
+                        float L = sqrtf(T[0]*T[0]+T[1]*T[1]+T[2]*T[2]);
+                        if (L < 1e-9f) continue;
+                        T[0]/=L; T[1]/=L; T[2]/=L;
+                        auto dis = [](const float a[3], const float b[3]) {
+                            float dx=a[0]-b[0],dy=a[1]-b[1],dz=a[2]-b[2];
+                            return sqrtf(dx*dx+dy*dy+dz*dz); };
+                        float dp = dis(Pc,Pm), dn = dis(Pp,Pc);
+                        float e[6] = { -T[0]*dp,-T[1]*dp,-T[2]*dp, T[0]*dn,T[1]*dn,T[2]*dn };
+                        float ein = dis(h, e), eout = dis(h+3, e+3);
+                        double err = std::max(ein, eout);
+                        interior++;
+                        if (err > 0.01) {
+                            bad++;
+                            if (err > worst) { worst = err;
+                                worstWhere = p.substr(p.find_last_of("/\\")+1) +
+                                    " slot " + std::to_string(r.slot) +
+                                    " node " + std::to_string(k); }
+                        }
+                    }
+                }
+                return true;
+            };
+            int interior = 0, bad = 0, maps = 0; double worst = 0; std::string where;
+            std::error_code ec;
+            if (std::filesystem::is_directory(argv[i+1], ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(argv[i+1], ec);
+                     it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    if (ec || !it->is_regular_file(ec)) continue;
+                    if (it->path().extension() != ".map") continue;
+                    if (scan(it->path().string(), interior, bad, worst, where)) maps++;
+                }
+            } else { if (scan(argv[i+1], interior, bad, worst, where)) maps = 1; }
+            printf("roadauxtest: maps=%d interior=%d within0.01=%d bad=%d worst=%.5f %s\n",
+                   maps, interior, interior - bad, bad, worst, where.c_str());
+            // Corpus baseline, asserted only for a whole-corpus run.
+            bool pass = (maps == 1) ? true : (interior == 27792 && bad == 2);
+            printf("roadauxtest: %s\n", pass ? "PASS" : "FAIL");
+            return pass ? 0 : 3;
+        }
+        else if (!strcmp(argv[i], "--roadwritetest") && i + 2 < argc) {
+            // dev: --roadwritetest <map> <out.map> [slot] [node]
+            Scene s;
+            if (!load_map_native(argv[i+1], s)) { printf("roadwritetest: load failed\n"); return 2; }
+            if (s.roadRecs.empty()) { printf("roadwritetest: no roads\n"); return 2; }
+            int slot = (i + 3 < argc) ? atoi(argv[i+3]) : -1;
+            int node = (i + 4 < argc) ? atoi(argv[i+4]) : 1;
+            const Scene::RoadRec* rr = nullptr;
+            for (const Scene::RoadRec& r : s.roadRecs) {
+                if (slot >= 0 ? (r.slot == slot) : (r.nodeCount >= 5)) { rr = &r; break; }
+            }
+            if (!rr) { printf("roadwritetest: no suitable road\n"); return 2; }
+            slot = rr->slot;
+            if (node < 1 || node > rr->nodeCount - 2) node = 1;
+            const long base = rr->nodesOff;
+            const int N = rr->nodeCount;
+            std::vector<unsigned char> before = s.raw;
+
+            float p0[3]; memcpy(p0, &s.raw[(size_t)base + (size_t)node * 36], 12);
+            // Endpoint direction must survive bit-for-bit; capture both ends.
+            float e0[6], e1[6];
+            memcpy(e0, &s.raw[(size_t)base + 12], 24);
+            memcpy(e1, &s.raw[(size_t)base + (size_t)(N-1) * 36 + 12], 24);
+
+            bool ok = overlay_set_road_node(s, slot, node, p0[0] + 3.5f, p0[2] - 2.25f);
+
+            // 1. only the three node records may differ
+            long changed = 0, outside = 0;
+            for (size_t k = 0; k < s.raw.size() && k < before.size(); k++) {
+                if (s.raw[k] == before[k]) continue;
+                changed++;
+                long rel = (long)k - base;
+                long lo = (long)std::max(0, node - 1) * 36;
+                long hi = (long)std::min(N - 1, node + 1) * 36 + 36;
+                if (rel < lo || rel >= hi) outside++;
+            }
+            bool sizeSame = s.raw.size() == before.size();
+
+            // 2. read the moved position back
+            float p1[3]; memcpy(p1, &s.raw[(size_t)base + (size_t)node * 36], 12);
+            bool moved = fabsf(p1[0] - (p0[0]+3.5f)) < 1e-4f &&
+                         fabsf(p1[2] - (p0[2]-2.25f)) < 1e-4f && p1[1] == p0[1];
+
+            // 3. endpoint DIRECTION bit-identical after normalising the magnitude
+            auto dirSame = [](const float a[6], const float b[6]) {
+                float la = sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);
+                float lb = sqrtf(b[0]*b[0]+b[1]*b[1]+b[2]*b[2]);
+                if (la < 1e-9f || lb < 1e-9f) return la == lb;
+                for (int c = 0; c < 3; c++)
+                    if (fabsf(a[c]/la - b[c]/lb) > 1e-5f) return false;
+                return true;
+            };
+            float f0[6], f1[6];
+            memcpy(f0, &s.raw[(size_t)base + 12], 24);
+            memcpy(f1, &s.raw[(size_t)base + (size_t)(N-1) * 36 + 12], 24);
+            bool epDir = dirSame(e0, f0) && dirSame(e1, f1);
+
+            // 4. the identity now holds at the moved node
+            auto Pat = [&](int k, float o[3]) {
+                memcpy(o, &s.raw[(size_t)base + (size_t)k * 36], 12); };
+            float Pm[3], Pc[3], Pp[3], hh[6];
+            Pat(node-1, Pm); Pat(node, Pc); Pat(node+1, Pp);
+            memcpy(hh, &s.raw[(size_t)base + (size_t)node * 36 + 12], 24);
+            float T[3] = { Pp[0]-Pm[0], Pp[1]-Pm[1], Pp[2]-Pm[2] };
+            float L = sqrtf(T[0]*T[0]+T[1]*T[1]+T[2]*T[2]);
+            double identity = 1e9;
+            if (L > 1e-9f) {
+                T[0]/=L; T[1]/=L; T[2]/=L;
+                auto dis=[](const float a[3],const float b[3]){
+                    float dx=a[0]-b[0],dy=a[1]-b[1],dz=a[2]-b[2];
+                    return sqrtf(dx*dx+dy*dy+dz*dz); };
+                float dp=dis(Pc,Pm), dn=dis(Pp,Pc);
+                float ex[6]={-T[0]*dp,-T[1]*dp,-T[2]*dp, T[0]*dn,T[1]*dn,T[2]*dn};
+                identity = std::max(dis(hh,ex), dis(hh+3,ex+3));
+            }
+
+            { std::ofstream f(argv[i+2], std::ios::binary);
+              f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size()); }
+            Scene s2; bool reload = load_map_native(argv[i+2], s2);
+            bool poolIntact = reload && s2.roadPool.ok &&
+                              s2.roadRecs.size() == s.roadRecs.size();
+
+            printf("roadwritetest slot %d node %d/%d: write=%d changed=%ld outside=%ld "
+                   "sizeSame=%d moved=%d endpointDir=%d identity=%.2g reload=%d pool=%d %s\n",
+                   slot, node, N, (int)ok, changed, outside, (int)sizeSame, (int)moved,
+                   (int)epDir, identity, (int)reload, (int)poolIntact,
+                   (ok && outside == 0 && sizeSame && moved && epDir &&
+                    identity < 1e-3 && reload && poolIntact) ? "OK" : "FAIL");
+            return (ok && outside == 0 && sizeSame && moved && epDir &&
+                    identity < 1e-3 && reload && poolIntact) ? 0 : 3;
+        }
         else if (!strcmp(argv[i], "--heaptest") && i + 1 < argc) {
             // dev: --heaptest <map|dir> — read-only validator for the scenario
             // object trees (HEAP/HASH/ARRY). Every OBJS section must consume to
