@@ -36,6 +36,7 @@ $E --roadwritetest <map> out.map [slot] [node]   # move a road node + re-derive 
 $E --overlaypicktest <map>                 # world-space core of decal / road-node picking
 $E --scentest   <map|dir>                  # scenario record VALUES (semantics, not just the walk)
 $E --blcktest   <map|dir>                  # BLCK two-plane decode + world coverage
+$E --strtest    <map> out.map              # variable-length string resize (+ a .grown.map copy)
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -372,16 +373,27 @@ correctly rejected).
      Note this is only true of *water*: `GRVL` is **not** vestigial — earlier
      notes calling it "24 empty bytes in every map" measured only the 17 maps
      where it is empty; the other 28 carry real `GRVR` river records.
-7. **Strings are read-only in Properties** — editing one would resize the record.
-   Doing it properly means patching the enclosing VOBJ/OBJT sizes as well as the
-   container chain; the machinery for the container chain already exists.
-   Now unblocked on the format side: `OBJS.schema_offset` is the **only** absolute
-   file offset in a `.map`, so a resize needs the ancestor sizes plus that one
-   dword and nothing else. Checked by enumerating all 285,272 integer-typed field
-   values in the scenario trees of all 45 maps — hits on chunk-tag positions run
-   at 1.22x the local-density chance rate and no field exceeds a ~5% hit rate,
-   where a real pointer field would sit at 100%. Use `--chunktile` **and**
-   `--heaptest` as the detectors; the oracle validates neither.
+7. ~~Strings are read-only in Properties.~~ **CLOSED.** `set_entity_string()`
+   resizes the record: it splices the bytes, then bumps the enclosing VOBJ, the
+   enclosing OBJT, every ancestor container size, and the `OBJS schema_offset` —
+   the only absolute file offset a `.map` contains (checked over 285,272
+   integer-typed field values across all 45 maps; chunk-tag hits run at 1.22x the
+   LOCAL-density chance rate and no field exceeds ~5% where a pointer would be
+   100%). Same-length values still take the ordinary in-place path.
+   `Prototype` stays read-only on purpose: it is a fixed 36-char GUID the model
+   loader resolves through, so an arbitrary-length value there is a different and
+   much riskier edit — change the prototype through the browser instead.
+   **This is the edit that proves why `--chunktile` exists.** Drop the OBJT size
+   bump and `--strtest` fails with a **606,182-byte gap** and a broken entity
+   list — while `cpcw_map.py roundtrip` calls the same corrupt file
+   "re-write IDENTICAL". That is not a hypothetical any more; it is reproducible
+   by commenting out one line.
+   `--strtest` grows, shrinks and restores a field, checking tiling, entity count
+   and readback at every step, and requires the round trip back to the original
+   length to be **byte-identical to the input file**. It also leaves a
+   `.grown.map` copy, because the restored file cannot prove a RESIZED map is
+   well-formed; that copy passes `--chunktile` (5/5 OBJS), `--heaptest`,
+   `--scentest`, `--blcktest`, `--overlayscan`, `--roadauxtest` and the oracle.
 8. ~~No settings persistence.~~ **CLOSED.** `src/settings.{h,cpp}` — a versioned
    `key value` file beside the exe, unknown keys preserved, one `if (v < N)`
    migration block per bump. Two ordering constraints that are easy to get wrong:

@@ -596,6 +596,10 @@ namespace {
 inline uint32_t rd32(const std::vector<unsigned char>& b, long o) {
     return (uint32_t)(b[o] | (b[o+1]<<8) | (b[o+2]<<16) | ((uint32_t)b[o+3]<<24));
 }
+inline void wr16(std::vector<unsigned char>& b, long o, uint16_t v) {
+    if (o < 0 || o + 2 > (long)b.size()) return;
+    b[o]=v&0xff; b[o+1]=(v>>8)&0xff;
+}
 inline void wr32(std::vector<unsigned char>& b, long o, uint32_t v) {
     b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff;
 }
@@ -627,6 +631,71 @@ long schd_pos(const Scene& s) {
 }
 
 } // namespace
+
+bool set_entity_string(Scene& s, long entId, const std::string& fieldName,
+                       const std::string& value) {
+    if (s.raw.empty() || value.size() > 0xFFFF) return false;
+    const Entity* e = nullptr;
+    for (const Entity& x : s.entities) if (x.id == entId) { e = &x; break; }
+    if (!e || e->objtStart < 0 || e->objtEnd <= e->objtStart) return false;
+    const EntityField* f = nullptr;
+    for (const EntityField& x : e->fields) if (x.name == fieldName) { f = &x; break; }
+    if (!f || f->off < 0 || !stringLike(f->ftype)) return false;
+
+    Data D; D.d = s.raw.data(); D.n = s.raw.size();
+    const long lenOff = f->off;                       // u16 length prefix
+    if (lenOff + 2 > (long)s.raw.size()) return false;
+    const long oldLen = (long)D.u16((size_t)lenOff);
+    const long newLen = (long)value.size();
+    const long delta  = newLen - oldLen;
+    if (lenOff + 2 + oldLen > (long)s.raw.size()) return false;
+
+    // Same length: no container anywhere changes, so this is the ordinary
+    // size-preserving write and must stay byte-faithful.
+    if (delta == 0) {
+        std::memcpy(&s.raw[(size_t)lenOff + 2], value.data(), (size_t)newLen);
+        return true;
+    }
+
+    // A resize has to grow/shrink EVERY container that encloses the string. The
+    // ancestors above the entity are already recorded (containerSizeOffs +
+    // objsSchemaOff); what those miss is the two headers inside the entity — the
+    // VOBJ that declares the field and the OBJT that wraps it. Find them by
+    // walking the OBJT's own children rather than assuming the first VOBJ: a
+    // placement field can live in a TRAILING version-extension VOBJ.
+    const long objtSizeOff = e->objtStart + 4;
+    long vobjSizeOff = -1;
+    {
+        const long objtEnd = e->objtEnd;
+        long p = e->objtStart + 10;
+        while (p + 8 <= objtEnd && D.tag((size_t)p, "VOBJ")) {
+            const long vEnd = p + 8 + (long)D.u32((size_t)p + 4);
+            if (lenOff >= p && lenOff < vEnd) { vobjSizeOff = p + 4; break; }
+            p = vEnd;
+        }
+    }
+    if (vobjSizeOff < 0) return false;                // not inside any VOBJ: refuse
+
+    // Splice the payload, then patch sizes. Every size field patched here sits
+    // BEFORE the edit point (a container's header precedes its content), so the
+    // recorded offsets stay valid across the splice.
+    const size_t at = (size_t)lenOff + 2;
+    if (delta > 0) s.raw.insert(s.raw.begin() + at + (size_t)oldLen, (size_t)delta, 0);
+    else           s.raw.erase(s.raw.begin() + at + (size_t)newLen,
+                               s.raw.begin() + at + (size_t)oldLen);
+    if (newLen) std::memcpy(&s.raw[at], value.data(), (size_t)newLen);
+    wr16(s.raw, lenOff, (uint16_t)newLen);
+
+    auto bump = [&](long off) {
+        if (off < 0 || off + 4 > (long)s.raw.size()) return;
+        wr32(s.raw, off, (uint32_t)((int64_t)rd32(s.raw, off) + delta));
+    };
+    bump(vobjSizeOff);
+    bump(objtSizeOff);
+    // countDelta 0: the entity list is the same length, only one record resized.
+    patch_container_sizes(s, s.raw, delta, 0);
+    return reparse_entities(s, lenOff, delta);
+}
 
 bool erase_objt_bytes(Scene& s, long pos, long len) {
     if (s.raw.empty() || pos < 0 || len <= 0 || pos + len > (long)s.raw.size()) return false;

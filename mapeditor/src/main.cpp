@@ -130,6 +130,7 @@ enum OvlKind { OVL_NONE, OVL_DECAL, OVL_ROADNODE };
 static OvlKind g_ovlSel = OVL_NONE;
 static bool  g_draggingOvl = false;
 static int   g_locSel = -1;             // Trigger panel: selected scenario location
+static int   g_strEdits = 0;            // string resizes since the last save
 
 // Vertex/Terrain tool indices, matching kModes[0].tools word for word.
 enum { TT_GRAB=0, TT_RAISE, TT_LOWER, TT_SETPLANE, TT_RAISE_TO_PLANE,
@@ -690,6 +691,7 @@ static bool loadScene(const std::string& path, bool preserveView = false, long s
     g_decalSel = -1; g_decalTouched.clear();
     g_roadSel = -1; g_roadNodeSel = 0; g_roadTouched.clear();
     g_locSel = -1;
+    g_strEdits = 0;
     if (selectId >= 0)
         for (int i = 0; i < (int)g_scene.entities.size(); i++)
             if (g_scene.entities[i].id == selectId) { selectOnly(i); break; }
@@ -767,6 +769,7 @@ static void doSaveTo(const std::string& out, bool keepBackup) {
         g_scene.weatherEdited = false;
         g_decalTouched.clear(); g_scene.decalEdited = 0;
         g_roadTouched.clear(); g_scene.roadEdited = 0;
+        g_strEdits = 0;
         for (Entity& e : g_scene.entities) for (EntityField& f : e.fields) f.dirty = false;
         for (WeatherPreset& w : g_scene.weather)
             std::fill(w.dirty.begin(), w.dirty.end(), (unsigned char)0);
@@ -1993,7 +1996,8 @@ static void drawChanges() {
     char title[96];
     snprintf(title, sizeof(title), "Changes (%d)###changes",
              (int)rows.size() + deleted + (wFields ? 1 : 0) +
-             (g_decalTouched.empty() ? 0 : 1) + (g_roadTouched.empty() ? 0 : 1));
+             (g_decalTouched.empty() ? 0 : 1) + (g_roadTouched.empty() ? 0 : 1) +
+             (g_strEdits ? 1 : 0));
     if (ImGui::Begin(title, &g_showChanges)) {
         if (g_srcMap.empty()) ImGui::TextDisabled("No .map loaded.");
         ImGui::Text("+%d added   -%d deleted   %d moved   %d rotated   %d field edits",
@@ -2009,6 +2013,9 @@ static void drawChanges() {
         if (!g_roadTouched.empty())
             ImGui::Text("%d road%s edited", (int)g_roadTouched.size(),
                         g_roadTouched.size() == 1 ? "" : "s");
+        if (g_strEdits)
+            ImGui::Text("%d string field%s resized (already written into the buffer)",
+                        g_strEdits, g_strEdits == 1 ? "" : "s");
         ImGui::TextDisabled("versus %s", g_srcMap.empty() ? "(nothing)" : g_srcMap.c_str());
         ImGui::Separator();
         ImGuiListClipper clip; clip.Begin((int)rows.size());
@@ -2132,8 +2139,38 @@ static void drawSchemaFields(Entity& e) {
         ImGui::PushID((int)k);
         bool changed = false;
         if (f.kind == FK_STR) {
-            ImGui::LabelText(f.name.c_str(), "%s", f.s.c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("strings are read-only (editing would resize the record)");
+            // A string edit RESIZES the record, so it is a structural change, not
+            // an in-place write: it goes straight to Scene::raw through
+            // set_entity_string() (which patches the VOBJ, the OBJT, every
+            // ancestor and the OBJS schema_offset) and is committed on Enter
+            // rather than per-keystroke — one undo step, and one reparse.
+            //
+            // Prototype stays read-only on purpose: it is a 36-char GUID the model
+            // loader resolves through, and every shipped record is exactly 36, so
+            // an arbitrary-length value there is a different and much riskier edit.
+            const bool isProto = (f.name == "Prototype");
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s", f.s.c_str());
+            if (isProto) {
+                ImGui::LabelText(f.name.c_str(), "%s", f.s.c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Prototype is a fixed 36-char GUID — use the "
+                                      "browser to change which prototype is placed");
+            } else if (ImGui::InputText(f.name.c_str(), buf, sizeof(buf),
+                                        ImGuiInputTextFlags_EnterReturnsTrue)) {
+                if (buf != f.s) {
+                    flushEditsToRaw();               // resize invalidates pending offsets
+                    const long id = e.id;
+                    if (set_entity_string(g_scene, id, f.name, std::string(buf))) {
+                        g_strEdits++;
+                        afterStructural(id);         // offsets moved: rebuild + reselect
+                        ImGui::PopID();
+                        break;                       // `e` and `f` are dangling now
+                    }
+                }
+            }
+            if (!isProto && ImGui::IsItemHovered())
+                ImGui::SetTooltip("press Enter to commit — this resizes the record");
         } else if (!field_is_writable(f.ftype)) {
             ImGui::TextDisabled("%s  (type 0x%04X, not editable)", f.name.c_str(), f.ftype);
         } else if (f.kind == FK_VEC3) {
@@ -3991,6 +4028,74 @@ int main(int argc, char** argv) {
                 printf("chunktile: %d map(s), %d failed\n", n, bad);
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
+        }
+        else if (!strcmp(argv[i], "--strtest") && i + 2 < argc) {
+            // dev: --strtest <map> <out.map> — variable-length string editing, the
+            // only edit that resizes a record. Grows a field, shrinks it, and
+            // restores it, checking after every step that the file still tiles
+            // (--chunktile's rule), that the entity list is unchanged, and that
+            // the value reads back. The round trip to the ORIGINAL length must
+            // reproduce the original file byte for byte — that is the check a
+            // wrong ancestor bump cannot survive.
+            Scene s;
+            if (!load_map_native(argv[i+1], s)) { printf("strtest: load failed\n"); return 2; }
+            const std::vector<unsigned char> original = s.raw;
+            const size_t entCount = s.entities.size();
+
+            // Pick an entity carrying an editable, non-GUID string. Prototype is a
+            // 36-char GUID the loader resolves models through; resizing it would
+            // be a different (and much worse) test.
+            long entId = -1; std::string fname, before;
+            for (const Entity& e : s.entities) {
+                for (const EntityField& f : e.fields) {
+                    if (f.kind != FK_STR || f.off < 0) continue;
+                    if (f.name == "Prototype") continue;
+                    if (f.s.empty()) continue;
+                    entId = e.id; fname = f.name; before = f.s; break;
+                }
+                if (entId >= 0) break;
+            }
+            if (entId < 0) { printf("strtest: no editable string field found\n"); return 2; }
+
+            auto check = [&](const char* what, const std::string& want) -> bool {
+                { std::ofstream f(argv[i+2], std::ios::binary);
+                  f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size()); }
+                ChunkTileReport r;
+                bool tiles = map_chunk_tile(s.raw, r) && r.ok;
+                Scene s2; bool reload = load_map_native(argv[i+2], s2);
+                std::string got; bool found = false;
+                if (reload) for (const Entity& e : s2.entities) if (e.id == entId)
+                    for (const EntityField& f : e.fields) if (f.name == fname) { got = f.s; found = true; }
+                bool same = found && got == want;
+                bool ents = reload && s2.entities.size() == entCount;
+                printf("  %-10s len=%2d tiles=%d gap=%ld overlap=%ld reload=%d ents=%d "
+                       "readback=%d %s\n", what, (int)want.size(), (int)tiles,
+                       r.gapBytes, r.overlapBytes, (int)reload, (int)ents, (int)same,
+                       (tiles && reload && ents && same) ? "ok" : "FAIL");
+                return tiles && reload && ents && same;
+            };
+
+            printf("strtest entity %ld field '%s' = \"%s\"\n", entId, fname.c_str(), before.c_str());
+            bool ok = true;
+            const std::string longer  = before + "_MUCH_LONGER_STRING_VALUE";
+            const std::string shorter = before.size() > 3 ? before.substr(0, 3) : std::string("x");
+            ok &= set_entity_string(s, entId, fname, longer);   ok &= check("grow", longer);
+            // Keep the GROWN file too: the restored one is byte-identical to the
+            // input, so it cannot prove a resized map is well-formed. This is the
+            // artifact to run --chunktile / --heaptest / the oracle against.
+            { std::string g = std::string(argv[i+2]) + ".grown.map";
+              std::ofstream f(g, std::ios::binary);
+              f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size());
+              printf("  (grown copy written to %s)\n", g.c_str()); }
+            ok &= set_entity_string(s, entId, fname, shorter);  ok &= check("shrink", shorter);
+            ok &= set_entity_string(s, entId, fname, before);   ok &= check("restore", before);
+
+            // The decisive one: back at the original length, the whole file must be
+            // byte-identical. Any ancestor size left un-restored shows up here.
+            bool exact = (s.raw == original);
+            printf("strtest: round trip byte-identical to the original: %d\n", (int)exact);
+            printf("strtest: %s\n", (ok && exact) ? "PASS" : "FAIL");
+            return (ok && exact) ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--blcktest") && i + 1 < argc) {
             // dev: --blcktest <map|dir> — BLCK decode. The dims must come from

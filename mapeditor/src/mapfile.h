@@ -57,6 +57,19 @@ bool build_entity_clone(const Scene& s, long srcId, const float pos[3], long new
 // (entIndex < 0 or past the end -> appended just before SCHD). Undo of a delete.
 bool insert_objt_at_index(Scene& s, int entIndex, const std::vector<unsigned char>& objt);
 
+// Overwrite one string field of an entity, RESIZING the record when the new
+// value is a different length. This is the one edit that is not size-preserving:
+// it splices bytes and then grows/shrinks the enclosing VOBJ, the enclosing OBJT,
+// every ancestor container size, and the OBJS `schema_offset` — which is the only
+// absolute file offset a .map contains, checked over all 285,272 integer-typed
+// field values in the scenario trees of all 45 shipped maps.
+//
+// Same-length values take the ordinary in-place path and change exactly those
+// bytes. Verify any output with --chunktile, NOT just the Python oracle: the
+// oracle re-emits each chunk's original span and cannot see a wrong size.
+bool set_entity_string(Scene& s, long entId, const std::string& fieldName,
+                       const std::string& value);
+
 // Erase `len` bytes of OBJT starting at `pos`. Undo of an add.
 bool erase_objt_bytes(Scene& s, long pos, long len);
 
