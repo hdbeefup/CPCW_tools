@@ -121,6 +121,14 @@ static int   g_decalSel = -1;           // Decals panel selection
 static std::set<int> g_roadTouched;     // road pool slots edited since the last save
 static int   g_roadSel = -1;            // Roads panel selection (index into roadRecs)
 static int   g_roadNodeSel = 0;         // selected node within that road
+// Overlays are a SECOND selection domain, deliberately kept out of `g_selection`:
+// that std::set<int> holds ENTITY indices and is consumed by eight call sites, so
+// tagging indices to mean "decal 3" instead would corrupt every one of them. The
+// two domains are mutually exclusive — selecting an overlay clears the entity
+// selection and vice versa.
+enum OvlKind { OVL_NONE, OVL_DECAL, OVL_ROADNODE };
+static OvlKind g_ovlSel = OVL_NONE;
+static bool  g_draggingOvl = false;
 
 // Vertex/Terrain tool indices, matching kModes[0].tools word for word.
 enum { TT_GRAB=0, TT_RAISE, TT_LOWER, TT_SETPLANE, TT_RAISE_TO_PLANE,
@@ -2133,6 +2141,103 @@ static bool terrainHit(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
     return true;
 }
 
+// Read one road node's (x, z) straight out of Scene::raw. Roads are baked into
+// ribbon geometry, so the node positions only exist in the byte buffer.
+static bool roadNodeXZ(const Scene::RoadRec& r, int n, float& x, float& z) {
+    if (n < 0 || n >= r.nodeCount || r.nodesOff < 0) return false;
+    size_t off = (size_t)r.nodesOff + (size_t)n * 36;
+    if (off + 12 > g_scene.raw.size()) return false;
+    memcpy(&x, &g_scene.raw[off], 4);
+    memcpy(&z, &g_scene.raw[off + 8], 4);
+    return true;
+}
+
+// Pick an overlay under the cursor. Deliberately a CPU test against the terrain
+// hit point rather than a colour-code pass: decals lie flat on the terrain and
+// road nodes are points, so the ray-terrain intersection already resolves both,
+// and no pick-code allocation or extra GPU pass is needed.
+//
+// Consequence worth knowing: this ignores occlusion, so a road node under a tree
+// or inside a building is still grabbable. For overlay editing that is the useful
+// behaviour — the geometry you are editing is on the ground, under the clutter.
+// The geometric core, split out so it can be tested without a camera or a window:
+// given a world-space ground point, what overlay is there?
+static bool pickOverlayAtWorld(float wx, float wz, float grab, bool wantRoads,
+                               bool wantDecals, OvlKind& kind, int& rec, int& node,
+                               int preferRoad = -1) {
+    kind = OVL_NONE; rec = -1; node = -1;
+    auto nearestNodeOf = [&](int k, float radius, int& outNode) {
+        const Scene::RoadRec& r = g_scene.roadRecs[(size_t)k];
+        float best = radius * radius; outNode = -1;
+        for (int n = 0; n < r.nodeCount; n++) {
+            float nx, nz;
+            if (!roadNodeXZ(r, n, nx, nz)) break;
+            float dx = nx - wx, dz = nz - wz, d2 = dx*dx + dz*dz;
+            if (d2 < best) { best = d2; outNode = n; }
+        }
+        return outNode >= 0;
+    };
+
+    // The nodes of the road you are ALREADY editing get first refusal — they are
+    // its drag handles, and they are the only ones drawn. Giving every road node
+    // priority instead made decals almost unpickable: 112 of M_01's 126 decals sit
+    // within grab range of some road node, because sidewalk and asphalt decals are
+    // road-adjacent by their nature. Measured, not guessed — see --overlaypicktest.
+    if (wantRoads && g_scene.roadPool.ok && preferRoad >= 0 &&
+        preferRoad < (int)g_scene.roadRecs.size()) {
+        int n;
+        if (nearestNodeOf(preferRoad, grab, n)) {
+            kind = OVL_ROADNODE; rec = preferRoad; node = n; return true;
+        }
+    }
+
+    // Then decals: point-in-rotated-rect, smallest matching quad wins so a small
+    // decal stacked on a large one stays reachable.
+    if (wantDecals && g_scene.decalPool.ok) {
+        float bestArea = 1e30f; int bD = -1;
+        for (int k = 0; k < (int)g_scene.decalRecs.size(); k++) {
+            const Scene::DecalRec& d = g_scene.decalRecs[(size_t)k];
+            if (d.sx <= 0 || d.sy <= 0) continue;
+            float c = std::cos(-d.rot), s = std::sin(-d.rot);
+            float px = wx - d.cx, pz = wz - d.cz;
+            float lx = px * c - pz * s, ly = px * s + pz * c;
+            if (std::fabs(lx) > d.sx * 0.5f || std::fabs(ly) > d.sy * 0.5f) continue;
+            float area = d.sx * d.sy;
+            if (area < bestArea) { bestArea = area; bD = k; }
+        }
+        if (bD >= 0) { kind = OVL_DECAL; rec = bD; return true; }
+    }
+
+    // Finally any road node, which is how a road gets selected in the first place.
+    if (wantRoads && g_scene.roadPool.ok) {
+        float best = grab * grab; int bR = -1, bN = -1;
+        for (int k = 0; k < (int)g_scene.roadRecs.size(); k++) {
+            int n;
+            const Scene::RoadRec& r = g_scene.roadRecs[(size_t)k];
+            if (!nearestNodeOf(k, grab, n)) continue;
+            float nx, nz;
+            if (!roadNodeXZ(r, n, nx, nz)) continue;
+            float dx = nx - wx, dz = nz - wz, d2 = dx*dx + dz*dz;
+            if (d2 < best) { best = d2; bR = k; bN = n; }
+        }
+        if (bR >= 0) { kind = OVL_ROADNODE; rec = bR; node = bN; return true; }
+    }
+    return false;
+}
+
+static bool pickOverlayAt(const ImVec2& mp, const ImVec2& cmin, const ImVec2& cmax,
+                          OvlKind& kind, int& rec, int& node) {
+    kind = OVL_NONE; rec = -1; node = -1;
+    float wx, wz;
+    if (!g_scene.loaded || !terrainHit(mp, cmin, cmax, wx, wz)) return false;
+    // Grab radius scales with the camera so the handle stays a roughly constant
+    // size on screen.
+    const float grab = std::min(14.0f, std::max(1.2f, g_cam.dist * 0.02f));
+    return pickOverlayAtWorld(wx, wz, grab, g_vp.showRoads, g_vp.showDecals,
+                              kind, rec, node,
+                              g_ovlSel == OVL_ROADNODE ? g_roadSel : -1);
+}
+
 // Sculpt the heightmap around (cx,cy) with a radial falloff. `invert` (Ctrl) flips
 // raise<->lower and raise-to-plane<->lower-to-plane. `drag` carries the vertical
 // mouse motion for the Grab tool. The "plane" tools all work against the panel's
@@ -2360,6 +2465,46 @@ static void drawSelectionOverlay(const ImVec2& cmin, const ImVec2& cmax) {
 
     const ImU32 kHandle = IM_COL32(255, 255, 255, 255);
     const ImU32 kEdge   = IM_COL32(0, 0, 0, 200);
+
+    // Overlay editing: draw the node handles of the selected road so there is
+    // something to aim at, and outline a selected decal. Only in overlay mode —
+    // 320 roads' worth of dots would bury every other mode.
+    if (modeIs(MK_OVERLAY)) {
+        if (g_roadSel >= 0 && g_roadSel < (int)g_scene.roadRecs.size() &&
+            g_vp.showRoads) {
+            const Scene::RoadRec& rr = g_scene.roadRecs[(size_t)g_roadSel];
+            ImVec2 prev; bool havePrev = false;
+            for (int n = 0; n < rr.nodeCount; n++) {
+                float nx, nz;
+                if (!roadNodeXZ(rr, n, nx, nz)) break;
+                ImVec2 sp;
+                if (!projectToView(vp, V3{ nx, terrainHeightAt(nx, nz) + 0.4f, nz },
+                                   cmin, W, H, sp)) { havePrev = false; continue; }
+                if (havePrev) dl->AddLine(prev, sp, IM_COL32(90, 200, 255, 150), 1.5f);
+                prev = sp; havePrev = true;
+                const bool sel = (g_ovlSel == OVL_ROADNODE && n == g_roadNodeSel);
+                const float r = sel ? 6.0f : 3.5f;
+                dl->AddCircleFilled(sp, r + 1.0f, kEdge);
+                dl->AddCircleFilled(sp, r, sel ? IM_COL32(255, 210, 40, 255)
+                                               : IM_COL32(120, 210, 255, 220));
+            }
+        }
+        if (g_ovlSel == OVL_DECAL && g_decalSel >= 0 &&
+            g_decalSel < (int)g_scene.decalRecs.size() && g_vp.showDecals) {
+            const Scene::DecalRec& d = g_scene.decalRecs[(size_t)g_decalSel];
+            const float c = std::cos(d.rot), s = std::sin(d.rot);
+            const float hx = d.sx * 0.5f, hy = d.sy * 0.5f;
+            const float corner[4][2] = {{-hx,-hy},{hx,-hy},{hx,hy},{-hx,hy}};
+            ImVec2 pts[4]; bool ok = true;
+            for (int k = 0; k < 4 && ok; k++) {
+                float wx = d.cx + corner[k][0]*c - corner[k][1]*s;
+                float wz = d.cz + corner[k][0]*s + corner[k][1]*c;
+                ok = projectToView(vp, V3{ wx, terrainHeightAt(wx, wz) + 0.4f, wz },
+                                   cmin, W, H, pts[k]);
+            }
+            if (ok) dl->AddPolyline(pts, 4, IM_COL32(255, 210, 40, 235), true, 2.0f);
+        }
+    }
 
     for (const Mark& mk : marks) {
         if (mk.idx < 0 || mk.idx >= (int)g_scene.entities.size()) continue;
@@ -2675,7 +2820,68 @@ static void updateCamera(const ImVec2& cmin, const ImVec2& cmax) {
 
     // Left-click selects. Ctrl toggles, Shift adds. Clicking empty space starts a
     // rubber-band; clicking an entity starts a drag-move.
-    if (over && ImGui::IsMouseClicked(0) && g_scene.loaded) {
+    // Overlay mode gets first refusal on a click: a decal or road node under the
+    // cursor is what the user means there, not the entity behind it.
+    bool tookOverlayClick = false;
+    if (over && ImGui::IsMouseClicked(0) && g_scene.loaded && modeIs(MK_OVERLAY) &&
+        !g_gizmoHot) {
+        OvlKind k; int rec, node;
+        if (pickOverlayAt(io.MousePos, cmin, cmax, k, rec, node)) {
+            selectNone();                       // the two domains are exclusive
+            g_ovlSel = k;
+            if (k == OVL_DECAL) g_decalSel = rec;
+            else { g_roadSel = rec; g_roadNodeSel = node; g_draggingOvl = true; }
+            tookOverlayClick = true;
+        } else {
+            // Nothing overlay-ish under the cursor: fall through, so entity
+            // selection and the marquee still work in this mode.
+            g_ovlSel = OVL_NONE;
+        }
+    }
+    // Drag a road node along the terrain. One undo step per drag: the byte span is
+    // snapshotted on grab and committed on release, exactly like the panel fields.
+    if (g_draggingOvl && g_ovlSel == OVL_ROADNODE) {
+        static int dSlot = -1, dNode = -1;
+        static std::vector<unsigned char> dBefore;
+        if (g_roadSel >= 0 && g_roadSel < (int)g_scene.roadRecs.size()) {
+            const Scene::RoadRec& rr = g_scene.roadRecs[(size_t)g_roadSel];
+            long off = 0, len = 0;
+            if (dSlot != rr.slot || dNode != g_roadNodeSel) {
+                if (overlay_road_node_span(g_scene, rr.slot, g_roadNodeSel, off, len)) {
+                    dBefore.assign(g_scene.raw.begin() + off, g_scene.raw.begin() + off + len);
+                    dSlot = rr.slot; dNode = g_roadNodeSel;
+                }
+            }
+            float wx, wz;
+            if (ImGui::IsMouseDown(0) && terrainHit(io.MousePos, cmin, cmax, wx, wz)) {
+                if ((g_snapOn || io.KeyShift) && g_snapGrid > 0.0f) {
+                    wx = std::round(wx / g_snapGrid) * g_snapGrid;
+                    wz = std::round(wz / g_snapGrid) * g_snapGrid;
+                }
+                if (overlay_set_road_node(g_scene, rr.slot, g_roadNodeSel, wx, wz)) {
+                    g_overlayDirty = true;
+                    g_roadTouched.insert(rr.slot);
+                    g_scene.roadEdited = (int)g_roadTouched.size();
+                }
+            }
+            if (!ImGui::IsMouseDown(0)) {
+                if (dSlot == rr.slot && dNode == g_roadNodeSel &&
+                    overlay_road_node_span(g_scene, rr.slot, g_roadNodeSel, off, len) &&
+                    (long)dBefore.size() == len) {
+                    std::vector<unsigned char> after(g_scene.raw.begin() + off,
+                                                     g_scene.raw.begin() + off + len);
+                    if (after != dBefore) {
+                        EditCmd c; c.kind = CMD_ROADNODE;
+                        c.rSlot = rr.slot; c.rNode = g_roadNodeSel;
+                        c.r0 = dBefore; c.r1 = std::move(after);
+                        pushCmd(std::move(c));
+                    }
+                }
+                dSlot = -1; dNode = -1; g_draggingOvl = false;
+            }
+        } else { g_draggingOvl = false; }
+    }
+    if (over && ImGui::IsMouseClicked(0) && g_scene.loaded && !tookOverlayClick) {
         int bi = pickExact(io.MousePos, cmin, cmax);
         bool additive = io.KeyCtrl || io.KeyShift;
         if (bi >= 0) {
@@ -3024,6 +3230,7 @@ int main(int argc, char** argv) {
     crashdump_install(crashContext);
     std::string loadPath, shotPath, pickDump, uiShotPath; bool selftest = false, pickTest = false;
     int uiShotFrames = 0, uiShotSelect = -1;
+    int uiShotRoad = -1, uiShotRoadNode = 0;   // preset an overlay selection for --uishot
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--crashtest")) {
             // Check the handler against the thing it exists for: fault on
@@ -3045,6 +3252,10 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--uishot-frames") && i + 1 < argc) uiShotFrames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--uishot-select") && i + 1 < argc) uiShotSelect = atoi(argv[++i]);
+        // dev: preset a road-node selection so a headless shot can show the node
+        // handles, which are otherwise only reachable by clicking.
+        else if (!strcmp(argv[i], "--uishot-road") && i + 1 < argc) uiShotRoad = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--uishot-roadnode") && i + 1 < argc) uiShotRoadNode = atoi(argv[++i]);
         // Overlay visibility from the command line, so a --shot pair can isolate
         // exactly one layer's contribution ("count pixels, not records").
         else if (!strcmp(argv[i], "--lighting") && i + 1 < argc) {
@@ -3629,6 +3840,59 @@ int main(int argc, char** argv) {
                 printf("chunktile: %d map(s), %d failed\n", n, bad);
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
+        }
+        else if (!strcmp(argv[i], "--overlaypicktest") && i + 1 < argc) {
+            // dev: --overlaypicktest <map> — the world-space core of overlay
+            // picking, without a camera or a window. Aiming exactly at a road
+            // node must return that node; aiming at a decal's centre must return
+            // that decal unless a road node is genuinely nearer, which is a real
+            // and expected outcome (nodes win ties on purpose).
+            if (!load_map_native(argv[i+1], g_scene)) { printf("overlaypicktest: load failed\n"); return 2; }
+            const float grab = 4.0f;
+            int nodes = 0, nodeHit = 0, nodeWrong = 0;
+            for (int k = 0; k < (int)g_scene.roadRecs.size(); k++) {
+                const Scene::RoadRec& r = g_scene.roadRecs[(size_t)k];
+                for (int n = 0; n < r.nodeCount; n++) {
+                    float nx, nz;
+                    if (!roadNodeXZ(r, n, nx, nz)) break;
+                    nodes++;
+                    OvlKind kk; int rc, nd;
+                    if (!pickOverlayAtWorld(nx, nz, grab, true, true, kk, rc, nd, k) ||
+                        kk != OVL_ROADNODE || rc != k) { nodeWrong++; continue; }
+                    // Another node may sit at the exact same spot (junctions do);
+                    // accept any node at zero distance from the one we aimed at.
+                    float ox, oz;
+                    const Scene::RoadRec& got = g_scene.roadRecs[(size_t)rc];
+                    if (roadNodeXZ(got, nd, ox, oz) &&
+                        std::fabs(ox-nx) < 1e-4f && std::fabs(oz-nz) < 1e-4f) nodeHit++;
+                    else nodeWrong++;
+                }
+            }
+            int dec = 0, decHit = 0, decToNode = 0;
+            for (int k = 0; k < (int)g_scene.decalRecs.size(); k++) {
+                const Scene::DecalRec& d = g_scene.decalRecs[(size_t)k];
+                if (d.sx <= 0 || d.sy <= 0) continue;
+                dec++;
+                OvlKind kk; int rc, nd;
+                // decals only, so the test is about the quad test itself
+                if (pickOverlayAtWorld(d.cx, d.cz, grab, false, true, kk, rc, nd) &&
+                    kk == OVL_DECAL) {
+                    const Scene::DecalRec& g = g_scene.decalRecs[(size_t)rc];
+                    // an exactly-covering smaller decal winning is correct
+                    if (rc == k || g.sx * g.sy <= d.sx * d.sy) decHit++;
+                }
+                if (pickOverlayAtWorld(d.cx, d.cz, grab, true, true, kk, rc, nd) &&
+                    kk == OVL_ROADNODE) decToNode++;
+            }
+            // A point far outside the map must hit nothing.
+            OvlKind ek; int er, en;
+            bool emptyOk = !pickOverlayAtWorld(-9999.0f, -9999.0f, grab, true, true, ek, er, en);
+            printf("overlaypicktest: nodes=%d hit=%d wrong=%d | decals=%d hit=%d "
+                   "(%d shadowed by a nearer road node) | emptyMiss=%d\n",
+                   nodes, nodeHit, nodeWrong, dec, decHit, decToNode, (int)emptyOk);
+            bool pass = nodes > 0 && nodeWrong == 0 && dec > 0 && decHit == dec && emptyOk;
+            printf("overlaypicktest: %s\n", pass ? "PASS" : "FAIL");
+            return pass ? 0 : 3;
         }
         else if (!strcmp(argv[i], "--roadauxtest") && i + 1 < argc) {
             // dev: --roadauxtest <map|dir> — the Catmull-Rom handle identity on
@@ -4246,6 +4510,10 @@ int main(int argc, char** argv) {
 
         // Scripted selection for --uishot: applied once the scene and its model
         // instances exist, so entityWorldAABB has something to measure.
+        if (uiShotRoad >= 0 && g_scene.loaded && !g_sceneDirty) {
+            g_roadSel = uiShotRoad; g_roadNodeSel = uiShotRoadNode;
+            g_ovlSel = OVL_ROADNODE; uiShotRoad = -1;
+        }
         if (uiShotSelect >= 0 && g_scene.loaded && !g_sceneDirty) {
             selectOnly(uiShotSelect); uiShotSelect = -1;
         }
