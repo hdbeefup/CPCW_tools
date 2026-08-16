@@ -37,6 +37,7 @@ $E --overlaypicktest <map>                 # world-space core of decal / road-no
 $E --scentest   <map|dir>                  # scenario record VALUES (semantics, not just the walk)
 $E --blcktest   <map|dir>                  # BLCK two-plane decode + world coverage
 $E --strtest    <map> out.map              # variable-length string resize (+ a .grown.map copy)
+$E --decaldeltest <map> out.map            # delete a decal: pool relink + container shrink
 $E --sunprobe   $M                         # sun-swizzle evidence (reports, no verdict)
 $E --settingstest tmp.ini                  # settings round-trip + unknown-key survival
 $E --crashtest                             # fault on purpose; report must name the frame
@@ -342,8 +343,16 @@ correctly rejected).
    decals at genuinely different positions ship byte-identical trailing data
    (Domination/(4) Islands Of Hope has one trailing body shared by four
    transforms), so nothing after the transform derives from it. `--decalwritetest`.
-   Still open beyond the road UI: river editing, and create/delete for any of
-   them (structural — free-list surgery, the one unproven inference).
+   **Decal DELETE works** (`overlay_delete_decal`): unlink from the used chain,
+   append to the free chain, flip `isFree`, rewrite the 5 header dwords, erase the
+   GDEC bytes and shrink every ancestor. `--decaldeltest`.
+   **The free-list convention turned out not to exist.** The shipped free lists
+   are in arbitrary slot order — 18 of the 28 pools with 2+ free slots are neither
+   ascending nor descending — so the engine follows the links and any
+   self-consistent list is as valid as the ones on disk. Appending at the tail is
+   a CHOICE; the INVARIANTS (`--overlayscan`) are what must hold. This was listed
+   as the one unproven inference blocking structural overlay ops; it is not one.
+   Still open: river editing, decal/road CREATE, and road-record delete.
    NOTE `g_overlayDirty` — decal and road meshes are BAKED geometry, so an edit
    without a re-decode + `buildOverlays` is correct and completely invisible.
 6. **The scenario object trees are DECODED (read-only); only the Lua trigger

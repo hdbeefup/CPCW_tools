@@ -70,6 +70,28 @@ bool insert_objt_at_index(Scene& s, int entIndex, const std::vector<unsigned cha
 bool set_entity_string(Scene& s, long entId, const std::string& fieldName,
                        const std::string& value);
 
+// ---- generic structural splice support -------------------------------------
+// The entity path has its ancestor size-field offsets pre-recorded
+// (Scene::containerSizeOffs), but an overlay pool lives under GTRN and is not on
+// that chain. These two walk the chunk tree for ANY edit position instead.
+//
+// Collect BEFORE the splice (the tree must still be self-consistent); apply
+// AFTER, passing the same editPos/delta. A container's size field is in its
+// header and so lies before `editPos` — those offsets survive the splice. An
+// OBJS `schema_offset` FIELD does not: it can sit on a different branch, after
+// the edit, in which case the splice moved the field itself, so `map_apply_
+// ancestors` relocates those by `delta`. `absOffs` holds the schema_offset
+// fields whose VALUE points at or after the edit and therefore needs bumping.
+bool map_collect_ancestors(const std::vector<unsigned char>& b, long editPos,
+                           std::vector<long>& sizeOffs, std::vector<long>& absOffs);
+void map_apply_ancestors(std::vector<unsigned char>& b, const std::vector<long>& sizeOffs,
+                         const std::vector<long>& absOffs, long editPos, long delta);
+
+// Re-walk the entity table and shift every recorded byte offset after a splice at
+// `editPos` of `delta` bytes. Callers that changed overlay/weather CONTENT (not
+// just position) must also re-run parse_overlays / parse_weather afterwards.
+bool map_reparse_after_splice(Scene& s, long editPos, long delta);
+
 // Erase `len` bytes of OBJT starting at `pos`. Undo of an add.
 bool erase_objt_bytes(Scene& s, long pos, long len);
 

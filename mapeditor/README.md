@@ -136,6 +136,7 @@ Every write path has a no-window check that runs from the command line:
 | `--scentest <map\|dir>` | scenario record values: every location named, sized sanely, and centred inside its own map |
 | `--blcktest <map\|dir>` | BLCK decodes with its own header dims on 45/45 and the plane covers the whole world (41 exact-2x, 4 padded) |
 | `--strtest <map> out.map` | variable-length string editing: grow, shrink and restore a field; the restore must be byte-identical to the input, and a `.grown.map` copy is left for the structural checks |
+| `--decaldeltest <map> out.map [slot]` | delete a decal: pool counts and links survive, survivors intact, every ancestor container shrinks, file still tiles |
 | `--overlayscan <map\|dir>` | GROL/GDCL/GRVL slot pools walk exactly, counts match, used-list invariants hold; river summary |
 | `--no-roads` `--no-decals` `--no-rivers` | drop one overlay layer, so a `--shot` pair isolates its pixels |
 | `--lighting {editor\|preset\|presetfog}` `--preset <name\|#slot>` | shade a `--shot` with a chosen WTHR preset |

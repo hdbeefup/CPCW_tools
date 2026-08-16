@@ -4029,6 +4029,55 @@ int main(int argc, char** argv) {
             } else { n = 1; if (!one(argv[i+1], true)) bad = 1; }
             return bad ? 3 : 0;
         }
+        else if (!strcmp(argv[i], "--decaldeltest") && i + 2 < argc) {
+            // dev: --decaldeltest <map> <out.map> [slot] — delete a decal. The
+            // first STRUCTURAL overlay edit: the container shrinks, so every
+            // ancestor size has to move with it and the pool invariants have to
+            // survive. Verified against --overlayscan's rules, not by eye.
+            Scene s;
+            if (!load_map_native(argv[i+1], s)) { printf("decaldeltest: load failed\n"); return 2; }
+            if (!s.decalPool.ok || s.decalRecs.empty()) { printf("decaldeltest: no writable decals\n"); return 2; }
+            const size_t rawBefore = s.raw.size(), entBefore = s.entities.size();
+            const int liveBefore = s.decalPool.used, capBefore = s.decalPool.cap;
+            const size_t recBefore = s.decalRecs.size();
+            int slot = (i + 3 < argc) ? atoi(argv[i+3]) : s.decalRecs.front().slot;
+            // Remember a neighbour so we can prove the SURVIVORS are intact.
+            int witness = -1; float wcx = 0, wcz = 0;
+            for (const Scene::DecalRec& r : s.decalRecs)
+                if (r.slot != slot) { witness = r.slot; wcx = r.cx; wcz = r.cz; break; }
+
+            if (!overlay_delete_decal(s, slot)) { printf("decaldeltest: delete failed\n"); return 3; }
+
+            const long shrank = (long)rawBefore - (long)s.raw.size();
+            bool poolOk   = s.decalPool.ok;
+            bool countOk  = s.decalPool.used == liveBefore - 1 &&
+                            s.decalPool.cap == capBefore &&        // capacity never changes
+                            s.decalRecs.size() == recBefore - 1;
+            bool gone     = true;
+            for (const Scene::DecalRec& r : s.decalRecs) if (r.slot == slot) gone = false;
+            bool survivor = witness < 0;
+            for (const Scene::DecalRec& r : s.decalRecs)
+                if (r.slot == witness && r.cx == wcx && r.cz == wcz) survivor = true;
+            bool entsOk   = s.entities.size() == entBefore;
+
+            ChunkTileReport rep;
+            bool tiles = map_chunk_tile(s.raw, rep) && rep.ok;
+            { std::ofstream f(argv[i+2], std::ios::binary);
+              f.write((const char*)s.raw.data(), (std::streamsize)s.raw.size()); }
+            Scene s2; bool reload = load_map_native(argv[i+2], s2);
+            bool reloadOk = reload && s2.decalPool.ok &&
+                            s2.decalPool.used == liveBefore - 1 &&
+                            s2.entities.size() == entBefore;
+
+            printf("decaldeltest slot %d: shrank=%ld pool=%d counts=%d gone=%d survivor=%d "
+                   "ents=%d tiles=%d gap=%ld reload=%d %s\n",
+                   slot, shrank, (int)poolOk, (int)countOk, (int)gone, (int)survivor,
+                   (int)entsOk, (int)tiles, rep.gapBytes, (int)reloadOk,
+                   (poolOk && countOk && gone && survivor && entsOk && tiles &&
+                    reloadOk && shrank > 0) ? "OK" : "FAIL");
+            return (poolOk && countOk && gone && survivor && entsOk && tiles &&
+                    reloadOk && shrank > 0) ? 0 : 3;
+        }
         else if (!strcmp(argv[i], "--strtest") && i + 2 < argc) {
             // dev: --strtest <map> <out.map> — variable-length string editing, the
             // only edit that resizes a record. Grows a field, shrinks it, and

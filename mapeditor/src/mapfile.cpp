@@ -6,6 +6,8 @@
 #include "weather.h"
 #include "heap.h"
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -631,6 +633,79 @@ long schd_pos(const Scene& s) {
 }
 
 } // namespace
+
+bool map_reparse_after_splice(Scene& s, long editPos, long delta) {
+    return reparse_entities(s, editPos, delta);
+}
+
+bool map_collect_ancestors(const std::vector<unsigned char>& b, long editPos,
+                           std::vector<long>& sizeOffs, std::vector<long>& absOffs) {
+    sizeOffs.clear(); absOffs.clear();
+    Data D; D.d = b.data(); D.n = b.size();
+    if (!D.tag(0, "SCEN")) return false;
+    // Recursive walk mirroring Parser::parseChildren. A chunk whose CONTENT span
+    // contains editPos must grow or shrink with it; its size field sits in the
+    // header, i.e. before editPos, so the offset survives the splice.
+    struct W {
+        const Data& D; long editPos;
+        std::vector<long>& sizeOffs; std::vector<long>& absOffs;
+        void walk(size_t pos, size_t end) {
+            while (pos + 8 <= end) {
+                bool ascii = true;
+                for (int k = 0; k < 4; k++) {
+                    unsigned char c = D.u8(pos + k);
+                    if (c < 0x20 || c >= 0x7F) { ascii = false; break; }
+                }
+                if (!ascii) break;
+                std::string tag((const char*)D.d + pos, 4);
+                size_t size = D.u32(pos + 4), chunkEnd = pos + 8 + size;
+                if (chunkEnd > end + 4) break;
+                const size_t contentStart = pos + 8;
+                // Size grows/shrinks only for a container that actually HOLDS the
+                // edit...
+                if ((long)contentStart <= editPos && editPos < (long)chunkEnd)
+                    sizeOffs.push_back((long)pos + 4);
+                // ...but an OBJS schema_offset is an ABSOLUTE file offset and
+                // shifts whenever bytes move before the SCHD it names — which can
+                // be on a completely different branch from the edit. So recurse
+                // through every container, not just the one containing editPos.
+                if (tag == "PREC" || tag == "SETS" || tag == "OJTS" || tag == "OBJS")
+                    walk(pos + 12, chunkEnd);
+                else if (tag == "WRLD") walk(pos + 20, chunkEnd);
+                else if (tag == "GTRN") walk(pos + 9, chunkEnd);
+                else if (tag == "UNTS") walk(pos + 16, chunkEnd);
+                if (tag == "OBJS" && contentStart + 4 <= chunkEnd) {
+                    long sch = (long)D.u32(contentStart);
+                    if (sch >= editPos) absOffs.push_back((long)contentStart);
+                }
+                pos = chunkEnd;
+            }
+        }
+    } w{ D, editPos, sizeOffs, absOffs };
+    const size_t scenEnd = std::min((size_t)8 + D.u32(4), D.n);
+    // SCEN is the root and is never visited by the child walk, but it holds every
+    // edit and its size must move too. Omitting it left the file 287 bytes shorter
+    // than SCEN claimed, which --chunktile reports as a negative trailer.
+    if (editPos >= 12 && editPos < (long)scenEnd) sizeOffs.push_back(4);
+    w.walk(12, scenEnd);
+    return !sizeOffs.empty();
+}
+
+void map_apply_ancestors(std::vector<unsigned char>& b, const std::vector<long>& sizeOffs,
+                         const std::vector<long>& absOffs, long editPos, long delta) {
+    auto bump = [&](long off) {
+        if (off < 0 || off + 4 > (long)b.size()) return;
+        wr32(b, off, (uint32_t)((int64_t)rd32(b, off) + delta));
+    };
+    // A container's size field is in its header and therefore BEFORE the edit, so
+    // it is still where the collector found it.
+    for (long o : sizeOffs) bump(o);
+    // An OBJS schema_offset is NOT: it can sit on a different branch entirely,
+    // after the edit, in which case the splice moved the field itself. Writing at
+    // the pre-splice position put the value 287 bytes past its field and left one
+    // of the five OBJS sections pointing at the wrong SCHD.
+    for (long o : absOffs) bump(o >= editPos ? o + delta : o);
+}
 
 bool set_entity_string(Scene& s, long entId, const std::string& fieldName,
                        const std::string& value) {

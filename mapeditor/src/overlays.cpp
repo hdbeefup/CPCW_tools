@@ -37,6 +37,7 @@
 //     a real per-node width in world units (22.0, 25.0 observed) — so unlike a
 //     road, a river needs no texture-dimension width derivation.
 #include "overlays.h"
+#include "mapfile.h"
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -110,8 +111,10 @@ std::vector<Rec> walkPool(const std::vector<unsigned char>& d, size_t off, size_
     pool.cap      = i32(off + 20);
     if (pool.cap < 0 || pool.cap > (int)((end - off) / 9) + 1) return recs;
     size_t p = off + 24;
+    pool.slotOff.assign((size_t)pool.cap, -1);
     for (int s = 0; s < pool.cap; s++) {
         if (p + 9 > end) return recs;
+        pool.slotOff[(size_t)s] = (long)p;
         int nxt = i32(p), prv = i32(p + 4);
         bool free = d[p + 8] != 0;
         p += 9;
@@ -154,6 +157,72 @@ std::vector<Rec> readPool(const std::vector<unsigned char>& d, size_t off, size_
     return scanRecords(d, off, size, subtag);
 }
 } // namespace
+
+bool overlay_delete_decal(Scene& s, int slot) {
+    Scene::OverlayPool& P = s.decalPool;
+    if (!P.ok || s.raw.empty()) return false;              // fail closed
+    if (slot < 0 || slot >= P.cap || slot >= (int)P.slotOff.size()) return false;
+    const Scene::OverlaySlotRef* rec = nullptr;
+    for (const Scene::OverlaySlotRef& L : P.live) if (L.slot == slot) { rec = &L; break; }
+    if (!rec) return false;                                // already free
+    const long chunkOff = rec->chunkOff;                   // the "GDEC" tag
+    const long len = 8 + rec->bodySize;
+    if (chunkOff < 0 || chunkOff + len > (long)s.raw.size()) return false;
+
+    auto slotHdr = [&](int i) -> long {
+        return (i >= 0 && i < (int)P.slotOff.size()) ? P.slotOff[(size_t)i] : -1;
+    };
+    auto rdI = [&](long o) -> int {
+        return (o < 0 || o + 4 > (long)s.raw.size()) ? -1
+             : (int)(s.raw[o] | (s.raw[o+1]<<8) | (s.raw[o+2]<<16) | ((unsigned)s.raw[o+3]<<24));
+    };
+    auto wrI = [&](long o, int v) {
+        if (o < 0 || o + 4 > (long)s.raw.size()) return;
+        s.raw[o]=v&0xff; s.raw[o+1]=(v>>8)&0xff; s.raw[o+2]=(v>>16)&0xff; s.raw[o+3]=(v>>24)&0xff;
+    };
+    // Slot record is { i32 next, i32 prev, u8 isFree } — next FIRST here, the
+    // opposite of a HEAP slot. Both orders are in the tree; do not assume either.
+    const long hdr = slotHdr(slot);
+    if (hdr < 0) return false;
+    const int nxt = rdI(hdr), prv = rdI(hdr + 4);
+
+    // Unlink from the used chain.
+    if (prv != -1) wrI(slotHdr(prv), nxt); else P.usedHead = nxt;
+    if (nxt != -1) wrI(slotHdr(nxt) + 4, prv); else P.usedTail = prv;
+
+    // Append to the free chain. Appending at the tail is a CHOICE, not a rule:
+    // the shipped free lists are in arbitrary slot order (18 of the 28 pools with
+    // two or more free slots are neither ascending nor descending), so the engine
+    // follows the links and no particular order is "the" convention. What must
+    // hold are the invariants --overlayscan checks.
+    const int oldFreeTail = P.freeTail;
+    wrI(hdr, -1);                                   // next
+    wrI(hdr + 4, oldFreeTail);                      // prev
+    if (oldFreeTail != -1) wrI(slotHdr(oldFreeTail), slot);
+    else P.freeHead = slot;
+    P.freeTail = slot;
+    s.raw[(size_t)hdr + 8] = 1;                     // isFree
+    P.used -= 1;
+
+    // Header dwords: used, freeHead, freeTail, usedHead, usedTail, cap.
+    wrI(P.hdrOff,      P.used);
+    wrI(P.hdrOff + 4,  P.freeHead);
+    wrI(P.hdrOff + 8,  P.freeTail);
+    wrI(P.hdrOff + 12, P.usedHead);
+    wrI(P.hdrOff + 16, P.usedTail);
+
+    // Now remove the record's bytes and shrink every container that held them.
+    std::vector<long> sizeOffs, absOffs;
+    if (!map_collect_ancestors(s.raw, chunkOff, sizeOffs, absOffs)) return false;
+    s.raw.erase(s.raw.begin() + chunkOff, s.raw.begin() + chunkOff + len);
+    map_apply_ancestors(s.raw, sizeOffs, absOffs, chunkOff, -len);
+
+    // Entity/terrain/weather offsets after the edit shift; overlay CONTENT
+    // changed, so it is re-decoded outright rather than shifted.
+    map_reparse_after_splice(s, chunkOff, -len);
+    parse_overlays(s.raw, s);
+    return true;
+}
 
 bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
                        float sx, float sy, float rot) {

@@ -46,6 +46,17 @@ bool overlay_set_decal(Scene& s, int slot, float cx, float cz,
 // baked geometry).
 bool overlay_set_road_node(Scene& s, int slot, int node, float x, float z);
 
+// Delete one decal: free its pool slot and remove its GDEC record's bytes. This
+// is a STRUCTURAL edit — the container shrinks — so it patches every ancestor
+// chunk size and re-decodes the overlays. `slot` is the pool slot.
+//
+// The freed slot is appended at the free-list tail, which is a CHOICE rather than
+// a discovered convention: the shipped free lists are in arbitrary slot order (18
+// of the 28 pools with two or more free slots are neither ascending nor
+// descending), so the engine follows the links and any self-consistent list is as
+// valid as the ones on disk. The INVARIANTS are what matter — see --overlayscan.
+bool overlay_delete_decal(Scene& s, int slot);
+
 // Byte span of the node records a move of `node` can touch — that node and both
 // neighbours. Undo snapshots these bytes verbatim rather than re-running the
 // handle derivation backwards: an endpoint's magnitude is scaled by a float

@@ -103,6 +103,10 @@ struct Scene {
         int freeHead = -1, freeTail = -1, usedHead = -1, usedTail = -1;
         bool ok = false;                 // the slot walk landed exactly on the end
         std::vector<OverlaySlotRef> live;
+        // Byte offset of EVERY slot's 9-byte header (free ones included), indexed
+        // by slot. `live` only covers occupied slots, but relinking a free list
+        // has to write through the current freeTail, which is by definition free.
+        std::vector<long> slotOff;
     };
     OverlayPool roadPool, decalPool, riverPool;
     // Decoded GDEC transforms, parallel to `decals`. The render meshes are baked
